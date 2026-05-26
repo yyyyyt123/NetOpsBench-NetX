@@ -1,0 +1,74 @@
+---
+title: Overview
+description: Documentation map for implementing, running, and evaluating NetOpsBench agents.
+---
+
+NetOpsBench evaluates troubleshooting agents on generated data-center network fault scenarios. A run provisions a SONiC-VS / Containerlab topology, injects a controlled fault or healthy episode, exposes runtime evidence, calls an agent, and scores the returned `DiagnosisResult` against scenario ground truth.
+
+These docs are organized around the agent-development workflow.
+
+## Main path
+
+<Steps>
+  <Step>
+    ### Verify the runtime
+
+    Use [Quickstart](/docs/quickstart) to check Linux, Docker, Containerlab, credentials, generated scenarios, and one XS run.
+  </Step>
+  <Step>
+    ### Implement the agent contract
+
+    Read [Custom Troubleshooting Agents](/docs/build-your-agent/custom-agents) for the required `diagnose(context) -> DiagnosisResult` shape.
+  </Step>
+  <Step>
+    ### Run benchmark cases
+
+    Use [Running Benchmarks](/docs/run-benchmarks/run-scenario-vs-suite) for one scenario, small suites, full scale runs, and multi-scale batches.
+  </Step>
+  <Step>
+    ### Interpret results
+
+    Use [Benchmark Methodology](/docs/run-benchmarks/methodology) for scoring definitions and [Benchmark Results](/docs/run-benchmarks/results) as a reference snapshot.
+  </Step>
+</Steps>
+
+## Task map
+
+<Cards>
+  <Card
+    title="First run"
+    href="/docs/quickstart"
+    description="Install runtime dependencies, prepare XS scenarios, and produce one BenchmarkReport."
+  />
+  <Card
+    title="Agent contract"
+    href="/docs/build-your-agent/custom-agents"
+    description="Implement the input and output objects that the benchmark can score."
+  />
+  <Card
+    title="Python API"
+    href="/docs/build-your-agent/python-api-guide"
+    description="Run scenarios and suites from code, manage runtimes, and inspect artifacts."
+  />
+  <Card
+    title="Benchmark runs"
+    href="/docs/run-benchmarks/run-scenario-vs-suite"
+    description="Move from one case to suites, scale benchmarks, and batch scripts."
+  />
+  <Card
+    title="Runtime inspection"
+    href="/docs/debug-operate/observability"
+    description="Use Grafana, worker buckets, manual runtimes, and cleanup commands when debugging."
+  />
+  <Card
+    title="Fault extension"
+    href="/docs/extend-netopsbench/custom-faults"
+    description="Add project-local fault definitions after the standard agent workflow is working."
+  />
+</Cards>
+
+## Reference material
+
+- [System Overview](/docs/architecture/system-overview) explains the runtime loop, evidence path, worker isolation, and report aggregation.
+- [Benchmark Methodology](/docs/run-benchmarks/methodology) defines scenario coverage, scoring, negative samples, and optional semantic fault-type matching.
+- [Benchmark Results](/docs/run-benchmarks/results) records one completed cross-model run for comparison context.

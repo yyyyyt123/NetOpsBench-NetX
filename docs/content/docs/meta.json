@@ -1,0 +1,12 @@
+{
+  "title": "NetOpsBench Docs",
+  "pages": [
+    "index",
+    "quickstart",
+    "build-your-agent",
+    "run-benchmarks",
+    "debug-operate",
+    "extend-netopsbench",
+    "architecture"
+  ]
+}

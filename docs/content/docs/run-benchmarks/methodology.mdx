@@ -1,0 +1,103 @@
+---
+title: Benchmark Methodology
+description: What NetOpsBench measures and how diagnosis outputs are scored.
+---
+
+NetOpsBench evaluates whether an agent can detect a network state, localize faults, classify the fault type, and do so with measurable runtime cost. Scoring is localization-first: detecting a fault is required, but useful credit comes from identifying the correct device and interface.
+
+## Evaluation target
+
+Each benchmark case pairs a generated scenario with ground truth:
+
+- expected verdict: `fault_detected` or `network_healthy`;
+- expected fault type for fault cases;
+- expected device;
+- expected interface when the fault is interface-applicable;
+- accepted peer-side equivalents for symmetric link-like faults.
+
+The agent returns a `DiagnosisResult` with verdict, findings, confidence, evidence, reasoning, and optional metadata such as tool calls or token usage.
+
+## Test suite
+
+All topologies use a spine-leaf fabric. Scale increases both switch count and Pingmesh endpoint density.
+
+| Scale | Spines | Leafs | Clients | Network devices |
+|---|---:|---:|---:|---:|
+| XS | 2 | 2 | 2 | 4 |
+| Small | 2 | 4 | 8 | 6 |
+| Medium | 4 | 8 | 16 | 12 |
+| Large | 4 | 16 | 64 | 20 |
+
+The benchmark covers twelve canonical fault types:
+
+| Category | Fault types |
+|---|---|
+| Link | `link_down`, `link_flapping` |
+| Routing | `blackhole_route`, `static_route_misconfig`, `bgp_neighbor_misconfig`, `route_policy_misconfig` |
+| Impairment | `mtu_mismatch`, `packet_loss`, `packet_corruption`, `high_latency` |
+| System | `device_down` |
+| ACL | `acl_misconfig` |
+
+Each scale combines fault cases with healthy negative samples:
+
+| Scale | Fault cases | Healthy cases | Total |
+|---|---:|---:|---:|
+| XS | 12 | 2 | 14 |
+| Small | 12 | 3 | 15 |
+| Medium | 24 | 4 | 28 |
+| Large | 48 | 4 | 52 |
+
+Scenarios are generated from `scenarios/specs/fault_campaign.yaml`. Running `netopsbench benchmark prepare --scales <scale>` materializes YAML files under `scenarios/generated/<scale>/`.
+
+## Scoring dimensions
+
+| Dimension | Meaning |
+|---|---|
+| Detection accuracy | Whether the agent distinguishes faulted cases from healthy negative samples. |
+| Device localization | Whether the predicted device matches ground truth or an accepted equivalent. |
+| Interface localization | Whether the predicted interface matches when interface-level ground truth exists. |
+| Fault type classification | Whether the predicted fault label matches the ground-truth type. |
+| Runtime efficiency | Diagnosis time, tool calls, and token usage. |
+
+Fault-case score is verdict-gated. If the agent does not return the correct fault verdict, localization score is zero.
+
+When interface ground truth exists:
+
+```text
+score = 0.5 * device_correct + 0.5 * interface_correct
+```
+
+When interface ground truth is unavailable, device localization receives the full localization score.
+
+## Healthy cases
+
+Healthy negative samples evaluate false-positive control:
+
+- `network_healthy` receives full credit.
+- `fault_detected` and `inconclusive` receive zero.
+
+Localization and fault-type aggregates should be interpreted on positive fault cases, not healthy cases.
+
+## Symmetric locations
+
+Some faults affect both ends of a link or path segment. For `link_down`, `link_flapping`, `packet_loss`, `packet_corruption`, `high_latency`, and `mtu_mismatch`, the scorer can accept an equivalent peer-side location when topology evidence proves both answers refer to the same impairment.
+
+## Optional semantic fault-type judge
+
+Canonical string matching is the default. Set `NETOPSBENCH_FAULT_TYPE_JUDGE_ENABLED=1` to allow an LLM judge for non-exact but semantically meaningful fault type descriptions, such as mapping "BGP peer AS mismatch" to `bgp_neighbor_misconfig`.
+
+The judge affects only fault-type classification. Verdict, device localization, interface localization, and efficiency metrics remain deterministic. Reports include `fault_type_judgment` when semantic matching is used.
+
+## Aggregate report fields
+
+| Metric | Interpretation |
+|---|---|
+| `detection_accuracy` | Fault/healthy verdict quality. |
+| `device_localization_rate` | Device-level troubleshooting precision. |
+| `interface_localization_rate` | Interface-level precision for applicable cases. |
+| `localization_composite_score` | Combined localization metric used for comparison. |
+| `average_score` | Mean case score over the run. |
+| `avg_time_seconds` | Mean diagnosis latency per case. |
+| `avg_tool_calls` | Mean tool calls per case. |
+
+The scoring implementation lives in `netopsbench.evaluator.scorer` and session scoring helpers under `netopsbench.platform.session.scoring`.

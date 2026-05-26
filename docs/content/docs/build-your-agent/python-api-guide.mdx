@@ -1,0 +1,88 @@
+---
+title: Python API Guide
+description: Run NetOpsBench scenarios and suites from Python.
+---
+
+External integrations should import through the SDK root:
+
+```python
+from netopsbench.sdk import NetOpsBench
+```
+
+Use the checked-in examples for runnable scripts and the SDK for application code. Treat `netopsbench.platform.*` as internal implementation detail.
+
+## Run one scenario
+
+Prepare scenarios first with `netopsbench benchmark prepare --scales xs`, then call `run_scenario(...)`:
+
+```python
+from examples.agents import MinimalDeepAgent
+from netopsbench.sdk import NetOpsBench, RunFailedError
+
+with NetOpsBench(workspace=".") as bench:
+    agent = bench.agents.wrap(MinimalDeepAgent(vendor="openai"))
+    run = bench.sessions.run_scenario(
+        scenario="scenarios/generated/xs/generated_link_down_xs_001.yaml",
+        agent=agent,
+    )
+    try:
+        report = run.wait(raise_on_failure=True)
+    except RunFailedError as exc:
+        report = exc.report
+        raise
+
+print(report.summary)
+print(run.report_path)
+```
+
+`run` is a `RunHandle`. It records the run id, mode, runtime id, artifact directory, scenario ids, status, and persisted report path. `run.wait()` loads the saved `BenchmarkReport`.
+
+`bench.agents.wrap(...)` is recommended for provider-backed or asynchronous agents because it gives the SDK one lifecycle boundary to close resources.
+
+## Session APIs
+
+| API | Use when | Runtime ownership |
+|---|---|---|
+| `run_scenario(...)` | One scenario for environment validation or agent debugging. | SDK provisions and tears down a runtime unless `keep_runtime=True`. |
+| `run_suite(...)` | One agent over multiple scenarios. | SDK provisions a runtime pool; `workers=N` enables parallel execution. |
+| `run_on_runtime_scenario(...)` | You already provisioned a runtime and want one case. | Caller owns teardown. |
+| `run_on_runtime_suite(...)` | You already provisioned a runtime pool and want a suite. | Caller owns teardown. |
+
+Common options:
+
+| Option | Meaning |
+|---|---|
+| `workers` | Number of isolated runtime workers for automatic suite runs. |
+| `keep_runtime` | Preserve an automatically provisioned runtime for inspection. |
+| `artifacts_dir` | Override where `report.json`, metadata, and raw scenario outputs are written. |
+| `scale` | Explicit topology scale when it cannot be inferred from scenario paths. |
+
+## Artifacts
+
+When `artifacts_dir` is omitted, session artifacts are written under the workspace-managed artifact root. A run directory contains:
+
+- `report.json` for the final `BenchmarkReport`;
+- `metadata.json` for run-level metadata;
+- `raw/` for worker-local scenario outputs.
+
+The `scenario_summaries[*].raw_result_path` fields point to raw JSON files for case-level debugging.
+
+## SDK managers
+
+`NetOpsBench` groups public operations under managers:
+
+| Manager | Use |
+|---|---|
+| `bench.scenarios` | Load generated scenario files and handles. |
+| `bench.agents` | Wrap or manage objects implementing `diagnose(context)`. |
+| `bench.sessions` | Run scenarios and suites. |
+| `bench.runtimes` | Provision, attach, list, and tear down runtime pools. |
+| `bench.faults` | Register or inspect fault definitions. |
+| `bench.evaluators` | Score `DiagnosisResult` objects and produce reports. |
+| `bench.artifacts` | Resolve run artifacts and report files. |
+
+The stable external boundary is `netopsbench.sdk`, documented example scripts, and documented CLI commands such as `benchmark prepare`, `scenario validate`, `result show`, and `runtime teardown`.
+
+## Runtime ownership
+
+Automatic session methods are best for comparable benchmark runs because the SDK owns provisioning, observability startup, execution, and teardown. Existing-runtime methods are useful when debugging Containerlab, SONiC, Pingmesh, Telegraf, Grafana, or repeated agent iterations against a preserved lab.

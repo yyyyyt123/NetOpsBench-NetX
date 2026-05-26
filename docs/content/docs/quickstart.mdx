@@ -1,0 +1,90 @@
+---
+title: Quickstart
+description: The shortest path from a fresh clone to one completed NetOpsBench run.
+---
+
+This page verifies that the host can run one benchmark case. It stops after the first `BenchmarkReport`; agent implementation and larger benchmark runs are covered separately.
+
+## Requirements
+
+<Callout title="Linux host required" type="warn">
+NetOpsBench depends on Containerlab and Linux networking primitives such as network namespaces and veth pairs. Windows and macOS hosts are not supported for runtime execution.
+</Callout>
+
+- Python 3.11+
+- Docker
+- Containerlab
+- An API key for the selected LLM provider
+
+Install Docker:
+
+```bash
+curl -fsSL https://get.docker.com | sh
+sudo usermod -aG docker $USER   # re-login after this step
+docker run --rm hello-world
+```
+
+Install Containerlab:
+
+```bash
+bash -c "$(curl -sL https://get.containerlab.dev)"
+containerlab version
+```
+
+Enable non-interactive access for the privileged commands used by the benchmark scripts:
+
+```bash
+echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/containerlab, /usr/bin/rm" \
+  | sudo tee /etc/sudoers.d/netopsbench
+sudo chmod 440 /etc/sudoers.d/netopsbench
+sudo visudo -cf /etc/sudoers.d/netopsbench
+```
+
+Check the same shell session you will use for the run:
+
+```bash
+python3 --version
+docker run --rm hello-world
+containerlab version
+sudo -n docker ps
+sudo -n containerlab version
+sudo -n rm --version
+```
+
+If Docker still reports a socket permission error after `sudo usermod -aG docker $USER`, log out and back in, or start a new shell with `newgrp docker`. The `sudo -n` commands must not prompt for a password.
+
+## Install
+
+```bash
+git clone https://github.com/NetX-lab/NetOpsBench.git
+cd NetOpsBench
+python -m venv .venv
+source .venv/bin/activate
+pip install -e ".[agent]"
+```
+
+## Run one case
+
+Supported provider presets:
+
+| `--vendor` | Model | Environment variable |
+|---|---|---|
+| `openai` | gpt-5.4 | `OPENAI_API_KEY` |
+| `minimax` | MiniMax-M2.7 | `MINIMAX_API_KEY` |
+| `deepseek` | deepseek-v4-pro | `DEEPSEEK_API_KEY` |
+| `zhipu` | glm-5.1 | `ZHIPU_API_KEY` |
+| `kimi` | kimi-k2.6 | `KIMI_API_KEY` |
+
+```bash
+netopsbench benchmark prepare --scales xs
+export OPENAI_API_KEY=...
+PYTHONPATH=. python examples/01_run_scenario.py --vendor openai
+```
+
+The run provisions an XS topology, starts observability, injects one generated fault, calls the reference agent, scores the returned diagnosis, and writes a `BenchmarkReport`.
+
+## After success
+
+- Implement your own agent with [Custom Troubleshooting Agents](/docs/build-your-agent/custom-agents).
+- Run larger evaluations with [Running Benchmarks](/docs/run-benchmarks/run-scenario-vs-suite).
+- Use [Operations](/docs/debug-operate/observability) only when a runtime, Grafana dashboard, or cleanup path needs inspection.

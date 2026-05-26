@@ -1,0 +1,132 @@
+---
+title: Operations
+description: Inspect observability, preserve runtimes, reproduce the stack, and clean up labs.
+---
+
+Most benchmark runs use automatic runtime lifecycle management. Use this page only when a run needs inspection, a runtime should remain alive, or low-level observability must be reproduced by hand.
+
+## Grafana and worker buckets
+
+NetOpsBench starts InfluxDB, Telegraf, Grafana, and Pingmesh during benchmark runs.
+
+```text
+URL:      http://<host-ip>:3000
+Username: admin
+Password: admin
+```
+
+If `http_proxy` or `https_proxy` is set on the host, `localhost:3000` may be intercepted by the proxy. Use the host IP address from the browser, or set `NO_PROXY=localhost,127.0.0.1`.
+
+Grafana dashboards use a `Bucket` drop-down. Benchmark data lives in worker buckets, not in the default housekeeping bucket.
+
+| Run mode | Bucket pattern |
+|---|---|
+| One scenario | `network_data_xs_w01` |
+| XS suite with 3 workers | `network_data_xs_w01` through `network_data_xs_w03` |
+| Scale benchmark | `network_data_{scale}_w01` through the configured worker count |
+| Manual runtime | Worker bucket printed by the runtime script |
+
+Useful dashboards:
+
+| Dashboard | Use |
+|---|---|
+| DCN Overview | BGP state, interface traffic, packet loss, syslog, and fabric health. |
+| Pingmesh Analysis | Path latency, path loss, worst leaf pairs, and source/destination narrowing. |
+
+![DCN Overview dashboard](/assets/grafana_dcn_overview.png)
+
+![Pingmesh Analysis dashboard](/assets/grafana_pingmesh.png)
+
+## Common states
+
+| Symptom | Likely cause | Action |
+|---|---|---|
+| No data in every panel | Wrong bucket or no active runtime | Select `network_data_{scale}_w{n}` or start a runtime. |
+| No same-rack P99 on XS | XS has two racks with one client per rack | Use cross-rack panels on XS. |
+| Packet loss spikes during a scenario | Fault episode is active | Expected during the observation window. |
+| Packet loss remains after recovery | Cleanup or recovery may not have completed | Inspect scenario logs and preserved runtime state. |
+| BGP panels show non-established peers | Startup convergence or control-plane disruption | Check the scenario window and device logs. |
+| Telegraf data appears late | Scrape interval and startup lag | Wait about 30 seconds, then inspect Telegraf logs. |
+
+## Preserve a runtime
+
+Automatic examples tear down the runtime after the report is collected. `examples/05_manual_runtime.py` keeps a runtime alive:
+
+```bash
+PYTHONPATH=. python examples/05_manual_runtime.py --repo-root .
+```
+
+The script provisions a runtime and runs a scenario through the existing-runtime API:
+
+```python
+runtime = bench.runtimes.provision(scale="xs", workers=1, name=runtime_name)
+run = bench.sessions.run_on_runtime_scenario(
+    scenario=scenario,
+    runtime=runtime,
+    agent=agent,
+    artifacts_dir=artifacts_dir,
+)
+```
+
+Because the runtime is caller-owned, it remains active until explicit teardown.
+
+Useful checks:
+
+```bash
+sudo containerlab inspect -t lab-topology/generated_topology_xs/dcn.clab.yaml
+docker ps | grep clab-dcn
+docker ps | grep -E "influxdb|telegraf|grafana"
+docker logs telegraf | tail -20
+```
+
+## Reproduce observability manually
+
+Manual deployment is for debugging the observability stack outside an SDK-managed run.
+
+```bash
+# 1. Generate and deploy an XS topology
+bash scripts/runtime/deploy.sh xs lab-topology
+
+# 2. Point tooling at the active topology
+export NETOPSBENCH_TOPOLOGY_DIR="$PWD/lab-topology/generated_topology_xs"
+```
+
+`deploy.sh` generates topology metadata, renders Telegraf config, starts InfluxDB / Telegraf / Grafana, and deploys Pingmesh agents.
+
+Common overrides:
+
+```bash
+export NETOPSBENCH_MGMT_SUBNET=172.31.250.0/24
+export SONIC_GNMI_PORT=50051
+export SONIC_GNMI_USERNAME=admin
+export SONIC_GNMI_PASSWORD=<your-password>
+export NETOPSBENCH_SYSLOG_COLLECTOR=172.20.20.200
+export NETOPSBENCH_SFLOW_COLLECTOR=172.20.20.200
+```
+
+The default SONiC image is `yyyyyt123/netopsbench-sonic-vs-202505-telemetry:202505-telemetry`.
+
+## Cleanup
+
+SDK-visible runtimes:
+
+```bash
+netopsbench runtime list
+netopsbench runtime show <runtime-name>
+netopsbench runtime teardown <runtime-name>
+netopsbench runtime teardown --all
+```
+
+Manual deployment teardown:
+
+```bash
+bash scripts/runtime/teardown.sh lab-topology/generated_topology_xs
+```
+
+InfluxDB buckets can be inspected directly when debugging retained evidence:
+
+```bash
+sudo docker exec influxdb influx bucket list \
+  --host http://localhost:8086 \
+  --token "$NETOPSBENCH_INFLUXDB_TOKEN"
+```
