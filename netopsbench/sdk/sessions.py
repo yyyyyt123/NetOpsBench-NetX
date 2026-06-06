@@ -86,6 +86,7 @@ class SessionManager:
         root_dir: str | Path | None = None,
         keep_runtime: bool = False,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> RunHandle:
         return self._executor.run_scenario(
             scenario=_coerce_public_scenario_input(scenario),
@@ -95,6 +96,7 @@ class SessionManager:
             root_dir=root_dir,
             keep_runtime=keep_runtime,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def run_suite(
@@ -107,6 +109,7 @@ class SessionManager:
         root_dir: str | Path | None = None,
         keep_runtime: bool = False,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> RunHandle:
         return self._executor.run_suite(
             scenarios=_coerce_public_scenario_inputs(scenarios),
@@ -116,6 +119,7 @@ class SessionManager:
             root_dir=root_dir,
             keep_runtime=keep_runtime,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def run_on_runtime_scenario(
@@ -125,12 +129,14 @@ class SessionManager:
         runtime: RuntimePool,
         agent: Any,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> RunHandle:
         return self._executor.run_on_runtime_scenario(
             scenario=_coerce_public_scenario_input(scenario),
             runtime=runtime,
             agent=agent,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def run_on_runtime_suite(
@@ -140,12 +146,14 @@ class SessionManager:
         runtime: RuntimePool,
         agent: Any,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> RunHandle:
         return self._executor.run_on_runtime_suite(
             scenarios=_coerce_public_scenario_inputs(scenarios),
             runtime=runtime,
             agent=agent,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
 

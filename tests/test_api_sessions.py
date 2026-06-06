@@ -1,7 +1,10 @@
 import inspect
+import json
 import os
+import re
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 from netopsbench.sdk.agents import DiagnosisResult
 from netopsbench.sdk.core import NetOpsBench
@@ -176,19 +179,19 @@ def test_run_scenario_accepts_path_and_returns_real_run_handle(tmp_path, monkeyp
     )
 
     assert isinstance(run, RunHandle)
-    assert run.id == "run-0001"
+    assert re.fullmatch(r"run-\d{8}T\d{6}Z", run.id)
     assert run.mode == "scenario"
     assert run.status == "completed"
     assert isinstance(run.started_at, datetime)
     assert isinstance(run.completed_at, datetime)
-    assert run.runtime_id == "run-0001-runtime"
-    assert run.artifact_dir == str(tmp_path / "artifacts" / "run-0001")
+    assert run.runtime_id == f"{run.id}-runtime"
+    assert run.artifact_dir == str(tmp_path / "artifacts" / run.id)
     assert run.scenario_ids == ["scenario-1"]
     assert Path(run.artifact_dir).exists()
     report = run.report()
     assert isinstance(report, BenchmarkReport)
     assert report.raw["status"] == "completed"
-    assert report.summary["runtime_id"] == "run-0001-runtime"
+    assert report.summary["runtime_id"] == f"{run.id}-runtime"
     assert report.raw["runtime_owner"] == "platform"
     assert report.raw["execution"] == "real_runtime_runner"
 
@@ -311,6 +314,177 @@ def test_runtime_agent_context_is_sanitized_and_no_ground_truth_leak(tmp_path, m
     assert (agent.context.symptoms or {}).get("observations") is not None
 
 
+def test_runtime_trace_metadata_is_persisted_only_as_sidecar(tmp_path, monkeypatch):
+    _install_real_runtime_mocks(monkeypatch)
+    bench = NetOpsBench(workspace=str(tmp_path))
+    runtime = bench.runtimes.create(scale="xs", workers=1, name="trace-runtime")
+    scenario = _make_scenario(scenario_id="trace-scenario")
+
+    class TraceAgent:
+        name = "trace-agent"
+
+        def diagnose(self, context):
+            context.trace.record_llm_request([{"role": "user", "content": "diagnose"}], run_id="llm-1")
+            context.trace.record_llm_response(
+                SimpleNamespace(
+                    generations=[
+                        [SimpleNamespace(message=SimpleNamespace(type="ai", content="checking"))]
+                    ]
+                ),
+                run_id="llm-1",
+            )
+            return DiagnosisResult(
+                agent_name="trace-agent",
+                verdict="inconclusive",
+                findings={"fault_type": None, "location": {}, "evidence": []},
+                confidence=0.0,
+                reasoning="trace captured",
+                metadata={},
+            )
+
+    run = bench.sessions.run_on_runtime_scenario(
+        scenario=scenario,
+        runtime=runtime,
+        agent=TraceAgent(),
+        artifacts_dir=tmp_path / "trace-runs",
+    )
+
+    report = run.report()
+    raw_result_path = Path(report.scenario_summaries[0]["raw_result_path"])
+    raw_result = json.loads(raw_result_path.read_text(encoding="utf-8"))
+    diagnosis = raw_result["episodes"][0]["diagnosis"]
+
+    assert "trace" not in diagnosis["metadata"]
+    assert "trajectory" not in diagnosis["metadata"]
+    assert diagnosis["trace"]["trace_id"]
+    assert Path(diagnosis["trace"]["atif_path"]).exists()
+
+
+def test_runtime_agent_failure_trace_is_linked_from_results_sidecar(tmp_path, monkeypatch):
+    _install_real_runtime_mocks(monkeypatch)
+
+    import netopsbench.platform.session.orchestrator as sessions_mod
+
+    class LinkedEvalResult:
+        score = 0.0
+
+        def to_dict(self):
+            return {
+                "testcase_id": "failure-scenario:ep1",
+                "score": 0.0,
+                "details": {"scenario_id": "failure-scenario", "episode_id": "ep1"},
+            }
+
+    monkeypatch.setattr(sessions_mod, "score_scenario_fault_episodes", lambda *args, **kwargs: [LinkedEvalResult()])
+
+    bench = NetOpsBench(workspace=str(tmp_path))
+    runtime = bench.runtimes.create(scale="xs", workers=1, name="trace-failure-runtime")
+    scenario = _make_scenario(scenario_id="failure-scenario")
+
+    class FailingAgent:
+        name = "failing-agent"
+        vendor = "deepseek"
+        model = "deepseek-v4-pro"
+
+        def diagnose(self, context):
+            raise ValueError("agent exploded")
+
+    run = bench.sessions.run_on_runtime_scenario(
+        scenario=scenario,
+        runtime=runtime,
+        agent=FailingAgent(),
+        artifacts_dir=tmp_path / "trace-failure-runs",
+    )
+
+    report = run.report()
+    raw_result_path = Path(report.scenario_summaries[0]["raw_result_path"])
+    raw_result = json.loads(raw_result_path.read_text(encoding="utf-8"))
+    diagnosis = raw_result["episodes"][0]["diagnosis"]
+
+    assert diagnosis["success"] is False
+    assert diagnosis["error"] == "agent exploded"
+    assert diagnosis["trace"]["trace_id"]
+    assert diagnosis["trace"]["case_id"].startswith("case-")
+
+    result_rows = [
+        json.loads(line)
+        for line in (Path(run.artifact_dir) / "traces" / "results.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert result_rows[0]["trace_id"] == diagnosis["trace"]["trace_id"]
+    assert result_rows[0]["case_id"] == diagnosis["trace"]["case_id"]
+    assert result_rows[0]["case_id"] is not None
+
+    index_rows = [
+        json.loads(line)
+        for line in (Path(run.artifact_dir) / "traces" / "index.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert index_rows[0]["provider"] == "deepseek"
+    assert index_rows[0]["model"] == "deepseek-v4-pro"
+    assert index_rows[0]["topology_scale"] == "xs"
+
+
+def test_runtime_trace_false_disables_trace_artifacts_and_recorder_capture(tmp_path, monkeypatch):
+    _install_real_runtime_mocks(monkeypatch)
+    bench = NetOpsBench(workspace=str(tmp_path))
+    runtime = bench.runtimes.create(scale="xs", workers=1, name="trace-off-runtime")
+    scenario = _make_scenario(scenario_id="trace-off-scenario")
+
+    class TraceOffAgent:
+        name = "trace-off-agent"
+
+        def __init__(self):
+            self.trace_enabled = None
+
+        def diagnose(self, context):
+            self.trace_enabled = getattr(context.trace, "enabled", None)
+            context.trace.record_llm_request([{"role": "user", "content": "private prompt"}], run_id="llm-1")
+            context.trace.record_llm_response(
+                SimpleNamespace(
+                    generations=[
+                        [
+                            SimpleNamespace(
+                                message=SimpleNamespace(
+                                    type="ai",
+                                    content="private response",
+                                    usage_metadata={"input_tokens": 99, "output_tokens": 1, "total_tokens": 100},
+                                )
+                            )
+                        ]
+                    ]
+                ),
+                run_id="llm-1",
+            )
+            return DiagnosisResult(
+                agent_name="trace-off-agent",
+                verdict="inconclusive",
+                findings={"fault_type": None, "location": {}, "evidence": []},
+                confidence=0.0,
+                reasoning="trace disabled",
+                metadata={"input_tokens": 3, "tool_calls": [{"tool": "manual"}]},
+            )
+
+    agent = TraceOffAgent()
+    run = bench.sessions.run_on_runtime_scenario(
+        scenario=scenario,
+        runtime=runtime,
+        agent=agent,
+        artifacts_dir=tmp_path / "trace-off-runs",
+        trace=False,
+    )
+
+    report = run.report()
+    raw_result_path = Path(report.scenario_summaries[0]["raw_result_path"])
+    raw_result = json.loads(raw_result_path.read_text(encoding="utf-8"))
+    diagnosis = raw_result["episodes"][0]["diagnosis"]
+
+    assert agent.trace_enabled is False
+    assert "trace" not in diagnosis
+    assert diagnosis["metadata"]["input_tokens"] == 3
+    assert diagnosis["tool_calls"] == [{"tool": "manual"}]
+    assert "traces_dir" not in report.artifact_paths
+    assert not (Path(run.artifact_dir) / "traces").exists()
+
+
 def test_runtime_session_does_not_override_process_env_during_diagnosis(tmp_path, monkeypatch):
     _install_real_runtime_mocks(monkeypatch)
     bench = NetOpsBench(workspace=str(tmp_path))
@@ -373,6 +547,7 @@ def test_session_manager_signatures_match_public_surface_without_provider_or_mod
         "root_dir",
         "keep_runtime",
         "artifacts_dir",
+        "trace",
     ]
     assert list(methods["run_suite"].parameters) == [
         "scenarios",
@@ -382,21 +557,25 @@ def test_session_manager_signatures_match_public_surface_without_provider_or_mod
         "root_dir",
         "keep_runtime",
         "artifacts_dir",
+        "trace",
     ]
     assert list(methods["run_on_runtime_scenario"].parameters) == [
         "scenario",
         "runtime",
         "agent",
         "artifacts_dir",
+        "trace",
     ]
     assert list(methods["run_on_runtime_suite"].parameters) == [
         "scenarios",
         "runtime",
         "agent",
         "artifacts_dir",
+        "trace",
     ]
 
     for sig in methods.values():
+        assert sig.parameters["trace"].default is True
         for forbidden in ("provider", "model", "model_name"):
             assert forbidden not in sig.parameters
 

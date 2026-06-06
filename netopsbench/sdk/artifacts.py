@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from netopsbench.platform.session.tracing import export_traces, load_trace_index, load_trace_results
+
 
 class ArtifactManager:
     """Thin helper for resolving and persisting public artifact data."""
@@ -22,6 +24,9 @@ class ArtifactManager:
 
     def get_run_metadata_path(self, run_id: str) -> Path:
         return self.get_run_dir(run_id) / "metadata.json"
+
+    def get_run_traces_dir(self, run_id: str) -> Path:
+        return self.get_run_dir(run_id) / "traces"
 
     def get_runtime_metadata_path(self, runtime_id: str) -> Path:
         return self.get_runtime_dir(runtime_id) / "metadata.json"
@@ -44,3 +49,18 @@ class ArtifactManager:
         if not isinstance(payload, dict):
             raise ValueError(f"Metadata payload must be a JSON object: {metadata_path}")
         return payload
+
+    def get_run_traces(self, run_id: str) -> list[dict[str, Any]]:
+        """Return the run-level trace index rows for ``run_id``."""
+
+        return load_trace_index(self.get_run_dir(run_id))
+
+    def get_run_trace_results(self, run_id: str) -> list[dict[str, Any]]:
+        """Return run-level trace scoring/result rows for ``run_id``."""
+
+        return load_trace_results(self.get_run_dir(run_id))
+
+    def export_traces(self, run_id: str, *, output: str | Path) -> Path:
+        """Export run traces as a Harbor jobs directory."""
+
+        return export_traces(self.get_run_dir(run_id), output=output)

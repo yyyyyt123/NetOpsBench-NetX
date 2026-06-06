@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 
+from netopsbench.agents.tracing import AgentTraceRecorder
 from netopsbench.sdk.types import DiagnosisResult, DiagnosticContext
 
 logger = logging.getLogger(__name__)
@@ -145,5 +146,6 @@ __all__ = [
     "SyncDiagnosticAgent",
     "AgentHandle",
     "AgentManager",
+    "AgentTraceRecorder",
     "DiagnosticContext",
 ]

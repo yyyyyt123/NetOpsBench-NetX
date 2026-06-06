@@ -45,6 +45,13 @@ set +a
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 LOG_DIR="${REPO_ROOT}/scenario_results/benchmark_logs_${TIMESTAMP}"
 mkdir -p "$LOG_DIR"
+RUN_MANIFEST="${LOG_DIR}/benchmark_runs_${TIMESTAMP}.jsonl"
+
+list_run_dirs() {
+    local runs_dir="$REPO_ROOT/.netopsbench/runs"
+    [ -d "$runs_dir" ] || return 0
+    find "$runs_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
+}
 
 # ── Helper: clean all clab resources ────────────────────────
 cleanup_clab() {
@@ -87,8 +94,14 @@ echo " Total:   ${total_scenarios} scenarios"
 echo " Logs:    ${LOG_DIR}"
 echo "======================================================"
 
-# Clean stale data
-sudo rm -rf "$REPO_ROOT/.netopsbench/runs/"* 2>/dev/null || true
+# Clean stale runtime data. Run artifacts are preserved by default so traces
+# remain available across benchmark invocations.
+if [[ "${BENCH_CLEAN_RUNS:-0}" == "1" ]]; then
+    echo "Cleaning previous run artifacts because BENCH_CLEAN_RUNS=1"
+    sudo rm -rf "$REPO_ROOT/.netopsbench/runs/"* 2>/dev/null || true
+else
+    echo "Preserving previous run artifacts in ${REPO_ROOT}/.netopsbench/runs"
+fi
 cleanup_clab
 
 # ── 逐 scale 执行 ──────────────────────────────────────────
@@ -97,8 +110,11 @@ for scale in "${SCALES[@]}"; do
     workers="${SCALE_WORKERS[$scale]:-1}"
     label="${VENDOR}_${scale}"
     log_file="${LOG_DIR}/${label}.log"
+    runs_before="${LOG_DIR}/${label}.runs_before"
+    runs_after="${LOG_DIR}/${label}.runs_after"
     echo ""
     echo "[$(date '+%H:%M:%S')] >>> ${label}: workers=${workers}"
+    list_run_dirs > "$runs_before"
 
     if NETOPSBENCH_WORKER_DEPLOY_JOBS="${SCALE_DEPLOY_JOBS[$scale]:-${workers}}" \
        NETOPSBENCH_WORKER_HEALTH_RETRIES="${SCALE_HEALTH_RETRIES[$scale]:-12}" \
@@ -106,9 +122,45 @@ for scale in "${SCALES[@]}"; do
             --vendor "$VENDOR" --scale "$scale" --workers "$workers" \
             > "$log_file" 2>&1; then
         echo "[$(date '+%H:%M:%S')]  ✓  ${label} — 完成"
+        run_status="completed"
     else
         echo "[$(date '+%H:%M:%S')]  ✗  ${label} — 失败 (see ${log_file})"
         failed=$((failed + 1))
+        run_status="failed"
+    fi
+
+    list_run_dirs > "$runs_after"
+    new_runs="$(comm -13 "$runs_before" "$runs_after" || true)"
+    if [ -n "$new_runs" ]; then
+        while IFS= read -r run_id; do
+            [ -z "$run_id" ] && continue
+            report_path="$REPO_ROOT/.netopsbench/runs/${run_id}/report.json"
+            trace_index="$REPO_ROOT/.netopsbench/runs/${run_id}/traces/index.jsonl"
+            view_cmd="netopsbench --workspace \"$REPO_ROOT\" trace view ${run_id}"
+            echo "[$(date '+%H:%M:%S')]     run: ${run_id}"
+            echo "[$(date '+%H:%M:%S')]     trace: ${trace_index}"
+            echo "[$(date '+%H:%M:%S')]     view: ${view_cmd}"
+            "$PYTHON" - "$RUN_MANIFEST" "$run_id" "$label" "$scale" "$VENDOR" "$log_file" "$report_path" "$trace_index" "$view_cmd" "$run_status" <<'PYEOF'
+import json
+import sys
+
+manifest, run_id, label, scale, vendor, log_file, report_path, trace_index, view_cmd, status = sys.argv[1:]
+with open(manifest, "a", encoding="utf-8") as fh:
+    fh.write(json.dumps({
+        "run_id": run_id,
+        "label": label,
+        "scale": scale,
+        "vendor": vendor,
+        "status": status,
+        "log_file": log_file,
+        "report": report_path,
+        "trace_index": trace_index,
+        "trace_view_command": view_cmd,
+    }, sort_keys=True) + "\n")
+PYEOF
+        done <<< "$new_runs"
+    else
+        echo "[$(date '+%H:%M:%S')]     no new run artifact detected for ${label}"
     fi
 
     # Clean up between scales
@@ -121,21 +173,37 @@ echo " 全部执行完毕  (失败: ${failed})"
 echo "======================================================"
 
 # ── 汇总结果 ────────────────────────────────────────────────
-# 找最新的 run 目录，提取 report.json 的 summary 字段
+# 汇总本次 benchmark 产生的 run；历史 runs 不会混入本次 CSV。
 SUMMARY_CSV="${REPO_ROOT}/scenario_results/benchmark_summary_${TIMESTAMP}.csv"
 
-"$PYTHON" - "$REPO_ROOT" "$TIMESTAMP" <<'PYEOF'
+"$PYTHON" - "$REPO_ROOT" "$TIMESTAMP" "$RUN_MANIFEST" <<'PYEOF'
 import json, sys, csv
 from pathlib import Path
 from datetime import datetime
 
 repo = Path(sys.argv[1])
 ts = sys.argv[2]
+manifest_path = Path(sys.argv[3])
 results_dir = repo / ".netopsbench" / "runs"
 
-# Collect all report.json files
+# Collect this benchmark's report.json files.
 reports = []
-for rj in sorted(results_dir.rglob("report.json")):
+report_paths = []
+if manifest_path.exists():
+    for line in manifest_path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except Exception:
+            continue
+        run_id = row.get("run_id")
+        if run_id:
+            report_paths.append(results_dir / str(run_id) / "report.json")
+
+for rj in report_paths:
+    if not rj.exists():
+        continue
     try:
         data = json.loads(rj.read_text())
     except Exception:
@@ -195,7 +263,7 @@ for rj in sorted(results_dir.rglob("report.json")):
     })
 
 if not reports:
-    print("No report.json files found.")
+    print("No report.json files found for this benchmark.")
     sys.exit(0)
 
 # Sort by vendor, scale

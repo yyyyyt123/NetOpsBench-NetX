@@ -37,7 +37,6 @@ from typing import Any
 
 from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
-from langchain.agents.structured_output import ToolStrategy
 
 from netopsbench.agents.base import DiagnosticContext
 from netopsbench.sdk.agents import DiagnosisResult
@@ -50,8 +49,7 @@ from .providers.results import (
     _error_result,
     _parse_raw_result,
 )
-from .providers.runtime import RuntimeTraceCollector, _connect_mcp_tools
-from .schema import DiagnosisOutput
+from .providers.runtime import _connect_mcp_tools
 
 _PACKAGE_ROOT = Path(__file__).resolve().parent
 DEFAULT_MAX_TOOL_CALLS = 40
@@ -118,7 +116,9 @@ class MinimalDeepAgent:
         worker_env = context.metadata.get("worker_env") if context.metadata else None
         server_config = self.mcp_server_config or builtin_mcp_server_config(workspace=repo_root, env=worker_env)
         exit_stack = AsyncExitStack()
-        trace = RuntimeTraceCollector()
+        trace_callback = _langchain_trace_callback(context)
+        tool_calls: list[dict[str, Any]] = []
+        token_counts: dict[str, int] = {}
 
         try:
             await exit_stack.__aenter__()
@@ -138,7 +138,6 @@ class MinimalDeepAgent:
                 model=llm,
                 tools=mcp_tools,
                 system_prompt=self.system_prompt,
-                response_format=ToolStrategy(schema=DiagnosisOutput),
                 skills=["/skills/"] if skills_root.is_dir() else [],
                 backend=FilesystemBackend(root_dir=_PACKAGE_ROOT, virtual_mode=True),
             )
@@ -149,15 +148,11 @@ class MinimalDeepAgent:
 
             raw = await agent.ainvoke(
                 {"messages": [{"role": "user", "content": build_user_prompt(context)}]},
-                config={"recursion_limit": recursion_limit, "callbacks": [trace]},
+                config={"recursion_limit": recursion_limit, "callbacks": [trace_callback] if trace_callback else []},
             )
             structured, tool_calls, token_counts = _parse_raw_result(raw)
-            if trace.tool_calls:
-                tool_calls = trace.tool_calls
-            if trace.token_counts.get("llm_call_count", 0):
-                token_counts = trace.token_counts
             if not structured:
-                raise ValueError("structured_response missing from runtime result")
+                raise ValueError("DiagnosisOutput JSON block missing or invalid in runtime result")
 
             return _build_diagnosis_result(
                 self.name,
@@ -173,8 +168,8 @@ class MinimalDeepAgent:
                 self.vendor,
                 self.model,
                 exc,
-                tool_calls=trace.tool_calls,
-                token_counts=trace.token_counts,
+                tool_calls=tool_calls,
+                token_counts=token_counts,
             )
         finally:
             await exit_stack.aclose()
@@ -184,3 +179,9 @@ class MinimalDeepAgent:
 
     def get_capabilities(self):
         return ["deepagent_reasoning", "mcp_tool_diagnosis", "sdk_public_agent"]
+
+
+def _langchain_trace_callback(context: DiagnosticContext) -> Any | None:
+    trace = getattr(context, "trace", None)
+    callback_factory = getattr(trace, "langchain_callback", None)
+    return callback_factory() if callable(callback_factory) else None

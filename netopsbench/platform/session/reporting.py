@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,18 +42,15 @@ def artifacts_root(artifact_manager: Any, artifacts_dir: str | Path | None) -> P
     return Path(artifacts_dir) if artifacts_dir is not None else (artifact_manager.root_dir / "runs")
 
 
-def next_run_id(artifact_root: Path) -> str:
-    if not artifact_root.exists():
-        return "run-0001"
-    indices: list[int] = []
-    for child in artifact_root.iterdir():
-        if not child.is_dir() or not child.name.startswith("run-"):
-            continue
-        suffix = child.name[4:]
-        if suffix.isdigit():
-            indices.append(int(suffix))
-    next_index = (max(indices) + 1) if indices else 1
-    return f"run-{next_index:04d}"
+def next_run_id(artifact_root: Path, *, started_at: datetime | None = None) -> str:
+    timestamp = (started_at or datetime.now(UTC)).astimezone(UTC)
+    base = f"run-{timestamp.strftime('%Y%m%dT%H%M%SZ')}"
+    if not artifact_root.exists() or not (artifact_root / base).exists():
+        return base
+    suffix = 2
+    while (artifact_root / f"{base}-{suffix:02d}").exists():
+        suffix += 1
+    return f"{base}-{suffix:02d}"
 
 
 def resolve_scale(platform: Any, scenarios: Iterable[ScenarioExecutionRef]) -> str:
@@ -82,6 +79,9 @@ def create_run_report(
     raw_dir: Path,
     report_path: Path,
     metadata_path: Path,
+    traces_dir: Path | None = None,
+    trace_index_path: Path | None = None,
+    trace_results_path: Path | None = None,
 ) -> dict[str, Any]:
     overall_success = all(summary.get("success", False) for summary in worker_summaries) if worker_summaries else True
     status = "completed" if overall_success else "failed"
@@ -94,6 +94,18 @@ def create_run_report(
         or (scenarios[0].scale if scenarios else "unknown")
         or "unknown"
     )
+    artifact_paths = {
+        "report": str(report_path),
+        "metadata": str(metadata_path),
+        "raw_dir": str(raw_dir),
+    }
+    if traces_dir is not None:
+        artifact_paths["traces_dir"] = str(traces_dir)
+    if trace_index_path is not None:
+        artifact_paths["trace_index"] = str(trace_index_path)
+    if trace_results_path is not None:
+        artifact_paths["trace_results"] = str(trace_results_path)
+
     return {
         "id": f"run:{run_id}",
         "run_id": run_id,
@@ -115,11 +127,7 @@ def create_run_report(
         },
         "scenario_summaries": scenario_summaries,
         "detailed_results": list(aggregate_report.get("detailed_results") or []),
-        "artifact_paths": {
-            "report": str(report_path),
-            "metadata": str(metadata_path),
-            "raw_dir": str(raw_dir),
-        },
+        "artifact_paths": artifact_paths,
         "raw": {
             "status": status,
             "mode": mode,
@@ -156,7 +164,17 @@ def save_run_metadata(
     completed_at: datetime,
     scenarios: Sequence[ScenarioExecutionRef],
     worker_summaries: list[dict[str, Any]],
+    traces_dir: Path | None = None,
+    trace_index_path: Path | None = None,
+    trace_results_path: Path | None = None,
 ) -> None:
+    artifact_paths = {}
+    if traces_dir is not None:
+        artifact_paths["traces_dir"] = str(traces_dir)
+    if trace_index_path is not None:
+        artifact_paths["trace_index"] = str(trace_index_path)
+    if trace_results_path is not None:
+        artifact_paths["trace_results"] = str(trace_results_path)
     artifact_manager.save_metadata(
         artifact_dir,
         {
@@ -171,6 +189,7 @@ def save_run_metadata(
             "scenario_ids": [scenario.id for scenario in scenarios],
             "execution": "real_runtime_runner",
             "worker_summaries": worker_summaries,
+            "artifact_paths": artifact_paths,
         },
     )
 

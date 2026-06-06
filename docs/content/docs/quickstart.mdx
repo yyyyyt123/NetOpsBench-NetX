@@ -11,7 +11,7 @@ This page verifies that the host can run one benchmark case. It stops after the 
 NetOpsBench depends on Containerlab and Linux networking primitives such as network namespaces and veth pairs. Windows and macOS hosts are not supported for runtime execution.
 </Callout>
 
-- Python 3.11+
+- Python 3.12+
 - Docker
 - Containerlab
 - An API key for the selected LLM provider
@@ -85,6 +85,7 @@ The run provisions an XS topology, starts observability, injects one generated f
 
 ## After success
 
+- Open saved agent trajectories with `netopsbench trace view`; it syncs trace-enabled runs into the local Harbor viewer cache automatically.
 - Implement your own agent with [Custom Troubleshooting Agents](/docs/build-your-agent/custom-agents).
 - Run larger evaluations with [Running Benchmarks](/docs/run-benchmarks/run-scenario-vs-suite).
 - Use [Operations](/docs/debug-operate/observability) only when a runtime, Grafana dashboard, or cleanup path needs inspection.

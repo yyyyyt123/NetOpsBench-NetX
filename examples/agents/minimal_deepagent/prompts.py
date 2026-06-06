@@ -17,7 +17,8 @@ DEFAULT_SYSTEM_PROMPT = (
     "Prefer Pingmesh and topology tools first, then validate with interface, routing, and log evidence. "
     "Be efficient: avoid redundant tool calls and do not repeat the same query. "
     "You have a limited tool-call budget — focus on the most informative tools first. "
-    "When your investigation is complete, you MUST call the DiagnosisOutput tool to submit your final structured diagnosis."
+    "When your investigation is complete, return a final answer containing one fenced JSON block that matches "
+    "the DiagnosisOutput schema."
 )
 
 
@@ -81,5 +82,19 @@ def build_user_prompt(context: Any) -> str:
         "2) Gather evidence with tools instead of relying on the summary alone.\n"
         "3) If a fault exists, identify fault_type and the most likely network-side location.\n"
         "4) Keep reasoning concise and tied to tool evidence.\n"
-        "5) When done, call the DiagnosisOutput tool with your final structured diagnosis.\n"
+        "5) If you call an MCP tool, first explain in normal assistant text what evidence you need and why.\n"
+        "6) Do not reveal hidden chain-of-thought; keep investigation notes observable and evidence-oriented.\n"
+        "7) When done, include exactly one fenced ```json block with fields: "
+        "verdict, fault_type, location, evidence, confidence, reasoning.\n"
+        "8) The JSON verdict MUST be exactly one of fault_detected, network_healthy, or inconclusive.\n"
+        "9) The JSON location MUST be an object, never a string: "
+        '{"device": "leaf1", "interface": "Ethernet8"}. '
+        'Use {"device": null, "interface": null} when location is unknown or not applicable.\n'
+        "10) Final JSON shape example:\n"
+        "```json\n"
+        '{"verdict":"fault_detected","fault_type":"link_down",'
+        '"location":{"device":"leaf1","interface":"Ethernet8"},'
+        '"evidence":["brief tool-backed fact"],"confidence":0.8,'
+        '"reasoning":"short evidence-based summary"}\n'
+        "```\n"
     )

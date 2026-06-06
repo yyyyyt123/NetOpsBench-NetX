@@ -14,6 +14,7 @@ _EXPORT_MAP: dict[str, tuple[str, str]] = {
     "SyncDiagnosticAgent": ("netopsbench.sdk.agents", "SyncDiagnosticAgent"),
     "AgentHandle": ("netopsbench.sdk.agents", "AgentHandle"),
     "AgentManager": ("netopsbench.sdk.agents", "AgentManager"),
+    "AgentTraceRecorder": ("netopsbench.sdk.agents", "AgentTraceRecorder"),
     "DiagnosticContext": ("netopsbench.sdk.types", "DiagnosticContext"),
     "DiagnosisResult": ("netopsbench.sdk.types", "DiagnosisResult"),
     "BuiltinMCPServerHandle": ("netopsbench.sdk.mcp", "BuiltinMCPServerHandle"),

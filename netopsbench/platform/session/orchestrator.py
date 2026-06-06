@@ -6,9 +6,11 @@ import json
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from netopsbench.agents.base import DiagnosticContext
+from netopsbench.agents.tracing import AgentTraceRecorder
 from netopsbench.evaluator.fault_type_judge import create_judge_from_env
 from netopsbench.evaluator.scorer import Evaluator
 from netopsbench.logging_utils import get_logger
@@ -34,6 +36,7 @@ from netopsbench.platform.session.reporting import (
     save_run_report,
 )
 from netopsbench.platform.session.scoring import score_scenario_fault_episodes
+from netopsbench.platform.session.tracing import TraceWriter
 from netopsbench.platform.session.types import ScenarioExecutionRef, WorkerExecutionContext
 from netopsbench.platform.worker.pool import WorkerSpec
 from netopsbench.platform.worker.runtime_agent_input import (
@@ -75,6 +78,7 @@ class SessionOrchestrator:
         root_dir: str | Path | None = None,
         keep_runtime: bool = False,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> Any:
         return self._run_with_platform_runtime(
             mode="scenario",
@@ -85,6 +89,7 @@ class SessionOrchestrator:
             root_dir=root_dir,
             keep_runtime=keep_runtime,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def run_suite(
@@ -97,6 +102,7 @@ class SessionOrchestrator:
         root_dir: str | Path | None = None,
         keep_runtime: bool = False,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> Any:
         return self._run_with_platform_runtime(
             mode="suite",
@@ -107,6 +113,7 @@ class SessionOrchestrator:
             root_dir=root_dir,
             keep_runtime=keep_runtime,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def run_on_runtime_scenario(
@@ -116,6 +123,7 @@ class SessionOrchestrator:
         runtime: RuntimePool,
         agent: Any,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> Any:
         return self._run_with_existing_runtime(
             mode="scenario",
@@ -123,6 +131,7 @@ class SessionOrchestrator:
             runtime=runtime,
             agent=agent,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def run_on_runtime_suite(
@@ -132,6 +141,7 @@ class SessionOrchestrator:
         runtime: RuntimePool,
         agent: Any,
         artifacts_dir: str | Path | None = None,
+        trace: bool = True,
     ) -> Any:
         return self._run_with_existing_runtime(
             mode="suite",
@@ -139,6 +149,7 @@ class SessionOrchestrator:
             runtime=runtime,
             agent=agent,
             artifacts_dir=artifacts_dir,
+            trace=trace,
         )
 
     def _run_with_platform_runtime(
@@ -152,8 +163,10 @@ class SessionOrchestrator:
         root_dir: str | Path | None,
         keep_runtime: bool,
         artifacts_dir: str | Path | None,
+        trace: bool,
     ) -> Any:
-        run_id = self._next_run_id(self._artifacts_root(artifacts_dir))
+        started_at = self._timestamp()
+        run_id = self._next_run_id(self._artifacts_root(artifacts_dir), started_at=started_at)
         runtime_id = f"{run_id}-runtime"
         runtime = self._provision_runtime(
             scale=scale or self._resolve_scale(scenarios),
@@ -169,8 +182,10 @@ class SessionOrchestrator:
                 runtime=runtime,
                 agent=agent,
                 artifacts_dir=artifacts_dir,
+                trace=trace,
                 runtime_owner="platform",
                 teardown=("preserved" if keep_runtime else "performed"),
+                started_at=started_at,
             )
         finally:
             if not keep_runtime:
@@ -184,8 +199,10 @@ class SessionOrchestrator:
         runtime: RuntimePool,
         agent: Any,
         artifacts_dir: str | Path | None,
+        trace: bool,
     ) -> Any:
-        run_id = self._next_run_id(self._artifacts_root(artifacts_dir))
+        started_at = self._timestamp()
+        run_id = self._next_run_id(self._artifacts_root(artifacts_dir), started_at=started_at)
         return self._execute_on_runtime_pool(
             run_id=run_id,
             mode=mode,
@@ -193,8 +210,10 @@ class SessionOrchestrator:
             runtime=runtime,
             agent=agent,
             artifacts_dir=artifacts_dir,
+            trace=trace,
             runtime_owner="user",
             teardown="skipped",
+            started_at=started_at,
         )
 
     def _execute_on_runtime_pool(
@@ -206,12 +225,14 @@ class SessionOrchestrator:
         runtime: RuntimePool,
         agent: Any,
         artifacts_dir: str | Path | None,
+        trace: bool,
         runtime_owner: str,
         teardown: str,
+        started_at: datetime,
     ) -> Any:
-        started_at = self._timestamp()
         artifact_dir = self._artifacts_root(artifacts_dir) / run_id
         raw_dir = artifact_dir / "raw"
+        trace_writer = TraceWriter(artifact_dir / "traces", run_id=run_id) if self._trace_enabled(trace) else None
         artifact_dir.mkdir(parents=True, exist_ok=True)
         raw_dir.mkdir(parents=True, exist_ok=True)
         report_path = artifact_dir / "report.json"
@@ -224,6 +245,8 @@ class SessionOrchestrator:
             agent=agent,
             artifact_dir=artifact_dir,
             raw_dir=raw_dir,
+            traces_dir=(trace_writer.root_dir if trace_writer is not None else None),
+            trace_writer=trace_writer,
             report_path=report_path,
             metadata_path=metadata_path,
             runtime_owner=runtime_owner,
@@ -270,6 +293,11 @@ class SessionOrchestrator:
         topology_dir: str,
         scenario_id: str,
         worker_context: WorkerExecutionContext | None = None,
+        trace_writer: TraceWriter | None = None,
+        worker_name: str | None = None,
+        run_id: str | None = None,
+        runtime_id: str | None = None,
+        scenario_scale: str | None = None,
     ):
         toolkit = _build_toolkit_for_topology(topology_dir)
         if worker_context is not None:
@@ -278,7 +306,7 @@ class SessionOrchestrator:
                 toolkit.topology_id = worker_context.topology_id
             except Exception:
                 logger.debug("failed to attach worker context to toolkit", exc_info=True)
-        handle = agent if hasattr(agent, "diagnose") and hasattr(agent, "name") else AgentHandleAdapter(agent)
+        handle = agent if isinstance(agent, AgentHandleAdapter) else AgentHandleAdapter(agent)
         context_dir = Path(topology_dir) / ".netopsbench"
         context_file = context_dir / "pingmesh_context.json"
 
@@ -290,6 +318,7 @@ class SessionOrchestrator:
 
         def callback(episode_result: dict) -> dict:
             start_time = self._timestamp()
+            trace_recorder = AgentTraceRecorder(enabled=trace_writer is not None)
             pingmesh_query_window = _extract_episode_pingmesh_query_window(episode_result)
             window_start = pingmesh_query_window.get("start_time")
             window_end = pingmesh_query_window.get("end_time")
@@ -316,16 +345,69 @@ class SessionOrchestrator:
                 ),
                 ground_truth=None,
                 tools=toolkit,
+                trace=trace_recorder,
                 metadata={"worker_env": _worker_env} if _worker_env else {},
             )
-            diagnosis = self._run_agent_diagnose(handle, context)
+            try:
+                diagnosis = self._run_agent_diagnose(handle, context)
+            except Exception as exc:
+                trace_recorder.record_error(stage="agent", error=exc)
+                ended_at = self._timestamp()
+                diagnosis_payload = {
+                    "error": str(exc),
+                    "success": False,
+                    "time_taken_seconds": max(0.0, (ended_at - start_time).total_seconds()),
+                    "metadata": {"agent_failure_stage": "diagnose", "error_type": type(exc).__name__},
+                }
+                if trace_writer is not None:
+                    try:
+                        trace_result = trace_writer.write_case_trace(
+                            case_id=context.scenario_id,
+                            scenario_id=scenario_id,
+                            episode_result=episode_result,
+                            worker=worker_name or "worker",
+                            topology_id=(worker_context.topology_id if worker_context is not None else None),
+                            topology_scale=scenario_scale,
+                            runtime_id=runtime_id or "",
+                            agent=agent,
+                            diagnostic_context=context,
+                            diagnosis=SimpleNamespace(
+                                agent_name=getattr(handle, "name", "agent"),
+                                success=False,
+                                findings={"error": str(exc)},
+                                metadata=diagnosis_payload["metadata"],
+                            ),
+                            diagnosis_payload=diagnosis_payload,
+                            started_at=start_time,
+                            ended_at=ended_at,
+                            pingmesh_window=pingmesh_query_window,
+                            error=str(exc),
+                            trace_recorder=trace_recorder,
+                        )
+                        diagnosis_payload["trace"] = {
+                            "trace_id": trace_result.trace_id,
+                            "case_id": trace_result.case_id,
+                            "worker": trace_result.worker,
+                            "atif_path": trace_result.atif_path,
+                        }
+                    except Exception:
+                        logger.debug("failed to persist failed agent runtime trace", exc_info=True)
+                diagnosis_payload["metadata"] = _strip_runtime_trace_metadata(diagnosis_payload["metadata"])
+                return diagnosis_payload
             findings = dict(diagnosis.findings or {})
             location = findings.get("location") or {}
             if not isinstance(location, dict):
                 location = {}
-            return {
+            ended_at = self._timestamp()
+            metadata = dict(diagnosis.metadata or {})
+            recorder_metrics = trace_recorder.metrics()
+            for key in ("input_tokens", "output_tokens", "total_tokens", "llm_call_count"):
+                if recorder_metrics.get(key):
+                    metadata[key] = recorder_metrics[key]
+            recorded_tool_calls = trace_recorder.tool_calls()
+            diagnosis_payload = {
                 "verdict": diagnosis.verdict,
-                "fault_type": findings.get("fault_type") or diagnosis.metadata.get("fault_type"),
+                "fault_type": findings.get("fault_type") or metadata.get("fault_type"),
                 "location": {
                     key: value
                     for key, value in {
@@ -337,10 +419,39 @@ class SessionOrchestrator:
                 "evidence": list(findings.get("evidence") or []),
                 "confidence": float(diagnosis.confidence or 0.0),
                 "reasoning": diagnosis.reasoning,
-                "tool_calls": list(diagnosis.metadata.get("tool_calls") or []),
-                "time_taken_seconds": max(0.0, (self._timestamp() - start_time).total_seconds()),
-                "metadata": dict(diagnosis.metadata or {}),
+                "tool_calls": recorded_tool_calls or list(metadata.get("tool_calls") or []),
+                "time_taken_seconds": max(0.0, (ended_at - start_time).total_seconds()),
+                "metadata": metadata,
             }
+            if trace_writer is not None:
+                try:
+                    trace_result = trace_writer.write_case_trace(
+                        case_id=context.scenario_id,
+                        scenario_id=scenario_id,
+                        episode_result=episode_result,
+                        worker=worker_name or "worker",
+                        topology_id=(worker_context.topology_id if worker_context is not None else None),
+                        topology_scale=scenario_scale,
+                        runtime_id=runtime_id or "",
+                        agent=agent,
+                        diagnostic_context=context,
+                        diagnosis=diagnosis,
+                        diagnosis_payload=diagnosis_payload,
+                        started_at=start_time,
+                        ended_at=ended_at,
+                        pingmesh_window=pingmesh_query_window,
+                        trace_recorder=trace_recorder,
+                    )
+                    diagnosis_payload["trace"] = {
+                        "trace_id": trace_result.trace_id,
+                        "case_id": trace_result.case_id,
+                        "worker": trace_result.worker,
+                        "atif_path": trace_result.atif_path,
+                    }
+                except Exception:
+                    logger.debug("failed to persist agent runtime trace", exc_info=True)
+            diagnosis_payload["metadata"] = _strip_runtime_trace_metadata(diagnosis_payload["metadata"])
+            return diagnosis_payload
 
         return callback
 
@@ -353,14 +464,35 @@ class SessionOrchestrator:
     def _artifacts_root(self, artifacts_dir: str | Path | None) -> Path:
         return artifacts_root(self.artifacts, artifacts_dir)
 
-    def _next_run_id(self, artifacts_root_dir: Path) -> str:
-        return next_run_id(artifacts_root_dir)
+    def _next_run_id(self, artifacts_root_dir: Path, *, started_at: datetime | None = None) -> str:
+        return next_run_id(artifacts_root_dir, started_at=started_at)
 
     def _resolve_scale(self, scenarios: Iterable[ScenarioExecutionRef]) -> str:
         return resolve_scale(self.platform, scenarios)
 
     def _timestamp(self) -> datetime:
         return datetime.now(UTC)
+
+    def _trace_enabled(self, trace: bool) -> bool:
+        if not trace:
+            return False
+        raw = str(self.env_value("NETOPSBENCH_TRACE", "1")).strip().lower()
+        return raw not in {"0", "false", "no", "off"}
+
+    def env_value(self, key: str, default: str = "") -> str:
+        env = getattr(self.platform, "env", None)
+        if isinstance(env, dict) and key in env:
+            return str(env[key])
+        import os
+
+        return os.environ.get(key, default)
+
+
+def _strip_runtime_trace_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    public_metadata = dict(metadata or {})
+    public_metadata.pop("trace", None)
+    public_metadata.pop("trajectory", None)
+    return public_metadata
 
 
 __all__ = ["SessionOrchestrator"]

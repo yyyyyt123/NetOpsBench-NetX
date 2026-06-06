@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import json
+import re
 from typing import Any
+
+from pydantic import ValidationError
 
 from netopsbench.sdk.agents import DiagnosisResult
 
 from ..schema import DiagnosisOutput
+
+_JSON_FENCE_RE = re.compile(r"```(?:json|JSON)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
 def _message_attr(message: Any, key: str) -> Any:
@@ -76,11 +82,7 @@ def _parse_raw_result(raw: Any) -> tuple[dict[str, Any], list[dict[str, Any]], d
     payload = raw if isinstance(raw, dict) else {}
     messages = payload.get("messages", [])
 
-    structured = payload.get("structured_response")
-    if structured is not None and hasattr(structured, "model_dump"):
-        structured = structured.model_dump()
-    elif not isinstance(structured, dict):
-        structured = {}
+    structured = _structured_from_final_message(messages)
 
     schema_name = DiagnosisOutput.__name__
     tool_calls = [
@@ -89,6 +91,104 @@ def _parse_raw_result(raw: Any) -> tuple[dict[str, Any], list[dict[str, Any]], d
         if getattr(msg, "type", None) == "tool" and getattr(msg, "name", None) != schema_name
     ]
     return structured, tool_calls, _collect_token_counts(messages)
+
+
+def _structured_from_final_message(messages: list[Any]) -> dict[str, Any]:
+    for message in reversed(messages):
+        if _message_attr(message, "type") not in {"ai", "assistant"}:
+            continue
+        content = _message_attr(message, "content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        parsed = _parse_diagnosis_json(content)
+        if parsed:
+            return parsed
+    return {}
+
+
+def _parse_diagnosis_json(text: str) -> dict[str, Any]:
+    for candidate in _json_candidates(text):
+        parsed = _load_json_candidate(candidate)
+        if parsed:
+            return parsed
+    return {}
+
+
+def _json_candidates(text: str) -> list[str]:
+    candidates: list[str] = []
+    candidates.extend(match.group(1).strip() for match in _JSON_FENCE_RE.finditer(text))
+    candidates.extend(_balanced_json_objects(text))
+    candidates.append(text.strip())
+
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        if not candidate or candidate in seen:
+            continue
+        deduped.append(candidate)
+        seen.add(candidate)
+    return deduped
+
+
+def _balanced_json_objects(text: str) -> list[str]:
+    objects: list[str] = []
+    start: int | None = None
+    depth = 0
+    in_string = False
+    escape = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+            continue
+        if char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+            continue
+        if char == "}" and depth:
+            depth -= 1
+            if depth == 0 and start is not None:
+                objects.append(text[start : index + 1])
+                start = None
+    return list(reversed(objects))
+
+
+def _load_json_candidate(candidate: str) -> dict[str, Any]:
+    for loader in (_strict_json_loads, _repair_json_loads):
+        value = loader(candidate)
+        if not isinstance(value, dict):
+            continue
+        try:
+            return DiagnosisOutput.model_validate(value).model_dump()
+        except ValidationError:
+            continue
+    return {}
+
+
+def _strict_json_loads(candidate: str) -> Any:
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+
+
+def _repair_json_loads(candidate: str) -> Any:
+    try:
+        from json_repair import loads as repair_loads
+    except Exception:
+        return None
+    try:
+        return repair_loads(candidate)
+    except Exception:
+        return None
 
 
 def _build_diagnosis_result(

@@ -1,9 +1,71 @@
 """Regression tests for the new query-focused SDK CLI."""
 
+import importlib
+import json
+
 import pytest
 
 from netopsbench.cli import build_parser, main
 from netopsbench.sdk import NetOpsBench
+
+cli_main_mod = importlib.import_module("netopsbench.cli.main")
+cli_trace_mod = importlib.import_module("netopsbench.cli.trace")
+
+
+def _write_trace_run(tmp_path, run_id, *, completed_at="2026-06-05T12:40:40+00:00"):
+    run_dir = tmp_path / ".netopsbench" / "runs" / run_id
+    trace_dir = run_dir / "traces" / "worker-1" / "case-1"
+    trace_dir.mkdir(parents=True)
+    (trace_dir / "trajectory.atif.json").write_text(
+        json.dumps(
+            {
+                "schema_version": "ATIF-v1.7",
+                "session_id": run_id,
+                "trajectory_id": "t1",
+                "agent": {},
+                "steps": [],
+                "final_metrics": {},
+                "extra": {"case_id": "case-1", "scenario_id": "scenario-1", "topology_scale": "xs"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (run_dir / "traces" / "index.jsonl").write_text(
+        json.dumps(
+            {
+                "trace_id": "t1",
+                "run_id": run_id,
+                "case_id": "case-1",
+                "scenario_id": "scenario-1",
+                "worker": "worker-1",
+                "agent": "agent",
+                "model": "model",
+                "provider": "provider",
+                "topology_scale": "xs",
+                "atif_path": str(trace_dir / "trajectory.atif.json"),
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (run_dir / "report.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "agent_name": "agent",
+                "topology_scale": "xs",
+                "status": "completed",
+                "summary": {
+                    "status": "completed",
+                    "agent_name": "agent",
+                    "topology_scale": "xs",
+                    "completed_at": completed_at,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return run_dir
 
 
 def test_cli_help_shows_query_focused_commands(capsys):
@@ -15,6 +77,7 @@ def test_cli_help_shows_query_focused_commands(capsys):
     assert "runtime" in output
     assert "scenario" in output
     assert "result" in output
+    assert "trace" in output
 
 
 def test_cli_runtime_list_and_show(tmp_path, monkeypatch, capsys):
@@ -235,6 +298,155 @@ def test_cli_result_show_missing(tmp_path, monkeypatch, capsys):
     assert main() == 1
     out = capsys.readouterr().out
     assert "report not found" in out
+
+
+def test_cli_trace_export(tmp_path, monkeypatch, capsys):
+    _write_trace_run(tmp_path, "run-20260605T124040Z")
+
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "netopsbench",
+            "--workspace",
+            str(tmp_path),
+            "trace",
+            "export",
+            "run-20260605T124040Z",
+            "--output",
+            "harbor-jobs",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "exported traces:" in out
+    assert (
+        tmp_path
+        / "harbor-jobs"
+        / "netopsbench-run-20260605T124040Z"
+        / "scenario-1__case-1"
+        / "agent"
+        / "trajectory.json"
+    ).exists()
+
+
+def test_cli_trace_view_exports_and_launches_harbor_viewer(tmp_path, monkeypatch, capsys):
+    _write_trace_run(tmp_path, "run-20260605T124040Z")
+    launched = {}
+
+    def fake_launch(folder, *, host, port):
+        launched["folder"] = folder
+        launched["host"] = host
+        launched["port"] = port
+
+    monkeypatch.setattr(cli_trace_mod, "_launch_harbor_viewer", fake_launch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "netopsbench",
+            "--workspace",
+            str(tmp_path),
+            "trace",
+            "view",
+            "run-20260605T124040Z",
+            "--port",
+            "55668",
+        ],
+    )
+    assert main() == 0
+    out = capsys.readouterr().out
+    assert "synced traces:" in out
+    expected = tmp_path / ".netopsbench" / "harbor-jobs"
+    assert launched == {"folder": expected, "host": "127.0.0.1", "port": "55668"}
+    assert (
+        expected / "netopsbench-run-20260605T124040Z" / "scenario-1__case-1" / "agent" / "trajectory.json"
+    ).exists()
+
+
+def test_cli_trace_list_shows_trace_runs(tmp_path, monkeypatch, capsys):
+    _write_trace_run(tmp_path, "run-0001", completed_at="2026-06-05T12:00:00+00:00")
+    _write_trace_run(tmp_path, "run-20260605T124040Z")
+    (tmp_path / ".netopsbench" / "runs" / "run-20260605T123000Z").mkdir(parents=True)
+
+    monkeypatch.setattr("sys.argv", ["netopsbench", "--workspace", str(tmp_path), "trace", "list"])
+    assert main() == 0
+    out = capsys.readouterr().out
+
+    assert "run-0001" in out
+    assert "run-20260605T124040Z" in out
+    assert "provider" in out
+    assert "model" in out
+    assert "yes" in out
+
+
+def test_cli_trace_view_latest_uses_newest_trace_run(tmp_path, monkeypatch, capsys):
+    _write_trace_run(tmp_path, "run-20260605T123000Z", completed_at="2026-06-05T12:30:00+00:00")
+    _write_trace_run(tmp_path, "run-20260605T124040Z", completed_at="2026-06-05T12:40:40+00:00")
+    launched = {}
+
+    def fake_launch(folder, *, host, port):
+        launched["folder"] = folder
+        launched["host"] = host
+        launched["port"] = port
+
+    monkeypatch.setattr(cli_trace_mod, "_launch_harbor_viewer", fake_launch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "netopsbench",
+            "--workspace",
+            str(tmp_path),
+            "trace",
+            "view",
+            "latest",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    expected = tmp_path / ".netopsbench" / "harbor-jobs"
+    assert "synced traces:" in out
+    assert launched == {"folder": expected, "host": "127.0.0.1", "port": "8080-8089"}
+    assert (
+        expected / "netopsbench-run-20260605T124040Z" / "scenario-1__case-1" / "agent" / "trajectory.json"
+    ).exists()
+    assert (
+        expected / "netopsbench-run-20260605T123000Z" / "scenario-1__case-1" / "agent" / "trajectory.json"
+    ).exists()
+
+
+def test_cli_trace_view_without_run_id_syncs_all_trace_runs(tmp_path, monkeypatch, capsys):
+    _write_trace_run(tmp_path, "run-20260605T123000Z", completed_at="2026-06-05T12:30:00+00:00")
+    _write_trace_run(tmp_path, "run-20260605T124040Z", completed_at="2026-06-05T12:40:40+00:00")
+    launched = {}
+
+    def fake_launch(folder, *, host, port):
+        launched["folder"] = folder
+        launched["host"] = host
+        launched["port"] = port
+
+    monkeypatch.setattr(cli_trace_mod, "_launch_harbor_viewer", fake_launch)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "netopsbench",
+            "--workspace",
+            str(tmp_path),
+            "trace",
+            "view",
+        ],
+    )
+
+    assert main() == 0
+    out = capsys.readouterr().out
+    expected = tmp_path / ".netopsbench" / "harbor-jobs"
+    assert "synced traces:" in out
+    assert launched == {"folder": expected, "host": "127.0.0.1", "port": "8080-8089"}
+    assert (
+        expected / "netopsbench-run-20260605T124040Z" / "scenario-1__case-1" / "agent" / "trajectory.json"
+    ).exists()
+    assert (
+        expected / "netopsbench-run-20260605T123000Z" / "scenario-1__case-1" / "agent" / "trajectory.json"
+    ).exists()
 
 
 def test_cli_benchmark_prepare_runs_topology_then_scenario_generation(tmp_path, monkeypatch, capsys):
