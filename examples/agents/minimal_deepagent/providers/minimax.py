@@ -5,7 +5,7 @@ from __future__ import annotations
 from langchain_openai import ChatOpenAI
 
 PRESET = {
-    "model": "MiniMax-M2.7",
+    "model": "MiniMax-M3",
     "base_url": "https://api.minimaxi.com/v1",
     "api_key_env": "MINIMAX_API_KEY",
 }

@@ -190,6 +190,7 @@ def test_minimal_deepagent_reads_minimax_api_key_from_environment(monkeypatch):
     agent = MinimalDeepAgent()
 
     assert agent.api_key == "shell-env-key"
+    assert agent.model == "MiniMax-M3"
 
 
 def test_minimal_deepagent_openai_defaults_and_openai_key(monkeypatch):

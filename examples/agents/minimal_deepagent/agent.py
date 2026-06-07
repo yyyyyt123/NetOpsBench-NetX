@@ -6,7 +6,7 @@ that users pass into ``bench.sessions.run_*``.
 Vendor-specific LLM configuration lives in the ``providers/`` sub-package:
 
 - ``providers/kimi.py``      — Kimi K2.6
-- ``providers/minimax.py``   — MiniMax-M2.7
+- ``providers/minimax.py``   — MiniMax-M3
 - ``providers/glm.py``       — ZhipuAI GLM-5.1
 - ``providers/deepseek.py``  — DeepSeek deepseek-v4-pro (thinking mode disabled)
 - ``providers/openai.py``    — OpenAI-compatible endpoint (gpt-5.4)
@@ -17,7 +17,7 @@ Shared runtime and result helpers live in ``providers/runtime.py`` and
 
 Supported vendors (via ``vendor`` parameter):
 - ``kimi``      — Kimi K2.6
-- ``minimax``   — MiniMax-M2.7 (default)
+- ``minimax``   — MiniMax-M3 (default)
 - ``zhipu``    — GLM-5.1 (ZhipuAI)
 - ``deepseek`` — deepseek-v4-pro (DeepSeek)
 - ``openai``   — gpt-5.4 via OpenAI-compatible endpoint
@@ -66,7 +66,7 @@ class MinimalDeepAgent:
     Use ``vendor`` to switch between LLM providers::
 
         agent = MinimalDeepAgent(vendor="kimi")     # Kimi K2.6
-        agent = MinimalDeepAgent(vendor="minimax")  # MiniMax-M2.7 (default)
+        agent = MinimalDeepAgent(vendor="minimax")  # MiniMax-M3 (default)
         agent = MinimalDeepAgent(vendor="zhipu")    # GLM-5.1
         agent = MinimalDeepAgent(vendor="deepseek") # deepseek-v4-pro
         agent = MinimalDeepAgent(vendor="openai")   # gpt-5.4
