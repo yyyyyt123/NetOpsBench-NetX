@@ -14,11 +14,10 @@
 </p>
 
 <p align="center">
-  <a href="https://netx-lab.github.io/NetOpsBench/">Documentation</a> ·
-  <a href="docs/content/docs/quickstart.mdx">Quickstart</a> ·
-  <a href="docs/content/docs/build-your-agent/custom-agents.mdx">Build Your Agent</a> ·
-  <a href="docs/content/docs/run-benchmarks/results.mdx">Benchmark Results</a> ·
-  <a href="https://huggingface.co/datasets/yyyyyt/netopsbench-trace">Agent Trace Dataset</a>
+  <a href="https://netx-lab.github.io/NetOpsBench/">Website</a> ·
+  <a href="https://netx-lab.github.io/NetOpsBench/docs/quickstart/">Quickstart</a> ·
+  <a href="https://netx-lab.github.io/NetOpsBench/docs/build-your-agent/custom-agents/">Build Your Agent</a> ·
+  <a href="https://huggingface.co/datasets/yyyyyt/netopsbench-trace">Trace Dataset</a>
 </p>
 
 NetOpsBench is an open benchmark arena for agentic network troubleshooting — run reproducible fault scenarios on live SONiC-VS / Containerlab topologies, plug in any troubleshooting agent, and score it across quality and efficiency dimensions.
