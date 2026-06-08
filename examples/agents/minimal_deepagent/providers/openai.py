@@ -9,7 +9,7 @@ from langchain_openai import ChatOpenAI
 
 PRESET = {
     "model": "gpt-5.5",
-    "base_url": "https://yh.m7ai.com/v1",
+    "base_url": "https://api.openai.com/v1",
     "api_key_env": "OPENAI_API_KEY",
 }
 
