@@ -9,7 +9,7 @@ This page records the public trace dataset snapshot. Treat it as a reference sna
 
 | Dimension | Values |
 |---|---|
-| Models | Kimi K2.6, DeepSeek V4 Pro, MiniMax M3 |
+| Models | Kimi K2.6, DeepSeek V4 Pro, OpenAI GPT-5.5, MiniMax M3 |
 | Topology scales | XS, Small, Medium, Large |
 | Fault types | 12 canonical types across link, routing, impairment, system, and ACL categories |
 | Quality metrics | Verdict F1-score, device localization, interface localization, composite score |
@@ -23,6 +23,7 @@ Each cell is `XS -> Large`.
 |---|---:|---:|---:|---:|---:|---:|---:|
 | Kimi K2.6 | 76.2 -> 58.0 | 66.7 -> 20.8 | 71.4 -> 21.4 | 64.3 -> 25.0 | 272.0 -> 576.8 | 36.5 -> 47.3 | 367.6 -> 1029.4 |
 | DeepSeek V4 Pro | 100.0 -> 91.7 | 83.3 -> 45.8 | 57.1 -> 39.3 | 78.6 -> 39.4 | 83.1 -> 106.2 | 24.9 -> 22.7 | 247.6 -> 564.2 |
+| OpenAI GPT-5.5 | 95.7 -> 66.7 | 83.3 -> 43.8 | 57.1 -> 10.7 | 75.0 -> 32.7 | 71.9 -> 80.5 | 17.9 -> 15.3 | 85.4 -> 147.6 |
 | MiniMax M3 | 80.0 -> 35.5 | 50.0 -> 16.7 | 71.4 -> 7.1 | 60.7 -> 16.3 | 214.3 -> 176.8 | 26.4 -> 15.0 | 133.3 -> 167.7 |
 
 The main pattern is that verdict classification remains easier than precise localization. Interface localization is the weakest metric on larger topologies.

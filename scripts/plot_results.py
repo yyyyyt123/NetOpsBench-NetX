@@ -1,8 +1,8 @@
 """
 Generate SIGCOMM/NSDI-style benchmark comparison figures.
 
-Produces eight separate PDF/PNG figures comparing Kimi, DeepSeek, and MiniMax
-across topology scales (xs -> large) for the following metrics:
+Produces eight separate PDF/PNG figures comparing Kimi, DeepSeek, MiniMax, and
+OpenAI across topology scales (xs -> large) for the following metrics:
   1. Verdict F1-score
   2. Device Localization Rate
   3. Interface Localization Rate
@@ -55,14 +55,21 @@ DATA = {
         "medium": dict(verdict_f1=82.9, device=70.8, interface=50.0, avg_score=0.714, avg_time=180.3, tool_calls=17.9, input_tokens=146968.4, output_tokens=6333.2),
         "large":  dict(verdict_f1=35.5, device=16.7, interface=7.1,  avg_score=0.163, avg_time=176.8, tool_calls=15.0, input_tokens=167732.9, output_tokens=6139.1),
     },
+    "OpenAI": {
+        "xs":     dict(verdict_f1=95.7, device=83.3, interface=57.1, avg_score=0.750, avg_time=71.9, tool_calls=17.9, input_tokens=85444.4, output_tokens=1798.9),
+        "small":  dict(verdict_f1=100.0, device=83.3, interface=71.4, avg_score=0.800, avg_time=70.0, tool_calls=14.6, input_tokens=80932.9, output_tokens=1757.9),
+        "medium": dict(verdict_f1=95.7, device=87.5, interface=42.9, avg_score=0.786, avg_time=69.0, tool_calls=14.0, input_tokens=92580.0, output_tokens=1777.9),
+        "large":  dict(verdict_f1=66.7, device=43.8, interface=10.7, avg_score=0.327, avg_time=80.5, tool_calls=15.3, input_tokens=147606.6, output_tokens=2201.3),
+    },
 }
 
 SCALES = ["xs", "small", "medium", "large"]
 SCALE_LABELS = ["XS\n(14)", "Small\n(15)", "Medium\n(28)", "Large\n(52)"]
-VENDORS = ["Kimi", "DeepSeek", "MiniMax"]
+VENDORS = ["Kimi", "DeepSeek", "OpenAI", "MiniMax"]
 LEGEND_LABELS = {
     "Kimi": "Kimi K2.6",
     "DeepSeek": "DeepSeek V4 Pro",
+    "OpenAI": "OpenAI GPT-5.5",
     "MiniMax": "MiniMax M3",
 }
 
@@ -71,18 +78,20 @@ LEGEND_LABELS = {
 # ---------------------------------------------------------------------------
 
 # Slightly wider than a single-column plot to keep grouped labels readable.
-FIG_W = 4.2   # inches
+FIG_W = 4.8   # inches
 FIG_H = 3.0   # inches (extra height for below-axis legend)
 
 # Colour-blind-friendly palette (Wong 2011 + extension)
 COLORS = {
     "Kimi":     "#0072B2",   # blue
     "DeepSeek": "#D55E00",   # vermillion
+    "OpenAI":   "#009E73",   # bluish green
     "MiniMax":  "#CC79A7",   # pink/purple
 }
 HATCHES = {
     "Kimi":     "\\\\",
     "DeepSeek": "////",
+    "OpenAI":   "..",
     "MiniMax":  "xx",
 }
 
@@ -132,7 +141,7 @@ def _grouped_bar(ax, values_dict: dict, ylabel: str, ylim: tuple,
     """
     n = len(SCALES)
     n_vendors = len(VENDORS)
-    bar_w = 0.22
+    bar_w = 0.20
     group_w = bar_w * n_vendors
     offsets = np.linspace(-(group_w - bar_w) / 2, (group_w - bar_w) / 2, n_vendors)
     span = ylim[1] - ylim[0]
@@ -389,7 +398,7 @@ def _fig_combined(outdir: Path) -> Path:
     # Hide the unused 6th subplot
     axes[1][2].set_visible(False)
 
-    fig.suptitle("NetOpsBench: Kimi / DeepSeek / MiniMax across Topology Scales",
+    fig.suptitle("NetOpsBench: Kimi / DeepSeek / OpenAI / MiniMax across Topology Scales",
                  fontsize=9, y=1.01)
     fig.tight_layout()
     out = outdir / "fig_combined_overview.pdf"
