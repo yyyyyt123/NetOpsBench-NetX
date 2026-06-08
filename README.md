@@ -10,6 +10,7 @@
   <a href="https://www.python.org/downloads/"><img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green"></a>
   <a href="https://join.slack.com/t/netopsbench/shared_invite/zt-3zhhfangj-2U4dU_NSfCy1rcOM1dmuvQ"><img alt="Join Slack" src="https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&logoColor=white"></a>
+  <a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=595v4390-2a51-4db0-baa4-811821b47448"><img alt="Feishu - Chinese Community" src="https://img.shields.io/badge/Feishu-Chinese%20Community-3370FF"></a>
 </p>
 
 <p align="center">
@@ -116,7 +117,8 @@ Public agent trajectory artifacts are available in the [NetOpsBench Trace Datase
 
 ## Community
 
-Have questions, ideas, or benchmark results to discuss? Join the [NetOpsBench Slack](https://join.slack.com/t/netopsbench/shared_invite/zt-3zhhfangj-2U4dU_NSfCy1rcOM1dmuvQ) to connect with the community.
+- Global community: [NetOpsBench Slack](https://join.slack.com/t/netopsbench/shared_invite/zt-3zhhfangj-2U4dU_NSfCy1rcOM1dmuvQ)
+- Chinese-language community: [NetOpsBench Feishu group](https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=595v4390-2a51-4db0-baa4-811821b47448)
 
 ## Contributing
 
