@@ -7,17 +7,17 @@
 <p align="center">
   <a href="https://github.com/NetX-lab/NetOpsBench/actions/workflows/test.yml"><img alt="Tests" src="https://github.com/NetX-lab/NetOpsBench/actions/workflows/test.yml/badge.svg"></a>
   <a href="https://github.com/NetX-lab/NetOpsBench/actions/workflows/docs-pages.yml"><img alt="Docs" src="https://github.com/NetX-lab/NetOpsBench/actions/workflows/docs-pages.yml/badge.svg"></a>
-  <a href="https://www.python.org/downloads/"><img alt="Python" src="https://img.shields.io/badge/python-3.11%2B-blue"></a>
+  <a href="https://www.python.org/downloads/"><img alt="Python" src="https://img.shields.io/badge/python-3.12%2B-blue"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-MIT-green"></a>
   <a href="https://join.slack.com/t/netopsbench/shared_invite/zt-3zhhfangj-2U4dU_NSfCy1rcOM1dmuvQ"><img alt="Join Slack" src="https://img.shields.io/badge/Slack-Join%20Community-4A154B?logo=slack&logoColor=white"></a>
   <a href="https://applink.feishu.cn/client/chat/chatter/add_by_link?link_token=595v4390-2a51-4db0-baa4-811821b47448"><img alt="Feishu - Chinese Community" src="https://img.shields.io/badge/Feishu-Chinese%20Community-3370FF"></a>
 </p>
 
 <p align="center">
-  <a href="https://netx-lab.github.io/NetOpsBench/">Documentation</a> ·
-  <a href="docs/content/docs/quickstart.mdx">Quickstart</a> ·
-  <a href="docs/content/docs/build-your-agent/custom-agents.mdx">Build Your Agent</a> ·
-  <a href="docs/content/docs/run-benchmarks/results.mdx">Benchmark Results</a>
+  <a href="https://netx-lab.github.io/NetOpsBench/">Website</a> ·
+  <a href="https://netx-lab.github.io/NetOpsBench/docs/quickstart/">Quickstart</a> ·
+  <a href="https://netx-lab.github.io/NetOpsBench/docs/build-your-agent/custom-agents/">Build Your Agent</a> ·
+  <a href="https://huggingface.co/datasets/yyyyyt/netopsbench-trace">Trace Dataset</a>
 </p>
 
 NetOpsBench is an open benchmark arena for agentic network troubleshooting — run reproducible fault scenarios on live SONiC-VS / Containerlab topologies, plug in any troubleshooting agent, and score it across quality and efficiency dimensions.
@@ -99,6 +99,8 @@ NetOpsBench reports detection, fault type, device/interface localization, runtim
 ![Composite benchmark score](docs/public/assets/benchmark/fig_avg_score.png)
 
 Read [Benchmark Methodology](docs/content/docs/run-benchmarks/methodology.mdx) for scoring definitions and [Benchmark Results](docs/content/docs/run-benchmarks/results.mdx) for an example completed suite.
+
+Public agent trajectory artifacts are available in the [NetOpsBench Trace Dataset](https://huggingface.co/datasets/yyyyyt/netopsbench-trace), including Harbor/ATIF traces, run reports, and summary CSVs for reproducible analysis.
 
 ## Learn More
 

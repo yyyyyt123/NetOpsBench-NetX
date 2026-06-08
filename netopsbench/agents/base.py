@@ -19,6 +19,7 @@ class DiagnosticContext:
     symptoms: Mapping[str, Any]
     ground_truth: Mapping[str, Any] | None = None
     tools: Any = None
+    trace: Any = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 

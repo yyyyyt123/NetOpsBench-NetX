@@ -8,7 +8,7 @@ This example is kept small on purpose and is organized around three concerns:
 
 Layout notes:
 
-- `providers/runtime.py` owns MCP session wiring and runtime trace collection.
+- `providers/runtime.py` owns MCP session and tool wiring.
 - `providers/results.py` owns result parsing, token aggregation, and fallback serialization.
 - `agent.py` keeps the example defaults, including `DEFAULT_MAX_TOOL_CALLS = 40`.
 

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from netopsbench.platform.runtime.manager import RuntimePool
+from netopsbench.platform.session.tracing import TraceWriter
 from netopsbench.platform.session.types import ScenarioExecutionRef, WorkerExecutionContext
 from netopsbench.platform.worker.pool import WorkerSpec
 
@@ -88,7 +89,7 @@ class RuntimePoolConfig:
     evaluator_factory: Callable[[], EvaluatorLike]
     score_fault_episodes: Callable[..., list[Any]]
     diagnosis_callback_builder: Callable[
-        [Any, str, str, WorkerExecutionContext],
+        [Any, str, str, WorkerExecutionContext, TraceWriter | None, str, str, str, str | None],
         Callable[[dict[str, Any]], dict[str, Any]],
     ]
     worker_context_builder: Callable[[WorkerSpec, Path], WorkerExecutionContext]
@@ -101,6 +102,8 @@ class RuntimePoolConfig:
     build_run_handle: Callable[..., dict[str, Any]]
     run_handle_adapter: Callable[[dict[str, Any]], Any]
     artifact_manager: Any
+    traces_dir: Path | None = None
+    trace_writer: TraceWriter | None = None
 
     # -- scenario executor knobs (defaults preserve historical behaviour) ---
     baseline_wait_seconds: float = 60
@@ -193,6 +196,11 @@ def _run_worker(
             str(worker_context.topology_dir),
             scenario.id,
             worker_context,
+            config.trace_writer,
+            worker_name,
+            config.run_id,
+            config.runtime.id,
+            scenario.scale,
         )
         scenario_result = runner.run_scenario(
             scenario.to_scenario(),
@@ -203,12 +211,33 @@ def _run_worker(
             scenario_id=scenario.id,
             scenario_result=scenario_result,
         )
-        scored = config.score_fault_episodes(
-            scenario.to_scenario(),
-            scenario_result,
-            evaluator,
-            topology_dir=str(worker_context.topology_dir),
-        )
+        try:
+            scored = config.score_fault_episodes(
+                scenario.to_scenario(),
+                scenario_result,
+                evaluator,
+                topology_dir=str(worker_context.topology_dir),
+            )
+        except Exception as exc:
+            if config.trace_writer is not None:
+                try:
+                    config.trace_writer.write_failure_result(
+                        scenario_id=scenario.id,
+                        scenario_result=scenario_result,
+                        stage="evaluator",
+                        error=exc,
+                    )
+                except Exception:
+                    logger.debug("failed to persist evaluator failure trace result", exc_info=True)
+            raise
+        if config.trace_writer is not None:
+            try:
+                config.trace_writer.write_evaluation_results(
+                    evaluation_results=scored,
+                    scenario_result=scenario_result,
+                )
+            except Exception:
+                logger.debug("failed to persist trace evaluation results", exc_info=True)
         executed_count += 1
         eval_results.extend(scored)
         scenario_summaries.append(
@@ -349,6 +378,9 @@ def execute_on_runtime_pool(
         aggregate_report=aggregate_report,
         artifact_dir=config.artifact_dir,
         raw_dir=config.raw_dir,
+        traces_dir=config.traces_dir,
+        trace_index_path=(config.trace_writer.index_path if config.trace_writer is not None else None),
+        trace_results_path=(config.trace_writer.results_path if config.trace_writer is not None else None),
         report_path=config.report_path,
         metadata_path=config.metadata_path,
     )
@@ -372,6 +404,9 @@ def execute_on_runtime_pool(
         completed_at=completed_at,
         scenarios=config.scenarios,
         worker_summaries=worker_summaries,
+        traces_dir=config.traces_dir,
+        trace_index_path=(config.trace_writer.index_path if config.trace_writer is not None else None),
+        trace_results_path=(config.trace_writer.results_path if config.trace_writer is not None else None),
     )
     handle_payload = config.build_run_handle(
         run_id=config.run_id,

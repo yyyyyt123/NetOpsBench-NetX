@@ -1,6 +1,7 @@
 """Tests for the public example DeepAgent implementation."""
 
 import asyncio
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -19,12 +20,10 @@ for _mod in [
 ]:
     sys.modules.setdefault(_mod, MagicMock())
 
-from langchain.agents.structured_output import ToolStrategy  # noqa: E402
-
 from examples.agents import MinimalDeepAgent  # noqa: E402
-from examples.agents.minimal_deepagent.agent import DiagnosisOutput  # noqa: E402
 from examples.agents.minimal_deepagent.providers import get_provider  # noqa: E402
 from netopsbench.agents.base import DiagnosticContext  # noqa: E402
+from netopsbench.agents.tracing import AgentTraceRecorder  # noqa: E402
 from netopsbench.sdk.agents import DiagnosisResult  # noqa: E402
 
 
@@ -34,10 +33,12 @@ class _FakeRuntime:
     def __init__(self, result):
         self.result = result
         self.prompts = []
+        self.configs = []
 
     async def ainvoke(self, payload, config=None):
         prompt = payload["messages"][0]["content"] if payload.get("messages") else ""
         self.prompts.append(prompt)
+        self.configs.append(config or {})
         return self.result
 
 
@@ -47,10 +48,12 @@ class _FailingRuntime:
     def __init__(self, exc):
         self.exc = exc
         self.prompts = []
+        self.configs = []
 
     async def ainvoke(self, payload, config=None):
         prompt = payload["messages"][0]["content"] if payload.get("messages") else ""
         self.prompts.append(prompt)
+        self.configs.append(config or {})
 
         for callback in (config or {}).get("callbacks", []):
             callback.on_tool_start({"name": "get_pingmesh_hotspots"}, "{}", run_id=uuid4())
@@ -91,22 +94,36 @@ def _patch_agent_deps(monkeypatch, fake_graph):
     monkeypatch.setattr(agent_mod, "create_deep_agent", lambda **kw: fake_graph)
 
 
+def _diagnosis_json_message(payload=None, **message_kwargs):
+    structured = {
+        "verdict": "inconclusive",
+        "fault_type": None,
+        "location": {"device": None, "interface": None},
+        "evidence": [],
+        "confidence": 0.0,
+        "reasoning": "",
+    }
+    if payload:
+        structured.update(payload)
+    content = "```json\n" + json.dumps(structured) + "\n```"
+    return SimpleNamespace(type="ai", content=content, **message_kwargs)
+
+
 def test_minimal_deepagent_diagnose_returns_public_diagnosis_result(tmp_path, monkeypatch):
     raw_result = {
-        "structured_response": {
-            "verdict": "fault_detected",
-            "fault_type": "link_down",
-            "location": {"device": "leaf-01", "interface": "Ethernet1"},
-            "evidence": ["pingmesh anomaly", "interface down"],
-            "confidence": 0.91,
-            "reasoning": "Pingmesh hotspots aligned with an interface-down observation.",
-        },
         "messages": [
             SimpleNamespace(type="ai", usage_metadata={"input_tokens": 21, "output_tokens": 7, "total_tokens": 28}),
             SimpleNamespace(type="tool", name="get_pingmesh_hotspots", content={"ok": True}),
             SimpleNamespace(type="tool", name="get_device_interfaces", content={"ok": True}),
-            SimpleNamespace(
-                type="ai",
+            _diagnosis_json_message(
+                {
+                    "verdict": "fault_detected",
+                    "fault_type": "link_down",
+                    "location": {"device": "leaf-01", "interface": "Ethernet1"},
+                    "evidence": ["pingmesh anomaly", "interface down"],
+                    "confidence": 0.91,
+                    "reasoning": "Pingmesh hotspots aligned with an interface-down observation.",
+                },
                 response_metadata={"token_usage": {"prompt_tokens": 9, "completion_tokens": 4, "total_tokens": 13}},
             ),
         ],
@@ -124,6 +141,7 @@ def test_minimal_deepagent_diagnose_returns_public_diagnosis_result(tmp_path, mo
         scenario_id="scenario-001",
         topology={"devices": {"leafs": [{"name": "leaf-01"}]}, "links": []},
         symptoms={"observations": {"pingmesh_metrics": {"anomalies": [{"type": "packet_loss"}]}}},
+        trace=SimpleNamespace(langchain_callback=lambda: "trace-callback"),
     )
 
     result = asyncio.run(agent.diagnose(context))
@@ -138,11 +156,13 @@ def test_minimal_deepagent_diagnose_returns_public_diagnosis_result(tmp_path, mo
     assert result.metadata["output_tokens"] == 11
     assert result.metadata["total_tokens"] == 41
     assert result.metadata["llm_call_count"] == 2
+    assert "trace" not in result.metadata
+    assert fake_graph.configs[0]["callbacks"] == ["trace-callback"]
     assert fake_graph.prompts and "SCENARIO_SUMMARY" in fake_graph.prompts[0]
 
 
 def test_minimal_deepagent_prompt_does_not_include_ground_truth(tmp_path, monkeypatch):
-    fake_graph = _FakeRuntime({"structured_response": {"verdict": "inconclusive"}, "messages": []})
+    fake_graph = _FakeRuntime({"messages": [_diagnosis_json_message()]})
     agent = MinimalDeepAgent(
         api_key="test-key",
         mcp_server_config={"netopsbench": {"transport": "stdio"}},
@@ -170,6 +190,7 @@ def test_minimal_deepagent_reads_minimax_api_key_from_environment(monkeypatch):
     agent = MinimalDeepAgent()
 
     assert agent.api_key == "shell-env-key"
+    assert agent.model == "MiniMax-M3"
 
 
 def test_minimal_deepagent_openai_defaults_and_openai_key(monkeypatch):
@@ -206,7 +227,7 @@ def test_minimal_deepagent_does_not_expose_legacy_process_method():
 
 
 def test_minimal_deepagent_closes_exit_stack_within_each_diagnose_call(tmp_path, monkeypatch):
-    fake_graph = _FakeRuntime({"structured_response": {"verdict": "inconclusive"}, "messages": []})
+    fake_graph = _FakeRuntime({"messages": [_diagnosis_json_message()]})
     agent = MinimalDeepAgent(
         api_key="test-key",
         mcp_server_config={"netopsbench": {"transport": "stdio"}},
@@ -223,13 +244,18 @@ def test_minimal_deepagent_closes_exit_stack_within_each_diagnose_call(tmp_path,
     assert result.verdict == "inconclusive"
 
 
-def test_minimal_deepagent_reports_error_when_structured_response_is_missing(monkeypatch):
+def test_minimal_deepagent_parses_final_json_block(monkeypatch):
     fake_graph = _FakeRuntime(
         {
             "messages": [
                 SimpleNamespace(
                     type="ai",
-                    content='```json {"verdict":"fault_detected","fault_type":"link_down"} ```',
+                    content=(
+                        "```json\n"
+                        '{"verdict":"fault_detected","fault_type":"link_down",'
+                        '"location":{"device":"leaf1","interface":"Ethernet8"}}\n'
+                        "```"
+                    ),
                 )
             ]
         }
@@ -240,26 +266,92 @@ def test_minimal_deepagent_reports_error_when_structured_response_is_missing(mon
     )
     _patch_agent_deps(monkeypatch, fake_graph)
 
-    context = DiagnosticContext(scenario_id="scenario-missing-structured", topology={"devices": {}}, symptoms={})
+    context = DiagnosticContext(scenario_id="scenario-json-block", topology={"devices": {}}, symptoms={})
 
+    result = asyncio.run(agent.diagnose(context))
+
+    assert result.success is True
+    assert result.verdict == "fault_detected"
+    assert result.findings["fault_type"] == "link_down"
+    assert result.findings["location"]["device"] == "leaf1"
+    assert result.findings["location"]["interface"] == "Ethernet8"
+    assert result.metadata["tool_calls"] == []
+    assert result.metadata["input_tokens"] == 0
+
+
+def test_minimal_deepagent_rejects_schema_invalid_final_json(monkeypatch):
+    fake_graph = _FakeRuntime(
+        {
+            "messages": [
+                SimpleNamespace(
+                    type="ai",
+                    content='```json\n{"verdict":"fault_detected","fault_type":"link_down","location":"leaf1"}\n```',
+                )
+            ]
+        }
+    )
+    agent = MinimalDeepAgent(
+        api_key="test-key",
+        mcp_server_config={"netopsbench": {"transport": "stdio"}},
+    )
+    _patch_agent_deps(monkeypatch, fake_graph)
+
+    context = DiagnosticContext(scenario_id="scenario-invalid-json-schema", topology={"devices": {}}, symptoms={})
     result = asyncio.run(agent.diagnose(context))
 
     assert result.success is False
     assert result.verdict == "inconclusive"
-    assert "structured_response" in result.findings["error"]
-    assert result.metadata["tool_calls"] == []
+    assert "JSON block missing or invalid" in result.findings["error"]
     assert result.metadata["error_type"] == "ValueError"
-    assert result.metadata["input_tokens"] == 0
+
+
+def test_minimal_deepagent_uses_json_repair_fallback_for_final_json(monkeypatch):
+    monkeypatch.setitem(
+        sys.modules,
+        "json_repair",
+        SimpleNamespace(
+            loads=lambda text: {
+                "verdict": "fault_detected",
+                "fault_type": "link_down",
+                "location": {"device": "leaf1", "interface": "Ethernet8"},
+                "evidence": ["repaired"],
+                "confidence": 0.8,
+                "reasoning": "repaired malformed JSON",
+            }
+        ),
+    )
+    fake_graph = _FakeRuntime(
+        {
+            "messages": [
+                SimpleNamespace(
+                    type="ai",
+                    content='```json\n{"verdict":"fault_detected","fault_type":"link_down",}\n```',
+                )
+            ]
+        }
+    )
+    agent = MinimalDeepAgent(
+        api_key="test-key",
+        mcp_server_config={"netopsbench": {"transport": "stdio"}},
+    )
+    _patch_agent_deps(monkeypatch, fake_graph)
+
+    context = DiagnosticContext(scenario_id="scenario-repair-json", topology={"devices": {}}, symptoms={})
+    result = asyncio.run(agent.diagnose(context))
+
+    assert result.success is True
+    assert result.verdict == "fault_detected"
+    assert result.findings["location"]["device"] == "leaf1"
+    assert result.reasoning == "repaired malformed JSON"
 
 
 def test_minimal_deepagent_tool_call_extraction(monkeypatch):
     """Tool calls from messages are extracted into metadata."""
     fake_graph = _FakeRuntime(
         {
-            "structured_response": {"verdict": "inconclusive"},
             "messages": [
                 SimpleNamespace(type="tool", name="get_topology", content={"ok": True}),
-                SimpleNamespace(type="ai", content="reasoning..."),
+                _diagnosis_json_message(),
             ],
         }
     )
@@ -284,18 +376,24 @@ def test_minimal_deepagent_preserves_runtime_usage_on_agent_error(monkeypatch):
     )
     _patch_agent_deps(monkeypatch, fake_graph)
 
-    context = DiagnosticContext(scenario_id="scenario-runtime-error", topology={"devices": {}}, symptoms={})
+    recorder = AgentTraceRecorder()
+    context = DiagnosticContext(
+        scenario_id="scenario-runtime-error",
+        topology={"devices": {}},
+        symptoms={},
+        trace=recorder,
+    )
 
     result = asyncio.run(agent.diagnose(context))
 
     assert result.success is False
     assert result.verdict == "inconclusive"
     assert result.metadata["error_type"] == "RuntimeError"
-    assert result.metadata["input_tokens"] == 17
-    assert result.metadata["output_tokens"] == 6
-    assert result.metadata["total_tokens"] == 23
-    assert result.metadata["llm_call_count"] == 1
-    assert [call["tool"] for call in result.metadata["tool_calls"]] == [
+    assert recorder.metrics()["input_tokens"] == 17
+    assert recorder.metrics()["output_tokens"] == 6
+    assert recorder.metrics()["total_tokens"] == 23
+    assert recorder.metrics()["llm_call_count"] == 1
+    assert [call["tool"] for call in recorder.tool_calls()] == [
         "get_pingmesh_hotspots",
         "get_device_interfaces",
     ]
@@ -649,7 +747,7 @@ def test_03_run_scale_benchmark_can_run_as_direct_script():
     _direct_script_smoke("examples/03_run_scale_benchmark.py", ["--scale", "xs"])
 
 
-def test_example_agent_passes_structured_output_and_skills_to_deepagent(monkeypatch):
+def test_example_agent_passes_tools_skills_and_backend_to_deepagent(monkeypatch):
     import examples.agents.minimal_deepagent.agent as agent_mod
 
     captured = {}
@@ -682,7 +780,7 @@ def test_example_agent_passes_structured_output_and_skills_to_deepagent(monkeypa
 
         class _FakeGraph:
             async def ainvoke(self, payload, config=None):
-                return {"structured_response": {"verdict": "inconclusive"}, "messages": []}
+                return {"messages": [SimpleNamespace(type="ai", content='```json\n{"verdict":"inconclusive"}\n```')]}
 
         return _FakeGraph()
 
@@ -700,9 +798,7 @@ def test_example_agent_passes_structured_output_and_skills_to_deepagent(monkeypa
     context = DiagnosticContext(scenario_id="scenario-skills", topology={"devices": {}}, symptoms={})
     asyncio.run(agent.diagnose(context))
 
-    rf = captured["response_format"]
-    assert isinstance(rf, ToolStrategy)
-    assert rf.schema is DiagnosisOutput
+    assert "response_format" not in captured
     assert captured["skills"] == ["/skills/"]
     assert captured["backend"].virtual_mode is True
     assert [tool.name for tool in captured["tools"]] == ["get_topology"]
@@ -734,7 +830,7 @@ def test_minimal_deepagent_uses_sdk_default_mcp_server_config(monkeypatch):
 
     class _FakeGraph:
         async def ainvoke(self, payload, config=None):
-            return {"structured_response": {"verdict": "inconclusive"}, "messages": []}
+            return {"messages": [_diagnosis_json_message()]}
 
     monkeypatch.setattr(agent_mod, "_connect_mcp_tools", _capturing_connect_mcp_tools)
     monkeypatch.setattr(provider_runtime, "_connect_mcp_tools", _capturing_connect_mcp_tools)

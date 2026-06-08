@@ -101,10 +101,11 @@ Useful environment overrides:
 |---|---|
 | `BENCH_VENDOR` | Provider passed to `examples/03_run_scale_benchmark.py`. |
 | `BENCH_SCALES` | Space-separated scale list such as `xs small`. |
+| `BENCH_CLEAN_RUNS=1` | Explicitly remove previous `.netopsbench/runs/` artifacts before the batch. By default, previous reports and traces are preserved. |
 | `NETOPSBENCH_WORKER_DEPLOY_JOBS` | Worker deployment parallelism override. |
 | `NETOPSBENCH_WORKER_HEALTH_RETRIES` | Health-check retry budget for larger fabrics. |
 
-The script writes logs under `scenario_results/benchmark_logs_<timestamp>/` and a CSV summary under `scenario_results/benchmark_summary_<timestamp>.csv`.
+The script writes logs under `scenario_results/benchmark_logs_<timestamp>/`, records the run ids for the batch in `benchmark_runs_<timestamp>.jsonl`, and writes a CSV summary under `scenario_results/benchmark_summary_<timestamp>.csv`. Run artifacts use timestamp ids such as `run-20260605T124040Z`; use `netopsbench trace view` to sync trace-enabled runs into the local Harbor viewer cache and inspect saved traces.
 
 ## Inspect reports and runtimes
 

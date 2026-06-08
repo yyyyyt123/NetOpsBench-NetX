@@ -56,6 +56,7 @@ Common options:
 | `keep_runtime` | Preserve an automatically provisioned runtime for inspection. |
 | `artifacts_dir` | Override where `report.json`, metadata, and raw scenario outputs are written. |
 | `scale` | Explicit topology scale when it cannot be inferred from scenario paths. |
+| `trace` | Save per-case agent runtime traces. Defaults to `True`. |
 
 ## Artifacts
 
@@ -64,8 +65,37 @@ When `artifacts_dir` is omitted, session artifacts are written under the workspa
 - `report.json` for the final `BenchmarkReport`;
 - `metadata.json` for run-level metadata;
 - `raw/` for worker-local scenario outputs.
+- `traces/` for per-case agent runtime traces, including ATIF v1.7 `trajectory.atif.json`, run-level `index.jsonl`, and scoring sidecar `results.jsonl`.
 
 The `scenario_summaries[*].raw_result_path` fields point to raw JSON files for case-level debugging.
+
+Agent traces are saved by default and can be disabled for a run with `trace=False` or by setting `NETOPSBENCH_TRACE=0`. Disabling trace prevents private runtime trace collection and sidecar artifact creation. Ground truth and score details are written to `traces/results.jsonl`, not into the agent trajectory.
+
+NetOpsBench stores visible prompts, model messages, tool calls, and observations with secret redaction and per-field truncation. For private LLM message capture, custom agents should call models through `context.trace.llm_client(...)` or attach `context.trace.langchain_callback()` to LangChain-compatible runtimes. Set `NETOPSBENCH_TRACE_MAX_FIELD_CHARS` to tune truncation.
+
+Open a completed run directly in the Harbor viewer:
+
+```bash
+netopsbench trace list
+netopsbench trace view
+netopsbench trace view run-20260605T124040Z
+```
+
+The command exports Harbor-compatible viewer files under `<workspace>/.netopsbench/harbor-jobs` and starts the local viewer. Export traces from Python when you need a reusable Harbor jobs directory:
+
+```python
+bench.artifacts.export_traces(run.id, output="harbor-jobs")
+trace_index = bench.artifacts.get_run_traces(run.id)
+trace_results = bench.artifacts.get_run_trace_results(run.id)
+```
+
+The CLI also supports an explicit export path for CI or offline inspection:
+
+```bash
+netopsbench trace export run-20260605T124040Z --output harbor-jobs
+```
+
+NetOpsBench validates exported `job/result.json` and `trial/result.json` with Harbor's own models before writing them.
 
 ## SDK managers
 

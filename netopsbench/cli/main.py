@@ -8,6 +8,7 @@ import json
 import sys
 from pathlib import Path
 
+from netopsbench.cli.trace import add_trace_subparser, cmd_trace
 from netopsbench.logging_utils import configure_logging
 from netopsbench.platform.scenario import generator as scenario_generator
 from netopsbench.platform.topology.generator import generate_topology
@@ -62,6 +63,8 @@ def build_parser() -> argparse.ArgumentParser:
     result_list.add_argument("--dir", default="scenario_results", help="Results directory (default: scenario_results)")
     result_show = result_sub.add_parser("show", help="Show a result report")
     result_show.add_argument("path", help="Path to report.json")
+
+    add_trace_subparser(subparsers)
 
     benchmark_parser = subparsers.add_parser("benchmark", help="Benchmark preparation helpers")
     benchmark_sub = benchmark_parser.add_subparsers(dest="benchmark_action", required=True)
@@ -309,6 +312,8 @@ def main() -> int:
         return _cmd_scenario(bench, args)
     if args.command == "result":
         return _cmd_result(bench, args)
+    if args.command == "trace":
+        return cmd_trace(bench, args)
     if args.command == "benchmark":
         return _cmd_benchmark(bench, args)
 
