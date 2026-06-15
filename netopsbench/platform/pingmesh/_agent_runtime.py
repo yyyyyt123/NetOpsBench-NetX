@@ -3,54 +3,59 @@
 from __future__ import annotations
 
 try:
-    from ._agent_support import as_completed, logger, time
+    from ._agent_support import logger, time
 except ImportError:
-    from _agent_support import as_completed, logger, time
+    from _agent_support import logger, time
 
 
 class PingRuntimeMixin:
-    def _probe_and_write(self, probe: dict) -> dict:
-        try:
-            result = self.udp_rtt_burst(probe["dst_ip"], probe.get("src_ip"))
-            if self.enable_df_probe:
-                df_result = self.udp_df_burst(probe["dst_ip"], probe.get("src_ip"))
-                result["df_success"] = 1 if df_result.get("success") else 0
-                result["df_loss_pct"] = float(df_result.get("loss_pct", 100.0))
-                result["df_rtt_avg"] = float(df_result.get("rtt_avg", 0.0))
-            else:
-                result["df_success"] = 0
-                result["df_loss_pct"] = 0.0
-                result["df_rtt_avg"] = 0.0
-            self.write_metrics(probe, result)
-            if result["packets_lost"] > 0:
-                self.write_drop_log(probe, result)
-            return {"success": True, "probe": probe, "result": result}
-        except Exception as e:
-            logger.warning("Probe failed %s→%s: %s", probe["src_name"], probe["dst_name"], e)
-            return {"success": False, "probe": probe, "error": str(e)}
+    def _write_probe_result(self, probe: dict, result: dict) -> None:
+        self.write_metrics(probe, result)
+        if result["packets_lost"] > 0:
+            self.write_drop_log(probe, result)
 
     def run(self):
-        logger.info("Starting parallel probe loop")
-        logger.info("  Workers: %s", self.max_workers)
+        logger.info("Starting probe loop")
+        logger.info("  Probe worker: 1")
         if self.min_interval == self.max_interval:
             logger.info("  Fixed cycle interval: %ss", self.min_interval)
         else:
             logger.info("  Interval range: %s-%ss", self.min_interval, self.max_interval)
+        startup_jitter = float(getattr(self, "startup_jitter_s", 0.0) or 0.0)
+        if startup_jitter > 0:
+            logger.info("  Startup jitter sleep: %.3fs", startup_jitter)
+            time.sleep(startup_jitter)
         while True:
             start = time.time()
-            futures = {self.executor.submit(self._probe_and_write, probe): probe for probe in self.tasks}
             completed = 0
             failed = 0
-            for future in as_completed(futures):
-                try:
-                    result = future.result()
-                    if result["success"]:
+            try:
+                cycle_results = self.udp_probe_cycle(self.tasks)
+            except Exception as exc:
+                logger.warning("Unexpected probe cycle error: %s", exc)
+                cycle_results = []
+                failed = len(self.tasks)
+            for item in cycle_results:
+                probe = item.get("probe", {})
+                if item.get("success"):
+                    try:
+                        self._write_probe_result(probe, item["result"])
                         completed += 1
-                    else:
+                    except Exception as exc:
+                        logger.warning(
+                            "Probe write failed %s→%s: %s",
+                            probe.get("src_name", "?"),
+                            probe.get("dst_name", "?"),
+                            exc,
+                        )
                         failed += 1
-                except Exception as e:
-                    probe = futures[future]
-                    logger.warning("Unexpected probe error %s→%s: %s", probe["src_name"], probe["dst_name"], e)
+                else:
+                    logger.warning(
+                        "Probe failed %s→%s: %s",
+                        probe.get("src_name", "?"),
+                        probe.get("dst_name", "?"),
+                        item.get("error", "unknown error"),
+                    )
                     failed += 1
             elapsed = time.time() - start
             target_interval = min(max(self.min_interval, elapsed * 1.5), self.max_interval)
@@ -67,6 +72,9 @@ class PingRuntimeMixin:
     def shutdown(self):
         logger.info("Shutting down agent, flushing remaining metrics...")
         self.shutdown_event.set()
+        close_probe_sockets = getattr(self, "_close_udp_probe_sockets", None)
+        if callable(close_probe_sockets):
+            close_probe_sockets()
         responder = getattr(self, "responder", None)
         if responder is not None:
             try:

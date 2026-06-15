@@ -351,6 +351,7 @@ class AgentTraceRecorder:
             self._metrics["total_tokens"] += usage["total_tokens"]
             self._metrics["llm_call_count"] += usage["has_usage"] or 1
 
+
 def _message_payload(message: Any, *, index: int) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "index": index,

@@ -42,13 +42,12 @@ with NetOpsBench(workspace=".") as bench:
     report.pretty_print()
 ```
 
-To switch provider and endpoint explicitly:
+To switch to OpenAI explicitly:
 
 ```python
 agent = MinimalDeepAgent(
     vendor="openai",
     model="gpt-5.5",
-    base_url="https://api.openai.com/v1",
 )
 ```
 

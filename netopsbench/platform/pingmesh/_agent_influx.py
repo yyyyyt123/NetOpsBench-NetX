@@ -46,9 +46,16 @@ class PingInfluxMixin:
                 f"packets_sent={result['packets_sent']}i",
                 f"packets_lost={result['packets_lost']}i",
                 f"packet_loss={result['loss_pct']}",
+                f"rtt_ports_active={int(result.get('rtt_ports_active', result.get('packets_sent', 0)))}i",
+                f"rtt_ports_total={int(result.get('rtt_ports_total', result.get('packets_sent', 0)))}i",
                 f"df_success={int(result.get('df_success', 0))}i",
                 f"df_loss_pct={result.get('df_loss_pct', 0.0)}",
                 f"df_rtt_avg={result.get('df_rtt_avg', 0.0)}",
+                f"df_packets_sent={int(result.get('df_packets_sent', 0))}i",
+                f"df_packets_lost={int(result.get('df_packets_lost', 0))}i",
+                f"df_ports_active={int(result.get('df_ports_active', 0))}i",
+                f"df_ports_total={int(result.get('df_ports_total', 0))}i",
+                f"df_mtu_drops={int(result.get('df_mtu_drops', result.get('mtu_drops', 0)))}i",
             ]
         if self.topology_id:
             tags.append(f"topology_id={_e(self.topology_id)}")

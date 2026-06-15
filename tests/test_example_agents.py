@@ -203,6 +203,34 @@ def test_minimal_deepagent_openai_defaults_and_openai_key(monkeypatch):
     assert agent.base_url == "https://api.openai.com/v1"
 
 
+def test_minimal_deepagent_openai_uses_official_base_url(monkeypatch):
+    monkeypatch.setenv("OPENAI_API_KEY", "openai-shell-key")
+    monkeypatch.setenv("OPENAI" + "_BASE_URL", "https://example.invalid/v1")
+
+    agent = MinimalDeepAgent(vendor="openai")
+
+    assert agent.base_url == "https://api.openai.com/v1"
+
+
+def test_openai_provider_uses_standard_openai_kwargs():
+    from examples.agents.minimal_deepagent.providers import openai as openai_provider
+
+    openai_provider.ChatOpenAI.reset_mock()
+
+    openai_provider.build_llm(
+        model="gpt-5.5",
+        api_key="openai-shell-key",
+        base_url="https://api.openai.com/v1",
+        temperature=0.1,
+        max_tokens=128,
+        timeout_seconds=60,
+    )
+
+    _, kwargs = openai_provider.ChatOpenAI.call_args
+    assert kwargs["base_url"] == "https://api.openai.com/v1"
+    assert kwargs["temperature"] == 0.1
+
+
 def test_minimal_deepagent_canonical_module_path():
     assert MinimalDeepAgent.__module__ == "examples.agents.minimal_deepagent.agent"
 

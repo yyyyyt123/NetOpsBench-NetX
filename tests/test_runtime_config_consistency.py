@@ -159,6 +159,23 @@ def test_pingmesh_agent_can_run_without_repo_package_install(tmp_path):
     assert "except ModuleNotFoundError" not in detector_text
 
 
+def test_pingmesh_agent_uses_single_fanout_probe_worker():
+    agent_text = Path("netopsbench/platform/pingmesh/agent.py").read_text(encoding="utf-8")
+    runtime_text = Path("netopsbench/platform/pingmesh/_agent_runtime.py").read_text(encoding="utf-8")
+    support_text = Path("netopsbench/platform/pingmesh/_agent_support.py").read_text(encoding="utf-8")
+
+    assert "Parallel workers" not in agent_text
+    assert "ThreadPoolExecutor" not in agent_text
+    assert "ThreadPoolExecutor" not in runtime_text
+    assert "ThreadPoolExecutor" not in support_text
+    assert "as_completed" not in runtime_text
+    assert "Probe worker: 1" in agent_text
+    assert "Concurrent flows" in agent_text
+    assert "Port pool" in agent_text
+    assert "Active ports/cycle" in agent_text
+    assert "udp_probe_cycle(self.tasks)" in runtime_text
+
+
 def test_plugin_agent_doc_uses_public_sdk_agent_narrative():
     doc_text = Path("docs/content/docs/build-your-agent/custom-agents.mdx").read_text(encoding="utf-8")
 

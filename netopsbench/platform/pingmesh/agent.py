@@ -14,7 +14,6 @@ try:
     from netopsbench.platform.pingmesh._agent_responder import UdpEchoResponder
     from netopsbench.platform.pingmesh._agent_runtime import PingRuntimeMixin
     from netopsbench.platform.pingmesh._agent_support import (
-        ThreadPoolExecutor,
         config,
         json,
         logger,
@@ -30,7 +29,6 @@ except ImportError:  # In-container deployment runs from /tmp/pingmesh/ flat fil
     from _agent_responder import UdpEchoResponder  # type: ignore[no-redef]
     from _agent_runtime import PingRuntimeMixin  # type: ignore[no-redef]
     from _agent_support import (  # type: ignore[no-redef]
-        ThreadPoolExecutor,
         config,
         json,
         logger,
@@ -40,6 +38,73 @@ except ImportError:  # In-container deployment runs from /tmp/pingmesh/ flat fil
         threading,
         time,
     )
+
+
+def _pinglist_client_count(data: dict) -> int:
+    clients = set()
+    for probe in data.get("probes", []):
+        src_name = str(probe.get("src_name") or "").strip()
+        dst_name = str(probe.get("dst_name") or "").strip()
+        if src_name:
+            clients.add(src_name)
+        if dst_name:
+            clients.add(dst_name)
+    return len(clients)
+
+
+def _default_ports_per_cycle(client_count: int) -> tuple[int, int]:
+    if client_count <= 8:
+        return 8, 2
+    if client_count <= 16:
+        return 6, 1
+    return 4, 1
+
+
+def _optional_int_env(name: str) -> int | None:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected integer", name, raw)
+        return None
+
+
+def _resolve_ports_per_cycle(
+    *,
+    client_count: int,
+    n_rtt_ports: int,
+    n_df_ports: int,
+    enable_df_probe: bool,
+) -> tuple[int, int]:
+    default_rtt, default_df = _default_ports_per_cycle(client_count)
+    rtt_override = _optional_int_env("PINGMESH_RTT_PORTS_PER_CYCLE")
+    df_override = _optional_int_env("PINGMESH_DF_PORTS_PER_CYCLE")
+
+    if n_rtt_ports <= 0:
+        rtt_ports = 0
+    else:
+        rtt_ports = rtt_override if rtt_override is not None else default_rtt
+        rtt_ports = max(1, min(int(rtt_ports), int(n_rtt_ports)))
+
+    if not enable_df_probe or n_df_ports <= 0:
+        df_ports = 0
+    else:
+        df_ports = df_override if df_override is not None else default_df
+        df_ports = max(0, min(int(df_ports), int(n_df_ports)))
+    return rtt_ports, df_ports
+
+
+def _deterministic_startup_jitter_seconds(hostname: str, interval: float) -> float:
+    try:
+        interval_value = float(interval)
+    except (TypeError, ValueError):
+        interval_value = 0.0
+    if interval_value <= 0:
+        return 0.0
+    seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(hostname or "")))
+    return (seed % 10_000) / 10_000.0 * interval_value
 
 
 class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
@@ -94,6 +159,14 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
         with open(pinglist_file, encoding="utf-8") as f:
             data = json.load(f)
         self.topology_id = config.topology_id or data.get("topology_id") or ""
+        self.pinglist_client_count = _pinglist_client_count(data)
+        self.rtt_ports_per_cycle, self.df_ports_per_cycle = _resolve_ports_per_cycle(
+            client_count=self.pinglist_client_count,
+            n_rtt_ports=self.n_rtt_ports,
+            n_df_ports=self.n_df_ports,
+            enable_df_probe=self.enable_df_probe,
+        )
+        self.startup_jitter_s = _deterministic_startup_jitter_seconds(self.my_name, self.interval)
 
         # Auto-derive DF payload size from topology MTU when using the default value.
         if self.df_payload_size == 1400:
@@ -115,8 +188,6 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
         except Exception as exc:
             logger.error("Failed to start UDP echo responder: %s", exc)
             self.responder = None
-        self.max_workers = min(max(len(self.tasks) // 10, 1), 16)
-        self.executor = ThreadPoolExecutor(max_workers=self.max_workers)
         self.write_queue = queue.Queue()
         self.batch_lock = threading.Lock()
         self.batch_buffer = []
@@ -137,25 +208,38 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
 
         logger.info("Pingmesh Agent started: %s", self.my_name)
         logger.info("  Probe tasks: %s", len(self.tasks))
-        logger.info("  Parallel workers: %s", self.max_workers)
+        active_port_count = self.rtt_ports_per_cycle + (self.df_ports_per_cycle if self.enable_df_probe else 0)
+        logger.info("  Probe worker: 1")
+        logger.info("  Concurrent flows: %s", len(self.tasks) * active_port_count)
         logger.info(
-            "  UDP RTT burst: %s ports (src %s-%s) -> dst :%s, timeout=%ss",
+            "  Port pool: RTT %s ports (src %s-%s), DF %s ports (src %s-%s)",
             self.n_rtt_ports,
             self.rtt_src_port_base,
             self.rtt_src_port_base + self.n_rtt_ports - 1,
+            self.n_df_ports if self.enable_df_probe else 0,
+            self.df_src_port_base,
+            self.df_src_port_base + self.n_df_ports - 1,
+        )
+        logger.info(
+            "  Active ports/cycle: RTT %s/%s, DF %s/%s",
+            self.rtt_ports_per_cycle,
+            self.n_rtt_ports,
+            self.df_ports_per_cycle if self.enable_df_probe else 0,
+            self.n_df_ports if self.enable_df_probe else 0,
+        )
+        logger.info(
+            "  UDP destination: :%s, timeout=%ss",
             self.udp_dst_port,
             self.burst_timeout_s,
         )
         if self.enable_df_probe:
             logger.info(
-                "  UDP DF burst: %s ports (src %s-%s), payload=%s bytes",
-                self.n_df_ports,
-                self.df_src_port_base,
-                self.df_src_port_base + self.n_df_ports - 1,
+                "  DF payload: %s bytes",
                 self.df_payload_size,
             )
         else:
             logger.info("  DF probe: disabled")
+        logger.info("  Startup jitter: %.3fs", self.startup_jitter_s)
         if self.min_interval == self.max_interval:
             logger.info("  Fixed cycle interval: %ss", self.min_interval)
         else:
