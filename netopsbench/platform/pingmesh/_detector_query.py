@@ -50,10 +50,11 @@ class DetectorQueryMixin:
             csv_data = StringIO(response.text)
             reader = csv.DictReader(csv_data)
             for row in reader:
-                if row.get("result", "") == "result" or not row.get("_value"):
+                raw_value = row.get("_value")
+                if row.get("result", "") == "result" or raw_value in (None, ""):
                     continue
                 try:
-                    row["value"] = float(row["_value"])
+                    row["value"] = float(raw_value)
                 except (ValueError, KeyError):
                     continue
                 results.append(row)

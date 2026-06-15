@@ -8,10 +8,10 @@
 #   bash scripts/run_all_benchmarks.sh          # 前台跑
 #
 # 每个 scale 使用不同并发 worker 数:
-#   xs:     3 workers  (12 scenarios, 3×6=18 containers)
-#   small:  3 workers  (12 scenarios, 3×14=42 containers)
-#   medium: 2 workers  (24 scenarios, 2×28=56 containers)
-#   large:  2 workers  (48 scenarios, 2×84=168 containers)
+#   xs:     3 workers  (14 scenarios, 3×6=18 containers)
+#   small:  3 workers  (15 scenarios, 3×14=42 containers)
+#   medium: 2 workers  (28 scenarios, 2×28=56 containers)
+#   large:  2 workers  (52 scenarios, 2×84=168 containers)
 #
 # 跑完后汇总 CSV 写入 scenario_results/benchmark_summary_<ts>.csv
 # ─────────────────────────────────────────────────────────────
@@ -27,9 +27,14 @@ cd "$REPO_ROOT"
 source "$REPO_ROOT/scripts/lib/find_python.sh"
 VENDOR="${BENCH_VENDOR:-minimax}"
 
-# scale → worker count. Keep XS at 3 to avoid provider/API rate limits while
-# still exercising the worker-pool path.
-declare -A SCALE_WORKERS=( [xs]=3 [small]=3 [medium]=2 [large]=2 )
+# scale → worker count. Override per scale with BENCH_WORKERS_<SCALE>, e.g.
+# BENCH_WORKERS_LARGE=4 bash scripts/run_all_benchmarks.sh
+declare -A SCALE_WORKERS=(
+    [xs]="${BENCH_WORKERS_XS:-3}"
+    [small]="${BENCH_WORKERS_SMALL:-3}"
+    [medium]="${BENCH_WORKERS_MEDIUM:-2}"
+    [large]="${BENCH_WORKERS_LARGE:-2}"
+)
 # Limit worker deployment fan-out to avoid simultaneous SONiC-VS boot pressure.
 declare -A SCALE_DEPLOY_JOBS=( [xs]=2 [small]=2 [medium]=2 [large]=1 )
 # Health check BGP retries: large needs more time (16 leafs vs 4 for medium)

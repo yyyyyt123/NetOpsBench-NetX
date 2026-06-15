@@ -1,6 +1,6 @@
 """OpenAI provider configuration and LLM factory.
 
-This provider targets an OpenAI-compatible API endpoint.
+This provider targets the standard OpenAI API.
 """
 
 from __future__ import annotations

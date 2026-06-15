@@ -34,6 +34,74 @@ def _filter_converged_loss(points: list[dict]) -> list[dict]:
     return [p for p in points if p.get("value", 0.0) < _BASELINE_UNREACHABLE_LOSS_PCT]
 
 
+def _loss_samples(
+    points: list[dict],
+    *,
+    pct_field: str,
+    sent_field: str,
+    lost_field: str,
+) -> list[dict]:
+    samples_by_time: dict[str, dict] = {}
+    for index, point in enumerate(points):
+        ts = str(point.get("_time") or point.get("time") or f"__row_{index}")
+        field = str(point.get("_field") or pct_field)
+        sample = samples_by_time.setdefault(ts, {"meta": point})
+        value = point.get("value")
+        if field == pct_field:
+            sample["pct"] = value
+        elif field == sent_field:
+            sample["sent"] = value
+        elif field == lost_field:
+            sample["lost"] = value
+
+    samples = []
+    for sample in samples_by_time.values():
+        sent = sample.get("sent")
+        lost = sample.get("lost")
+        pct = sample.get("pct")
+        try:
+            sent_value = float(sent)
+            lost_value = float(lost)
+        except (TypeError, ValueError):
+            sent_value = 0.0
+            lost_value = 0.0
+        if sent_value > 0:
+            sample["value"] = (lost_value / sent_value) * 100.0
+            sample["sent"] = sent_value
+            sample["lost"] = lost_value
+            sample["has_counts"] = True
+            samples.append(sample)
+            continue
+        try:
+            sample["value"] = float(pct)
+        except (TypeError, ValueError):
+            continue
+        sample["has_counts"] = False
+        samples.append(sample)
+    return samples
+
+
+def _aggregate_loss_pct(
+    points: list[dict],
+    *,
+    pct_field: str,
+    sent_field: str,
+    lost_field: str,
+    drop_unreachable: bool = False,
+) -> float:
+    samples = _loss_samples(points, pct_field=pct_field, sent_field=sent_field, lost_field=lost_field)
+    if drop_unreachable:
+        samples = [sample for sample in samples if sample.get("value", 0.0) < _BASELINE_UNREACHABLE_LOSS_PCT]
+    if not samples:
+        return 0.0
+    counted = [sample for sample in samples if sample.get("has_counts")]
+    sent = sum(float(sample.get("sent", 0.0) or 0.0) for sample in counted)
+    if sent > 0:
+        lost = sum(float(sample.get("lost", 0.0) or 0.0) for sample in counted)
+        return (lost / sent) * 100.0
+    return statistics.mean([sample["value"] for sample in samples])
+
+
 def _filter_converged_rtt(points: list[dict]) -> list[dict]:
     """Drop baseline samples where ``rtt_avg == 0`` (UDP burst returned no
     successful probes — a pre-convergence sentinel, not a legitimate RTT)."""
@@ -103,7 +171,7 @@ class DetectorAnalysisMixin:
             baseline = statistics.mean(baseline_values)
             stddev = statistics.stdev(baseline_values) if len(baseline_values) > 1 else 0
             current = statistics.mean(current_values)
-            # P2-fix: ensure minimum absolute threshold to avoid false positives on low-baseline paths
+            # Keep a minimum absolute threshold to avoid false positives on low-baseline paths.
             threshold = max(baseline + 3 * stddev, baseline + _MIN_LATENCY_ABS_THRESHOLD_MS)
             min_multiplier = 1.3
             min_abs_increase = 0.0
@@ -216,8 +284,12 @@ class DetectorAnalysisMixin:
         _be = self._safe_flux_string(baseline_end)
         _cs = self._safe_flux_string(current_start)
         _ce = self._safe_flux_string(current_end)
-        baseline_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_bs}"), stop: time(v: "{_be}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  |> filter(fn: (r) => r._field == "packet_loss")\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf"])\n'
-        current_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_cs}"), stop: time(v: "{_ce}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  |> filter(fn: (r) => r._field == "packet_loss")\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf"])\n'
+        fields_filter = (
+            '|> filter(fn: (r) => r._field == "packet_loss" or r._field == "packets_sent" '
+            'or r._field == "packets_lost")'
+        )
+        baseline_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_bs}"), stop: time(v: "{_be}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  {fields_filter}\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf", "_field"])\n'
+        current_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_cs}"), stop: time(v: "{_ce}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  {fields_filter}\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf", "_field"])\n'
         baseline_data = self._query_influxdb(baseline_query)
         current_data = self._query_influxdb(current_query)
 
@@ -226,8 +298,8 @@ class DetectorAnalysisMixin:
 
         anomalies = []
 
-        # P0-fix: detect paths that had baseline data but disappeared in current window
-        # (complete connectivity loss — link_down, blackhole, etc.)
+        # Detect paths that had baseline data but disappeared in the current
+        # window, which indicates complete connectivity loss.
         if baseline_paths:
             for path_key, baseline_points in baseline_paths.items():
                 if path_key in current_paths:
@@ -245,7 +317,12 @@ class DetectorAnalysisMixin:
                         src_leaf=first_point.get("src_leaf", ""),
                         dst_leaf=first_point.get("dst_leaf", ""),
                         value=100.0,
-                        baseline=statistics.mean([p["value"] for p in baseline_points]),
+                        baseline=_aggregate_loss_pct(
+                            baseline_points,
+                            pct_field="packet_loss",
+                            sent_field="packets_sent",
+                            lost_field="packets_lost",
+                        ),
                         threshold=100.0,
                         severity="high",
                         timestamp=_utcnow_iso(),
@@ -260,9 +337,19 @@ class DetectorAnalysisMixin:
             # pre-BGP-convergence state, not real path quality. Without this
             # filter, 100% loss samples from startup inflate baseline_loss
             # and raise `threshold` above the fault's real loss signal.
-            clean_baseline = _filter_converged_loss(baseline_points)
-            baseline_loss = statistics.mean([point["value"] for point in clean_baseline]) if clean_baseline else 0.0
-            current_loss = statistics.mean([point["value"] for point in current_points])
+            baseline_loss = _aggregate_loss_pct(
+                baseline_points,
+                pct_field="packet_loss",
+                sent_field="packets_sent",
+                lost_field="packets_lost",
+                drop_unreachable=True,
+            )
+            current_loss = _aggregate_loss_pct(
+                current_points,
+                pct_field="packet_loss",
+                sent_field="packets_sent",
+                lost_field="packets_lost",
+            )
             threshold = max(self.loss_pct_threshold, baseline_loss + self.loss_pct_delta)
             if current_loss >= threshold:
                 first_point = current_points[0]
@@ -293,8 +380,12 @@ class DetectorAnalysisMixin:
         _be = self._safe_flux_string(baseline_end)
         _cs = self._safe_flux_string(current_start)
         _ce = self._safe_flux_string(current_end)
-        baseline_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_bs}"), stop: time(v: "{_be}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  |> filter(fn: (r) => r._field == "df_loss_pct")\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf"])\n'
-        current_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_cs}"), stop: time(v: "{_ce}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  |> filter(fn: (r) => r._field == "df_loss_pct")\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf"])\n'
+        fields_filter = (
+            '|> filter(fn: (r) => r._field == "df_loss_pct" or r._field == "df_packets_sent" '
+            'or r._field == "df_packets_lost")'
+        )
+        baseline_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_bs}"), stop: time(v: "{_be}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  {fields_filter}\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf", "_field"])\n'
+        current_query = f'\nfrom(bucket: "{_b}")\n  |> range(start: time(v: "{_cs}"), stop: time(v: "{_ce}"))\n  |> filter(fn: (r) => r._measurement == "pingmesh")\n{topology_filter}  {fields_filter}\n  |> group(columns: ["src_ip", "dst_ip", "src_name", "dst_name", "src_leaf", "dst_leaf", "_field"])\n'
         baseline_data = self._query_influxdb(baseline_query)
         current_data = self._query_influxdb(current_query)
         if not baseline_data or not current_data:
@@ -308,9 +399,19 @@ class DetectorAnalysisMixin:
                 continue
             # Same pre-convergence guard as packet-loss: drop 100% df_loss_pct
             # startup samples so they don't inflate the baseline.
-            clean_baseline = _filter_converged_loss(baseline_points)
-            baseline_loss = statistics.mean([point["value"] for point in clean_baseline]) if clean_baseline else 0.0
-            current_loss = statistics.mean([point["value"] for point in current_points])
+            baseline_loss = _aggregate_loss_pct(
+                baseline_points,
+                pct_field="df_loss_pct",
+                sent_field="df_packets_sent",
+                lost_field="df_packets_lost",
+                drop_unreachable=True,
+            )
+            current_loss = _aggregate_loss_pct(
+                current_points,
+                pct_field="df_loss_pct",
+                sent_field="df_packets_sent",
+                lost_field="df_packets_lost",
+            )
             if current_loss >= 20.0 and (current_loss - baseline_loss) >= 15.0:
                 first_point = current_points[0]
                 anomalies.append(

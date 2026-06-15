@@ -9,7 +9,6 @@ import re
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import requests
@@ -48,8 +47,6 @@ except ModuleNotFoundError:
 logger = get_logger(__name__)
 
 __all__ = [
-    "ThreadPoolExecutor",
-    "as_completed",
     "config",
     "json",
     "logger",

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import time
@@ -197,6 +198,11 @@ def deploy_pingmesh(
         # Kill any existing agent, then start the new one
         _docker("exec", container, "pkill", "-f", "/tmp/pingmesh/run_pingmesh_agent.py", check=False, capture=True)
 
+        optional_env = ""
+        for env_name in ("PINGMESH_RTT_PORTS_PER_CYCLE", "PINGMESH_DF_PORTS_PER_CYCLE"):
+            if os.environ.get(env_name):
+                optional_env += f"{env_name}={shlex.quote(os.environ[env_name])} "
+
         env_block = (
             f"PYTHONPATH=/tmp "
             f"NETOPSBENCH_TOPOLOGY_ID='{topology_id}' "
@@ -204,6 +210,7 @@ def deploy_pingmesh(
             f"NETOPSBENCH_INFLUXDB_TOKEN='{influxdb_token}' "
             f"NETOPSBENCH_INFLUXDB_ORG='{influxdb_org}' "
             f"NETOPSBENCH_INFLUXDB_BUCKET='{influxdb_bucket}' "
+            f"{optional_env}"
             f"nohup python3 /tmp/pingmesh/run_pingmesh_agent.py "
             f"/tmp/pingmesh/pinglist.json {cycle_interval} "
             f"> /var/log/pingmesh/agent.log 2>&1 &"
