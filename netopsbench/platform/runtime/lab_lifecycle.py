@@ -28,7 +28,7 @@ def resolve_generated_topology_dir(topology_dir: str | None, scale: str) -> str:
     base = topology_dir or "lab-topology"
     if base == "generated_topology":
         return f"lab-topology/generated_topology_{scale}"
-    if any(base.endswith(f"generated_topology_{item}") for item in ("xs", "small", "medium", "large")):
+    if any(base.endswith(f"generated_topology_{item}") for item in ("xs", "small", "medium", "large", "xlarge")):
         return base
     return os.path.join(base, f"generated_topology_{scale}")
 

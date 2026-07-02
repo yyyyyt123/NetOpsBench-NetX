@@ -78,6 +78,49 @@ def _parse_bgp_established(bgp_output: str) -> int:
     return count
 
 
+def _parse_active_interfaces(show_interfaces_output: str) -> set[str]:
+    active: set[str] = set()
+    for line in show_interfaces_output.splitlines():
+        parts = line.split()
+        if not parts or not parts[0].startswith("Ethernet"):
+            continue
+        status_tokens = [part.lower() for part in parts[1:]]
+        if status_tokens.count("up") >= 2:
+            active.add(parts[0])
+    return active
+
+
+def _expected_active_interface_count(topo: dict, device: str) -> int:
+    devices = topo.get("devices", {}) or {}
+    scale = topo.get("scale", {}) or {}
+    leafs = devices.get("leafs", []) or []
+    spines = devices.get("spines", []) or []
+    clients = devices.get("clients", []) or []
+
+    if device.startswith("spine"):
+        return int(scale.get("num_leafs") or len(leafs))
+    if device.startswith("leaf"):
+        num_spines = int(scale.get("num_spines") or len(spines))
+        attached_clients = [client for client in clients if str(client.get("leaf", "")) == device]
+        clients_per_leaf = len(attached_clients) or int(scale.get("clients_per_leaf") or 0)
+        return num_spines + clients_per_leaf
+    return 0
+
+
+def _active_interface_coverage_error(
+    container: str,
+    device: str,
+    active_interfaces: set[str],
+    expected_count: int,
+) -> str | None:
+    if expected_count <= 0 or len(active_interfaces) >= expected_count:
+        return None
+    return (
+        f"active interface coverage too low on {container}: "
+        f"active={len(active_interfaces)} expected>={expected_count}"
+    )
+
+
 def check_worker_health(
     topology_dir: str,
     influxdb_url: str | None = None,
@@ -173,6 +216,35 @@ def check_worker_health(
         errors.append(f"BGP not converged on {spine_container}: " f"established={established} expected>={leaf_count}")
         return errors
 
+    logger.info("[3b/5] Checking active interface coverage...")
+    coverage_targets = ["spine1"]
+    if leafs:
+        coverage_targets.append("leaf1")
+        last_leaf = str(leafs[-1].get("name", ""))
+        if last_leaf and last_leaf not in coverage_targets:
+            coverage_targets.append(last_leaf)
+    for device in coverage_targets:
+        expected_count = _expected_active_interface_count(topo, device)
+        if expected_count <= 0:
+            continue
+        container = clab_container_name(lab_name, device)
+        active_ifaces: set[str] = set()
+        for _ in range(retries):
+            ret = _docker_exec(container, "bash", "-lc", "show interfaces status")
+            active_ifaces = _parse_active_interfaces(ret.stdout or "")
+            if len(active_ifaces) >= expected_count:
+                break
+            time.sleep(delay)
+        coverage_error = _active_interface_coverage_error(
+            container=container,
+            device=device,
+            active_interfaces=active_ifaces,
+            expected_count=expected_count,
+        )
+        if coverage_error:
+            errors.append(coverage_error)
+            return errors
+
     # [4/5] Client connectivity + Pingmesh agent
     logger.info("[4/5] Checking client connectivity and Pingmesh agent...")
     src_client = clients[0]
@@ -222,12 +294,7 @@ def check_worker_health(
 
     # Get active interfaces
     ret = _docker_exec(obs_container, "bash", "-lc", "show interfaces status")
-    active_ifaces: list[str] = []
-    for line in (ret.stdout or "").splitlines():
-        parts = line.split()
-        if parts and parts[0].startswith("Ethernet") and len(parts) >= 9:
-            if parts[7].lower() == "up" and parts[8].lower() == "up":
-                active_ifaces.append(parts[0])
+    active_ifaces = sorted(_parse_active_interfaces(ret.stdout or ""))
 
     # Send syslog marker
     syslog_marker = f"NETOPSBENCH_HEALTH_{lab_name}_{int(time.time())}"

@@ -39,6 +39,36 @@ def test_parse_scenario_allows_none_episode_without_target_device(tmp_path):
     assert validate_scenario(scenario) == []
 
 
+def test_validate_scenario_accepts_xlarge_scale(tmp_path):
+    scenario_path = tmp_path / "scenario.yaml"
+    scenario_path.write_text(
+        yaml.safe_dump(
+            {
+                "scenario_id": "generated_healthy_network_xlarge_001",
+                "name": "XLarge healthy case",
+                "description": "No fault episode",
+                "topology_scale": "xlarge",
+                "traffic_profile": "standard",
+                "metadata": {"negative_sample": True},
+                "episodes": [
+                    {
+                        "episode_id": "ep001",
+                        "description": "baseline",
+                        "fault_type": "none",
+                        "duration_seconds": 10,
+                        "stabilization_time": 1,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    scenario = parse_scenario_file(str(scenario_path))
+
+    assert validate_scenario(scenario) == []
+
+
 def test_parse_scenario_preserves_episode_parameters(tmp_path):
     scenario_path = tmp_path / "scenario.yaml"
     scenario_path.write_text(

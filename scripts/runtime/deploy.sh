@@ -42,7 +42,7 @@ echo ""
 ACTUAL_TOPO_DIR="$TOPO_DIR"
 if [ "$TOPO_DIR" = "generated_topology" ]; then
     ACTUAL_TOPO_DIR="lab-topology/generated_topology_${TOPO_SCALE}"
-elif echo "$TOPO_DIR" | grep -Eq '(^|/)generated_topology_(xs|small|medium|large)$'; then
+elif echo "$TOPO_DIR" | grep -Eq '(^|/)generated_topology_(xs|small|medium|large|xlarge)$'; then
     ACTUAL_TOPO_DIR="$TOPO_DIR"
 else
     ACTUAL_TOPO_DIR="$TOPO_DIR/generated_topology_${TOPO_SCALE}"
@@ -51,6 +51,10 @@ fi
 mkdir -p "$ACTUAL_TOPO_DIR"
 
 TOPOLOGY_FILE="$ACTUAL_TOPO_DIR/${LAB_NAME}.clab.yaml"
+TOPOLOGY_ID=${NETOPSBENCH_TOPOLOGY_ID:-$(basename "$ACTUAL_TOPO_DIR")}
+echo "Resolved topology directory: $ACTUAL_TOPO_DIR"
+echo "Topology ID: $TOPOLOGY_ID"
+echo ""
 
 # [1/7] Generate topology for requested scale
 echo "[1/7] Generating topology (scale=$TOPO_SCALE) into: $ACTUAL_TOPO_DIR"
@@ -75,12 +79,20 @@ if [ ! -f "$TOPOLOGY_FILE" ]; then
     exit 1
 fi
 
-"${SUDO[@]}" containerlab deploy -t "$TOPOLOGY_FILE" --reconfigure
+CLAB_DEPLOY_ARGS=(deploy -t "$TOPOLOGY_FILE" --reconfigure)
+if [ -n "${NETOPSBENCH_CONTAINERLAB_MAX_WORKERS:-}" ]; then
+    CLAB_DEPLOY_ARGS+=(--max-workers "$NETOPSBENCH_CONTAINERLAB_MAX_WORKERS")
+fi
+if [ -n "${NETOPSBENCH_CONTAINERLAB_TIMEOUT:-}" ]; then
+    CLAB_DEPLOY_ARGS+=(--timeout "$NETOPSBENCH_CONTAINERLAB_TIMEOUT")
+fi
+"${SUDO[@]}" containerlab "${CLAB_DEPLOY_ARGS[@]}"
 echo ""
 
 # [2.5/7] Apply SONiC configurations using fast parallel application
 echo "[2.5/7] Applying device configurations (SONiC)..."
-$PYTHON -m netopsbench.platform.runtime.apply_configs "$ACTUAL_TOPO_DIR" "" "$LAB_NAME"
+APPLY_CONFIG_PARALLEL=${NETOPSBENCH_APPLY_CONFIG_PARALLEL:-32}
+$PYTHON -m netopsbench.platform.runtime.apply_configs "$ACTUAL_TOPO_DIR" "$APPLY_CONFIG_PARALLEL" "$LAB_NAME"
 echo ""
 
 # [3/7] Generate or verify topology metadata
@@ -100,11 +112,6 @@ generate_metadata_file('$TOPOLOGY_FILE', '$METADATA_FILE')
 else
     echo "  Using existing metadata: $METADATA_FILE"
 fi
-echo ""
-
-# [4/7] Generate Telegraf configuration
-echo "[4/7] Generating Telegraf configuration..."
-$PYTHON -m netopsbench.platform.observability.telegraf "$METADATA_FILE"
 echo ""
 
 # [5/7] Start observability stack
@@ -130,15 +137,40 @@ if [ -n "$MGMT_NETWORK_NAME" ]; then
     echo ""
 fi
 
-# [6/7] Restart Telegraf to ensure proper data collection
-echo "[6/7] Restarting Telegraf for configuration reload..."
-"${SUDO[@]}" docker restart telegraf
+# [6/7] Start per-lab Telegraf sidecar
+echo "[6/7] Starting worker Telegraf..."
+BGP_COLLECTOR_PID_FILE="$ACTUAL_TOPO_DIR/bgp_collector.pid"
+BGP_COLLECTOR_LOG_FILE="$ACTUAL_TOPO_DIR/bgp_collector.log"
+BGP_COLLECTOR_OUTPUT_FILE="$ACTUAL_TOPO_DIR/bgp_neighbors.lp"
+BGP_PID=$(cat "$BGP_COLLECTOR_PID_FILE" 2>/dev/null || true)
+if [ -n "$BGP_PID" ] && kill -0 "$BGP_PID" >/dev/null 2>&1; then
+    kill "$BGP_PID" >/dev/null 2>&1 || true
+fi
+rm -f "$BGP_COLLECTOR_PID_FILE"
+NETOPSBENCH_TOPOLOGY_ID="$TOPOLOGY_ID" \
+NETOPSBENCH_TELEGRAF_INFLUXDB_URL="${NETOPSBENCH_TELEGRAF_INFLUXDB_URL:-http://influxdb:8086}" \
+    bash scripts/observability/start_worker_telegraf.sh "$ACTUAL_TOPO_DIR" "telegraf-${LAB_NAME}"
+
+if command -v setsid >/dev/null 2>&1; then
+    BGP_COLLECTOR_DETACH=(nohup setsid)
+else
+    BGP_COLLECTOR_DETACH=(nohup)
+fi
+NETOPSBENCH_TOPOLOGY_ID="$TOPOLOGY_ID" \
+    "${BGP_COLLECTOR_DETACH[@]}" $PYTHON scripts/runtime/run_bgp_collector.py \
+    "$METADATA_FILE" \
+    --output "$BGP_COLLECTOR_OUTPUT_FILE" \
+    --interval "${NETOPSBENCH_BGP_POLL_INTERVAL_SECONDS:-10}" \
+    --parallelism "${NETOPSBENCH_BGP_COLLECTOR_PARALLELISM:-16}" \
+    >> "$BGP_COLLECTOR_LOG_FILE" 2>&1 &
+echo $! > "$BGP_COLLECTOR_PID_FILE"
 sleep 5
 echo ""
 
 # [7/7] Deploy Pingmesh agents
 echo "[7/7] Deploying Pingmesh agents..."
-$PYTHON -m netopsbench.platform.pingmesh.deploy "$ACTUAL_TOPO_DIR/pinglist.json" "$ACTUAL_TOPO_DIR"
+NETOPSBENCH_TOPOLOGY_ID="$TOPOLOGY_ID" \
+    $PYTHON -m netopsbench.platform.pingmesh.deploy "$ACTUAL_TOPO_DIR/configs/pingmesh/pinglist.json" "$ACTUAL_TOPO_DIR"
 sleep 5
 echo ""
 

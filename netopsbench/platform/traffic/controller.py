@@ -2,8 +2,12 @@
 Traffic Controller - Manages background iperf3 traffic flows
 """
 
+import os
+import shlex
 import subprocess
 import uuid
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 
 from netopsbench.logging_utils import get_logger
@@ -11,6 +15,39 @@ from netopsbench.platform.utils.events import emit as _emit
 from netopsbench.platform.utils.proc import safe_run, sudo_prefix
 
 logger = get_logger(__name__)
+_DEFAULT_TRAFFIC_PARALLELISM = 32
+
+
+def _traffic_parallelism() -> int:
+    raw = os.environ.get("NETOPSBENCH_TRAFFIC_PARALLELISM", str(_DEFAULT_TRAFFIC_PARALLELISM))
+    try:
+        value = int(str(raw).strip())
+    except (TypeError, ValueError):
+        logger.warning(
+            "Ignoring invalid NETOPSBENCH_TRAFFIC_PARALLELISM=%r; using %d",
+            raw,
+            _DEFAULT_TRAFFIC_PARALLELISM,
+        )
+        value = _DEFAULT_TRAFFIC_PARALLELISM
+    return max(1, value)
+
+
+def _flow_summary(flow: "TrafficFlow") -> str:
+    return (
+        f"src={flow.src} dst={flow.dst} dst_ip={flow.dst_ip} "
+        f"protocol={flow.protocol} port={flow.dst_port} bandwidth={flow.bandwidth}"
+    )
+
+
+def _error_detail(exc: Exception) -> str:
+    parts = [str(exc)]
+    stderr = getattr(exc, "stderr", None)
+    stdout = getattr(exc, "stdout", None)
+    if stderr:
+        parts.append(f"stderr={str(stderr).strip()}")
+    if stdout:
+        parts.append(f"stdout={str(stdout).strip()}")
+    return "; ".join(part for part in parts if part)
 
 
 @dataclass
@@ -70,6 +107,60 @@ class TrafficController:
             timeout=self.command_timeout_seconds,
         )
         started_ports.add(dst_port)
+
+    def _ensure_iperf_servers_batch(self, dst_container: str, dst_ports: set[int]) -> None:
+        """Ensure a destination container has all required iperf3 server ports."""
+        started_ports = self.started_server_ports.setdefault(dst_container, set())
+        missing_ports = sorted(port for port in dst_ports if port not in started_ports)
+        if not missing_ports:
+            return
+
+        listener_checks = [f"ss -lnt 2>/dev/null | grep -q ':{port} '" for port in missing_ports]
+        start_commands = []
+        for port, check in zip(missing_ports, listener_checks, strict=True):
+            start_commands.extend(
+                [
+                    f"if ! {check}; then iperf3 -s -D -p {port}; fi",
+                    f"for _attempt in 1 2 3 4 5; do {check} && break; sleep 0.1; done",
+                    check,
+                ]
+            )
+        script = "\n".join(["set -e", *start_commands])
+        safe_run(
+            [*sudo_prefix(), "docker", "exec", dst_container, "sh", "-lc", script],
+            check=True,
+            capture_output=True,
+            timeout=max(self.command_timeout_seconds, 15),
+        )
+        started_ports.update(missing_ports)
+
+    def _client_command(self, flow: TrafficFlow) -> str:
+        cmd_parts = [
+            "iperf3",
+            "-c",
+            flow.dst_ip,
+            "-p",
+            str(flow.dst_port),
+            "-P",
+            str(flow.parallel),
+        ]
+        if flow.protocol == "udp":
+            cmd_parts.extend(["-u", "-b", flow.bandwidth, "-l", str(flow.udp_payload_len)])
+        elif flow.bandwidth:
+            cmd_parts.extend(["-b", flow.bandwidth])
+            if flow.tcp_mss > 0:
+                cmd_parts.extend(["-M", str(flow.tcp_mss)])
+        cmd_parts.extend(["-t", str(flow.duration)])
+        return " ".join(shlex.quote(part) for part in cmd_parts)
+
+    def _start_source_flows_batch(self, src_container: str, flows: list[TrafficFlow]) -> None:
+        script = "\n".join(f"nohup {self._client_command(flow)} >/dev/null 2>&1 &" for flow in flows)
+        safe_run(
+            [*sudo_prefix(), "docker", "exec", src_container, "sh", "-lc", script],
+            check=True,
+            capture_output=True,
+            timeout=max(self.command_timeout_seconds, 15),
+        )
 
     def start_flow(self, flow: TrafficFlow) -> str:
         """
@@ -178,24 +269,117 @@ class TrafficController:
         Returns:
             List of flow_ids
         """
-        flow_ids = []
+        if not flows:
+            _emit("\n  Started 0/0 flows")
+            return []
 
+        valid_flows: list[TrafficFlow] = []
+        dst_ports_by_container: dict[str, set[int]] = defaultdict(set)
+        flows_by_dst_container: dict[str, list[TrafficFlow]] = defaultdict(list)
         for flow in flows:
-            try:
-                flow_id = self.start_flow(flow)
-                flow_ids.append(flow_id)
-            except Exception as e:
-                _emit(f"  Warning: Skipping flow due to error: {e}", level="warning")
+            src_container = self.container_names.get(flow.src)
+            dst_container = self.container_names.get(flow.dst)
+            if not src_container:
+                _emit(f"  Warning: Skipping flow with unknown source: {_flow_summary(flow)}", level="warning")
+                continue
+            if not dst_container:
+                _emit(f"  Warning: Skipping flow with unknown destination: {_flow_summary(flow)}", level="warning")
+                continue
+            valid_flows.append(flow)
+            dst_ports_by_container[dst_container].add(flow.dst_port)
+            flows_by_dst_container[dst_container].append(flow)
 
+        failed_flows: set[str] = set()
+        parallelism = min(_traffic_parallelism(), max(len(dst_ports_by_container), 1))
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            future_map = {
+                executor.submit(self._ensure_iperf_servers_batch, dst_container, dst_ports): dst_container
+                for dst_container, dst_ports in dst_ports_by_container.items()
+            }
+            for future in as_completed(future_map):
+                dst_container = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    for flow in flows_by_dst_container.get(dst_container, []):
+                        failed_flows.add(flow.flow_id)
+                        _emit(
+                            f"  Warning: Failed to ensure server for {_flow_summary(flow)}: {_error_detail(exc)}",
+                            level="warning",
+                        )
+
+        source_groups: dict[str, list[TrafficFlow]] = defaultdict(list)
+        for flow in valid_flows:
+            if flow.flow_id in failed_flows:
+                continue
+            source_groups[self.container_names[flow.src]].append(flow)
+
+        parallelism = min(_traffic_parallelism(), max(len(source_groups), 1))
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            future_map = {
+                executor.submit(self._start_source_flows_batch, src_container, src_flows): (src_container, src_flows)
+                for src_container, src_flows in source_groups.items()
+            }
+            for future in as_completed(future_map):
+                src_container, src_flows = future_map[future]
+                try:
+                    future.result()
+                except Exception as exc:
+                    for flow in src_flows:
+                        failed_flows.add(flow.flow_id)
+                        _emit(
+                            "  Warning: Failed to start flow on "
+                            f"{src_container}: {_flow_summary(flow)}: {_error_detail(exc)}",
+                            level="warning",
+                        )
+                    continue
+                for flow in src_flows:
+                    self.active_flows[flow.flow_id] = flow
+                _emit(f"  Started {len(src_flows)} flow(s) from {src_flows[0].src}")
+
+        flow_ids = [flow.flow_id for flow in valid_flows if flow.flow_id in self.active_flows]
         _emit(f"\n  Started {len(flow_ids)}/{len(flows)} flows")
         return flow_ids
 
     def stop_all(self):
         """Stop all active traffic flows."""
         flow_ids = list(self.active_flows.keys())
-
+        flows_by_src_container: dict[str, list[TrafficFlow]] = defaultdict(list)
         for flow_id in flow_ids:
-            self.stop_flow(flow_id)
+            flow = self.active_flows[flow_id]
+            src_container = self.container_names.get(flow.src)
+            if src_container:
+                flows_by_src_container[src_container].append(flow)
+            else:
+                del self.active_flows[flow_id]
+
+        def stop_container(src_container: str) -> None:
+            safe_run(
+                [*sudo_prefix(), "docker", "exec", src_container, "sh", "-lc", "pkill -f 'iperf3 -c' || true"],
+                check=False,
+                capture_output=True,
+                timeout=15,
+            )
+
+        parallelism = min(_traffic_parallelism(), max(len(flows_by_src_container), 1))
+        with ThreadPoolExecutor(max_workers=parallelism) as executor:
+            future_map = {
+                executor.submit(stop_container, src_container): (src_container, src_flows)
+                for src_container, src_flows in flows_by_src_container.items()
+            }
+            for future in as_completed(future_map):
+                src_container, src_flows = future_map[future]
+                try:
+                    future.result()
+                    _emit(f"  Stopped {len(src_flows)} flow(s) from {src_flows[0].src}")
+                except Exception as exc:
+                    _emit(
+                        f"  Warning: Failed to stop flows on {src_container}: {_error_detail(exc)}",
+                        level="warning",
+                    )
+                finally:
+                    for flow in src_flows:
+                        self.active_flows.pop(flow.flow_id, None)
 
         _emit(f"  Stopped all {len(flow_ids)} flows")
 

@@ -18,6 +18,29 @@ logger = get_logger(__name__)
 
 
 QueryRunner = Callable[[str], str]
+_INTERFACE_COUNTER_FIELDS = {
+    "in_octets",
+    "out_octets",
+    "in_unicast_pkts",
+    "out_unicast_pkts",
+    "in_discarded_packets",
+    "out_discarded_packets",
+    "in_errors",
+    "out_errors",
+    "SAI_PORT_STAT_IF_IN_OCTETS",
+    "SAI_PORT_STAT_IF_OUT_OCTETS",
+    "SAI_PORT_STAT_IF_IN_UCAST_PKTS",
+    "SAI_PORT_STAT_IF_OUT_UCAST_PKTS",
+    "SAI_PORT_STAT_IF_IN_DISCARDS",
+    "SAI_PORT_STAT_IF_OUT_DISCARDS",
+    "SAI_PORT_STAT_IF_IN_ERRORS",
+    "SAI_PORT_STAT_IF_OUT_ERRORS",
+}
+
+
+def _interface_counter_field_filter() -> str:
+    predicates = " or ".join(f'r._field == "{field}"' for field in sorted(_INTERFACE_COUNTER_FIELDS))
+    return f"  |> filter(fn: (r) => {predicates})\n"
 
 
 def _make_url_opener(base_url: str):
@@ -70,6 +93,11 @@ def extract_interface_names(csv_text: str) -> list[str]:
     reader = csv.DictReader(lines)
     for row in reader:
         if row.get("result") == "result":
+            continue
+        if (row.get("_value") or "").strip() == "":
+            continue
+        field = (row.get("_field") or "").strip()
+        if field and field not in _INTERFACE_COUNTER_FIELDS:
             continue
         name = (row.get("name") or "").strip()
         path = (row.get("path") or "").strip()
@@ -138,7 +166,9 @@ def check_observability(
         f'from(bucket: "{bucket}")\n'
         f"  |> range(start: -10m)\n"
         f'  |> filter(fn: (r) => r._measurement == "interfaces")\n'
+        f"{topology_filter}"
         f'  |> filter(fn: (r) => r.source == "{obs_device}")\n'
+        f"{_interface_counter_field_filter()}"
         f"  |> limit(n: 5)\n"
     )
     if count_data_rows(query_runner(interface_query)) <= 0:
@@ -148,8 +178,10 @@ def check_observability(
             f'from(bucket: "{bucket}")\n'
             f"  |> range(start: -10m)\n"
             f'  |> filter(fn: (r) => r._measurement == "interfaces")\n'
+            f"{topology_filter}"
             f'  |> filter(fn: (r) => r.source == "{obs_device}")\n'
-            f'  |> keep(columns: ["name", "path"])\n'
+            f"{_interface_counter_field_filter()}"
+            f'  |> keep(columns: ["_field", "_value", "name", "path"])\n'
             f"  |> limit(n: 2000)\n"
         )
         observed_interfaces = extract_interface_names(query_runner(interface_identity_query))

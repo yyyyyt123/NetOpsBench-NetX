@@ -63,6 +63,12 @@ else
     "${SUDO[@]}" containerlab destroy --name "$LAB_NAME" --cleanup || true
 fi
 
+readarray -t RESIDUAL_CONTAINERS < <("${SUDO[@]}" docker ps -a --filter "name=clab-${LAB_NAME}-" --format '{{.Names}}' || true)
+if [ "${#RESIDUAL_CONTAINERS[@]}" -gt 0 ]; then
+    echo "Removing ${#RESIDUAL_CONTAINERS[@]} residual lab container(s) by name prefix..."
+    printf '%s\n' "${RESIDUAL_CONTAINERS[@]}" | xargs -r "${SUDO[@]}" docker rm -f >/dev/null 2>&1 || true
+fi
+
 if "${SUDO[@]}" docker network ls --format '{{.Name}}' | grep -qx "$MGMT_NETWORK"; then
     "${SUDO[@]}" docker network rm "$MGMT_NETWORK" >/dev/null 2>&1 || true
 fi

@@ -20,16 +20,22 @@ def _safe_label(value: str) -> str:
     return "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in text) or "unknown"
 
 
-# Third-octet base for worker management subnets: 172.31.{base+worker_idx}.0/24
+# Third-octet base for worker management subnets.
 # Each scale tier gets a 20-address range so workers from different scales
 # never overlap even if multiple tiers are deployed simultaneously.
 #   xs:     172.31.100-119.0/24
 #   small:  172.31.120-139.0/24
 #   medium: 172.31.140-159.0/24
 #   large:  172.31.160-179.0/24
+#   xlarge: 172.31.180-199.0/23
 _SCALE_SUBNET_BASE = {
     "xs": 100,
     "small": 120,
     "medium": 140,
     "large": 160,
+    "xlarge": 180,
+}
+
+_SCALE_SUBNET_PREFIX = {
+    "xlarge": 23,
 }

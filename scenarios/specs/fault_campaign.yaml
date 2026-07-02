@@ -20,6 +20,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: blackhole_route_leaf
     fault_type: blackhole_route
@@ -29,6 +31,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: mtu_mismatch_core
     fault_type: mtu_mismatch
@@ -39,6 +43,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: high_latency_leaf
     fault_type: high_latency
@@ -50,6 +56,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: static_route_misconfig
     fault_type: static_route_misconfig
@@ -59,6 +67,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: packet_loss_edge
     fault_type: packet_loss
@@ -71,6 +81,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: packet_corruption_edge
     fault_type: packet_corruption
@@ -83,6 +95,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: link_flapping_core
     fault_type: link_flapping
@@ -93,6 +107,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: bgp_neighbor_misconfig_leaf
     fault_type: bgp_neighbor_misconfig
@@ -104,6 +120,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: route_policy_misconfig_leaf
     fault_type: route_policy_misconfig
@@ -115,6 +133,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: device_down_leaf
     fault_type: device_down
@@ -124,6 +144,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: acl_misconfig_leaf
     fault_type: acl_misconfig
@@ -133,6 +155,8 @@ fault_templates:
       xs: 1
       small: 1
       medium: 2
+      large: 4
+      xlarge: 4
 
   - name: healthy_network
     fault_type: none
@@ -142,3 +166,4 @@ fault_templates:
       small: 3
       medium: 4
       large: 4
+      xlarge: 4

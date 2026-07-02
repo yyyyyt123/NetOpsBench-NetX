@@ -164,7 +164,7 @@ def _short_scenario_id(scenario_id: str) -> str:
         sid = sid[len("generated_") :]
     # Strip trailing scale + numeric suffix like "_xs_001".
     parts = sid.rsplit("_", 2)
-    if len(parts) == 3 and parts[-2] in {"xs", "small", "medium", "large"} and parts[-1].isdigit():
+    if len(parts) == 3 and parts[-2] in {"xs", "small", "medium", "large", "xlarge"} and parts[-1].isdigit():
         sid = parts[0]
     return sid
 

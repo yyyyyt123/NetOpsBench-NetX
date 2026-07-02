@@ -6,14 +6,33 @@ Supports generating 2-tier CLOS topologies with configurable scale.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import os
+import shutil
+from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 import yaml
 
 DEFAULT_SONIC_VS_IMAGE = "yyyyyt123/netopsbench-sonic-vs-202505-telemetry:202505-telemetry"
+SONIC_PLATFORM = "x86_64-kvm_x86_64-r0"
+SONIC_HWSKU = "Force10-S6000"
+SONIC_HWSKU_PATH = f"/usr/share/sonic/device/{SONIC_PLATFORM}/{SONIC_HWSKU}"
+SONIC_PORT_CONFIG_PATH = f"{SONIC_HWSKU_PATH}/port_config.ini"
+SONIC_LANEMAP_PATH = f"{SONIC_HWSKU_PATH}/lanemap.ini"
+SONIC_BASE_CONFIG_DB = Path(__file__).with_name("sonic_vs_base_config_db.json")
+SONIC_START_WRAPPER_SOURCE = Path(__file__).with_name("sonic_start.sh")
+
+
+def _parse_bool_env(name: str, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 @dataclass
@@ -32,14 +51,22 @@ class TopologyConfig:
     collector_ip: str | None = None
     spine_asn: int = 65001
     leaf_asn_start: int = 65011
+    scale_name: str | None = None
 
 
 # Predefined topology scales
 TOPOLOGY_SCALES = {
-    "xs": TopologyConfig(num_spines=2, num_leafs=2, clients_per_leaf=1),
-    "small": TopologyConfig(num_spines=2, num_leafs=4, clients_per_leaf=2),
-    "medium": TopologyConfig(num_spines=4, num_leafs=8, clients_per_leaf=2),
-    "large": TopologyConfig(num_spines=4, num_leafs=16, clients_per_leaf=4),
+    "xs": TopologyConfig(num_spines=2, num_leafs=2, clients_per_leaf=1, scale_name="xs"),
+    "small": TopologyConfig(num_spines=2, num_leafs=4, clients_per_leaf=2, scale_name="small"),
+    "medium": TopologyConfig(num_spines=4, num_leafs=8, clients_per_leaf=2, scale_name="medium"),
+    "large": TopologyConfig(num_spines=4, num_leafs=16, clients_per_leaf=4, scale_name="large"),
+    "xlarge": TopologyConfig(
+        num_spines=16,
+        num_leafs=128,
+        clients_per_leaf=1,
+        mgmt_ipv4_subnet="172.20.20.0/23",
+        scale_name="xlarge",
+    ),
 }
 
 
@@ -65,7 +92,9 @@ class TopologyGenerator:
         self.spine_mgmt_offset = 10
         self.leaf_mgmt_offset = self.spine_mgmt_offset + self.config.num_spines
         self.client_mgmt_offset = self.leaf_mgmt_offset + self.config.num_leafs
+        self._validate_address_space()
         self.collector_ip = self.config.collector_ip or self._default_collector_ip()
+        self._validate_collector_ip(self.collector_ip)
 
         self.syslog_collector = os.getenv("NETOPSBENCH_SYSLOG_COLLECTOR", self.collector_ip)
         self.sflow_collector = os.getenv("NETOPSBENCH_SFLOW_COLLECTOR", self.syslog_collector)
@@ -73,7 +102,12 @@ class TopologyGenerator:
         self.sflow_polling_interval = int(os.getenv("NETOPSBENCH_SFLOW_POLLING_INTERVAL", "20"))
         self.sflow_sample_rate = int(os.getenv("NETOPSBENCH_SFLOW_SAMPLE_RATE", "1000"))
         self.sflow_sample_direction = os.getenv("NETOPSBENCH_SFLOW_SAMPLE_DIRECTION", "ingress")
+        self.enable_interface_sflow = _parse_bool_env(
+            "NETOPSBENCH_ENABLE_INTERFACE_SFLOW",
+            default=self.config.scale_name != "xlarge",
+        )
         self.snmp_community = os.getenv("NETOPSBENCH_SNMP_COMMUNITY", "public")
+        self._validate_collector_ip(self.syslog_collector)
 
     def _mgmt_host_ip(self, host_offset: int) -> str:
         """Return a deterministic management IPv4 address from the configured subnet."""
@@ -88,19 +122,66 @@ class TopologyGenerator:
         return str(candidate)
 
     def _default_collector_ip(self) -> str:
-        """Pick a collector IP inside the management subnet, preferring .200 when possible."""
+        """Pick a collector IP outside allocated device management addresses."""
+        last_device_offset = self.client_mgmt_offset + (self.config.num_leafs * self.config.clients_per_leaf)
         preferred = int(self.mgmt_network.network_address) + 200
         preferred_ip = ipaddress.ip_address(preferred)
-        if preferred_ip in self.mgmt_network and preferred_ip not in {
+        if last_device_offset < 200 and preferred_ip in self.mgmt_network and preferred_ip not in {
             self.mgmt_network.network_address,
             self.mgmt_network.broadcast_address,
         }:
             return str(preferred_ip)
 
-        fallback = ipaddress.ip_address(int(self.mgmt_network.broadcast_address) - 1)
+        fallback = ipaddress.ip_address(int(self.mgmt_network.network_address) + last_device_offset + 1)
+        if fallback not in self.mgmt_network or fallback in {
+            self.mgmt_network.network_address,
+            self.mgmt_network.broadcast_address,
+        }:
+            fallback = ipaddress.ip_address(int(self.mgmt_network.broadcast_address) - 1)
         if fallback in {self.mgmt_network.network_address, self.mgmt_network.broadcast_address}:
             raise ValueError(f"Management subnet too small for collector IP: {self.mgmt_network}")
         return str(fallback)
+
+    def _validate_address_space(self) -> None:
+        """Validate deterministic IPv4 schemes before writing generated files."""
+        if not 1 <= self.config.num_spines <= 255:
+            raise ValueError(f"num_spines must fit in one IPv4 octet (1-255), got {self.config.num_spines}")
+        if not 1 <= self.config.num_leafs <= 155:
+            raise ValueError(
+                "num_leafs must fit the client subnet scheme 192.168.(100+leaf).0/24 "
+                f"(1-155), got {self.config.num_leafs}"
+            )
+        if not 1 <= self.config.clients_per_leaf <= 64:
+            raise ValueError(
+                "clients_per_leaf must fit the per-leaf /30 allocation (1-64), "
+                f"got {self.config.clients_per_leaf}"
+            )
+
+        last_device_offset = self.client_mgmt_offset + (self.config.num_leafs * self.config.clients_per_leaf)
+        self._mgmt_host_ip(last_device_offset)
+
+    def _allocated_mgmt_ips(self) -> set[ipaddress.IPv4Address]:
+        offsets = set()
+        offsets.update(self.spine_mgmt_offset + i for i in range(1, self.config.num_spines + 1))
+        offsets.update(self.leaf_mgmt_offset + i for i in range(1, self.config.num_leafs + 1))
+        offsets.update(
+            self.client_mgmt_offset + i
+            for i in range(1, (self.config.num_leafs * self.config.clients_per_leaf) + 1)
+        )
+        return {ipaddress.ip_address(int(self.mgmt_network.network_address) + offset) for offset in offsets}
+
+    def _validate_collector_ip(self, collector_ip: str) -> None:
+        candidate = ipaddress.ip_address(collector_ip)
+        if candidate not in self.mgmt_network:
+            raise ValueError(f"Collector IP {collector_ip} falls outside management subnet {self.mgmt_network}")
+        if candidate in {self.mgmt_network.network_address, self.mgmt_network.broadcast_address}:
+            raise ValueError(f"Collector IP {collector_ip} is reserved in management subnet {self.mgmt_network}")
+        if candidate in self._allocated_mgmt_ips():
+            raise ValueError(f"Collector IP {collector_ip} overlaps a generated device management address")
+
+    def _spine_leaf_ips(self, spine_idx: int, leaf_idx: int) -> tuple[str, str]:
+        """Return deterministic underlay IPs for one spine-leaf /30."""
+        return f"10.{spine_idx}.{leaf_idx}.1", f"10.{spine_idx}.{leaf_idx}.2"
 
     def generate(self) -> dict:
         """
@@ -111,6 +192,11 @@ class TopologyGenerator:
         """
         os.makedirs(self.output_dir, exist_ok=True)
         os.makedirs(os.path.join(self.output_dir, "configs"), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, "configs", "sonic"), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, "configs", "frr"), exist_ok=True)
+        os.makedirs(os.path.join(self.output_dir, "configs", "pingmesh"), exist_ok=True)
+        self._generated_frr_paths: list[str] = []
+        sonic_start_wrapper = self._write_sonic_start_wrapper()
 
         # Generate topology structure
         topology = self._generate_topology_structure()
@@ -131,6 +217,9 @@ class TopologyGenerator:
             "yaml_file": yaml_path,
             "metadata_file": metadata_path,
             "config_files": config_paths,
+            "startup_config_files": config_paths,
+            "sonic_start_wrapper_file": sonic_start_wrapper,
+            "frr_config_files": list(self._generated_frr_paths),
             "metadata": metadata,
         }
 
@@ -144,8 +233,20 @@ class TopologyGenerator:
             },
             "topology": {
                 "kinds": {
-                    self.config.nos_kind: {"image": self.config.nos_image},
-                    "linux": {"image": self.config.client_image},
+                    self.config.nos_kind: {
+                        "image": self.config.nos_image,
+                        "binds": [
+                            "configs/sonic/__clabNodeName__/config_db.json:/etc/sonic/config_db.json:rw",
+                            f"configs/sonic/__clabNodeName__/port_config.ini:{SONIC_PORT_CONFIG_PATH}:rw",
+                            f"configs/sonic/__clabNodeName__/lanemap.ini:{SONIC_LANEMAP_PATH}:rw",
+                            "configs/sonic/start.sh:/usr/bin/start.sh:ro",
+                            "configs/frr/__clabNodeName__.conf:/etc/frr/frr.conf:rw",
+                        ],
+                    },
+                    "linux": {
+                        "image": self.config.client_image,
+                        "binds": ["configs/pingmesh:/tmp/pingmesh:ro"],
+                    },
                 },
                 "nodes": {},
                 "links": [],
@@ -248,6 +349,15 @@ class TopologyGenerator:
 
         return yaml_path
 
+    def _write_sonic_start_wrapper(self) -> str:
+        """Stage the SONiC startup wrapper used by all sonic-vs nodes."""
+        target = Path(self.output_dir) / "configs" / "sonic" / "start.sh"
+        if not SONIC_START_WRAPPER_SOURCE.is_file():
+            raise FileNotFoundError(f"SONiC startup wrapper source not found: {SONIC_START_WRAPPER_SOURCE}")
+        shutil.copy2(SONIC_START_WRAPPER_SOURCE, target)
+        target.chmod(0o755)
+        return str(target)
+
     def _generate_device_configs(self) -> list[str]:
         """Generate device configuration files."""
         config_paths = []
@@ -268,138 +378,222 @@ class TopologyGenerator:
         """Map Linux eth index (eth1, eth2) to SONiC port name (Ethernet0, Ethernet4, ...)."""
         return f"Ethernet{(eth_index - 1) * 4}"
 
+    def _sonic_port_attrs(self, port_idx: int) -> dict[str, str]:
+        """Return CONFIG_DB PORT attributes for zero-based SONiC front-panel port index."""
+        eth = port_idx * 4
+        first_lane = eth + 1
+        lanes = ",".join(str(first_lane + offset) for offset in range(4))
+        return {
+            "alias": f"fortyGigE0/{eth}",
+            "index": str(port_idx),
+            "lanes": lanes,
+            "speed": "100000",
+            "subport": "0",
+            "admin_status": "up",
+        }
+
+    def _port_entries(self, required_ports: int) -> dict[str, dict[str, str]]:
+        """Return complete CONFIG_DB PORT rows for a generated SONiC-VS node."""
+        return {f"Ethernet{port_idx * 4}": self._sonic_port_attrs(port_idx) for port_idx in range(required_ports)}
+
+    def _port_config_ini(self, required_ports: int) -> str:
+        lines = ["# name          lanes             alias             index       speed"]
+        for port_idx in range(required_ports):
+            name = f"Ethernet{port_idx * 4}"
+            attrs = self._sonic_port_attrs(port_idx)
+            lines.append(
+                f"{name:<15} {attrs['lanes']:<17} {attrs['alias']:<17} {attrs['index']:<11} {attrs['speed']}"
+            )
+        return "\n".join(lines) + "\n"
+
+    def _lanemap_ini(self, required_ports: int) -> str:
+        lines = []
+        for port_idx in range(required_ports):
+            linux_if = f"eth{port_idx + 1}"
+            attrs = self._sonic_port_attrs(port_idx)
+            lines.append(f"{linux_if}:{attrs['lanes']}")
+        return "\n".join(lines) + "\n"
+
+    def _device_mac(self, device: str) -> str:
+        digest = hashlib.sha256(device.encode("utf-8")).digest()
+        return "02:" + ":".join(f"{byte:02x}" for byte in digest[:5])
+
+    def _load_base_config_db(self) -> dict[str, Any]:
+        with SONIC_BASE_CONFIG_DB.open(encoding="utf-8") as handle:
+            return deepcopy(json.load(handle))
+
+    def _add_configdb_interface(
+        self,
+        interfaces: dict[str, dict[str, Any]],
+        interface: str,
+        cidr: str,
+    ) -> None:
+        entry = interfaces.setdefault(interface, {"admin_status": "up", "ips": []})
+        entry["admin_status"] = "up"
+        ips = entry.setdefault("ips", [])
+        if cidr not in ips:
+            ips.append(cidr)
+
+    def _build_config_db(
+        self,
+        device: str,
+        required_ports: int,
+        interfaces: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        config_db = self._load_base_config_db()
+        metadata = config_db.setdefault("DEVICE_METADATA", {}).setdefault("localhost", {})
+        metadata["hostname"] = device
+        metadata["hwsku"] = SONIC_HWSKU
+        metadata["platform"] = SONIC_PLATFORM
+        metadata["mac"] = self._device_mac(device)
+
+        ports = self._port_entries(required_ports)
+        config_db["PORT"] = ports
+        config_db["CABLE_LENGTH"] = {"AZURE": {name: "0m" for name in ports}}
+        config_db["BREAKOUT_CFG"] = {name: {"brkout_mode": "1x100G[40G]"} for name in ports}
+        config_db["SYSLOG_SERVER"] = {"telegraf": {"server": self.syslog_collector}}
+
+        interface_table: dict[str, dict[str, str]] = {}
+        for interface_name in sorted(interfaces, key=lambda name: int(name[8:]) if name.startswith("Ethernet") else 0):
+            interface_table[interface_name] = {}
+            for cidr in interfaces[interface_name].get("ips", []):
+                interface_table[f"{interface_name}|{cidr}"] = {}
+        config_db["INTERFACE"] = interface_table
+
+        if self.enable_interface_sflow:
+            config_db["SFLOW"] = {
+                "global": {
+                    "admin_state": "up",
+                    "agent_id": "mgmt0",
+                    "polling_interval": str(self.sflow_polling_interval),
+                    "sample_direction": self.sflow_sample_direction,
+                }
+            }
+            config_db["SFLOW_COLLECTOR"] = {
+                "telegraf": {
+                    "collector_ip": self.sflow_collector,
+                    "collector_port": str(self.sflow_port),
+                }
+            }
+            config_db["SFLOW_SESSION"] = {
+                interface_name: {
+                    "admin_state": "up",
+                    "sample_rate": str(self.sflow_sample_rate),
+                }
+                for interface_name in interface_table
+                if "|" not in interface_name
+            }
+
+        return config_db
+
+    def _frr_config(
+        self,
+        device: str,
+        local_as: int,
+        router_id: str,
+        neighbors: list[tuple[str, int]],
+        networks: list[str],
+    ) -> str:
+        lines = [
+            "frr version 10.3",
+            "frr defaults traditional",
+            f"hostname {device}",
+            "log syslog informational",
+            "no ipv6 forwarding",
+            "service integrated-vtysh-config",
+            "!",
+            "route-map RM-ALLOW permit 10",
+            "!",
+            f"router bgp {local_as}",
+            f" bgp router-id {router_id}",
+            " no bgp ebgp-requires-policy",
+        ]
+        for peer_ip, remote_as in neighbors:
+            lines.append(f" neighbor {peer_ip} remote-as {remote_as}")
+        lines.extend([" !", " address-family ipv4 unicast"])
+        for peer_ip, _remote_as in neighbors:
+            lines.append(f"  neighbor {peer_ip} activate")
+            lines.append(f"  neighbor {peer_ip} route-map RM-ALLOW out")
+        for prefix in networks:
+            lines.append(f"  network {prefix} route-map RM-ALLOW")
+        lines.extend([" exit-address-family", "!", "line vty", "!"])
+        return "\n".join(lines) + "\n"
+
+    def _write_device_startup_artifacts(
+        self,
+        device: str,
+        required_ports: int,
+        interfaces: dict[str, dict[str, Any]],
+        local_as: int,
+        router_id: str,
+        neighbors: list[tuple[str, int]],
+        networks: list[str],
+    ) -> str:
+        sonic_dir = Path(self.output_dir) / "configs" / "sonic" / device
+        sonic_dir.mkdir(parents=True, exist_ok=True)
+        config_db_path = sonic_dir / "config_db.json"
+        config_db_path.write_text(
+            json.dumps(self._build_config_db(device, required_ports, interfaces), indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        (sonic_dir / "port_config.ini").write_text(self._port_config_ini(required_ports), encoding="utf-8")
+        (sonic_dir / "lanemap.ini").write_text(self._lanemap_ini(required_ports), encoding="utf-8")
+
+        frr_path = Path(self.output_dir) / "configs" / "frr" / f"{device}.conf"
+        frr_path.write_text(
+            self._frr_config(device, local_as, router_id, neighbors, networks),
+            encoding="utf-8",
+        )
+        self._generated_frr_paths.append(str(frr_path))
+        return str(config_db_path)
+
     def _client_subnet_octet(self, leaf_idx: int) -> int:
         """Return client subnet /24 octet for a leaf, avoiding spine-link collisions."""
         return 100 + leaf_idx
-
-    def _telemetry_config_lines(self) -> list[str]:
-        return [
-            f"config syslog add {self.syslog_collector} || true",
-            "sonic-db-cli CONFIG_DB hset 'FLEX_COUNTER_TABLE|PORT' FLEX_COUNTER_STATUS enable || true",
-            "sonic-db-cli CONFIG_DB hset 'FLEX_COUNTER_TABLE|PORT' POLL_INTERVAL 1000 || true",
-            "sonic-db-cli CONFIG_DB hmset 'GNMI|gnmi' port 50051 client_auth false log_level 2 || true",
-            (
-                "sonic-db-cli CONFIG_DB hmset 'GNMI|certs' "
-                "ca_crt /etc/sonic/telemetry/dsmsroot.cer "
-                "server_crt /etc/sonic/telemetry/streamingtelemetryserver.cer "
-                "server_key /etc/sonic/telemetry/streamingtelemetryserver.key || true"
-            ),
-            "mkdir -p /var/run/telemetry /var/log/telemetry || true",
-            (
-                "pgrep -x telemetry >/dev/null 2>&1 || "
-                "nohup /usr/sbin/telemetry -port 50051 -noTLS -client_auth none "
-                ">/var/log/telemetry/telemetry.log 2>&1 &"
-            ),
-            "config sflow agent-id add mgmt0 || true",
-            f"config sflow collector add telegraf {self.sflow_collector} --port {self.sflow_port} || true",
-            f"config sflow polling-interval {self.sflow_polling_interval} || true",
-            f"config sflow sample-direction {self.sflow_sample_direction} || true",
-            "config sflow enable || true",
-        ]
 
     def _generate_spine_config(self, spine_idx: int) -> str:
         """Generate configuration for a spine switch."""
         spine_name = f"spine{spine_idx}"
         router_id = f"10.0.0.{spine_idx}"
-
-        script = [
-            f"# Spine {spine_idx} Configuration",
-            "# Generated by NetOpsBench",
-            "set -e",
-            "",
-        ]
-
-        vtysh_cmds = [
-            "configure terminal",
-            "route-map RM-ALLOW permit 10",
-            "exit",
-            f"router bgp {self.config.spine_asn}",
-            f"bgp router-id {router_id}",
-            "no bgp ebgp-requires-policy",
-        ]
+        configdb_interfaces: dict[str, dict[str, Any]] = {}
+        neighbors: list[tuple[str, int]] = []
 
         # Add interfaces and BGP neighbors for each leaf
         for leaf_idx in range(1, self.config.num_leafs + 1):
             interface = self._sonic_port_name(leaf_idx)
-            subnet_idx = spine_idx * 10 + leaf_idx
-            spine_ip = f"192.168.{subnet_idx}.1"
-            leaf_ip = f"192.168.{subnet_idx}.2"
+            spine_ip, leaf_ip = self._spine_leaf_ips(spine_idx, leaf_idx)
             leaf_asn = self.config.leaf_asn_start + leaf_idx - 1
 
-            script.append(f"config interface startup {interface}")
-            script.append(f"config interface ip add {interface} {spine_ip}/30")
-            script.append(f"config sflow interface enable {interface} || true")
-            script.append(f"config sflow interface sample-rate {interface} {self.sflow_sample_rate} || true")
-            vtysh_cmds.append(f"neighbor {leaf_ip} remote-as {leaf_asn}")
+            self._add_configdb_interface(configdb_interfaces, interface, f"{spine_ip}/30")
+            neighbors.append((leaf_ip, leaf_asn))
 
-        # Telemetry services (best-effort)
-        script.extend(self._telemetry_config_lines())
-
-        vtysh_cmds.extend(
-            [
-                "address-family ipv4 unicast",
-            ]
+        return self._write_device_startup_artifacts(
+            device=spine_name,
+            required_ports=self.config.num_leafs,
+            interfaces=configdb_interfaces,
+            local_as=self.config.spine_asn,
+            router_id=router_id,
+            neighbors=neighbors,
+            networks=[],
         )
-        for leaf_idx in range(1, self.config.num_leafs + 1):
-            subnet_idx = spine_idx * 10 + leaf_idx
-            leaf_ip = f"192.168.{subnet_idx}.2"
-            vtysh_cmds.append(f"neighbor {leaf_ip} activate")
-            vtysh_cmds.append(f"neighbor {leaf_ip} route-map RM-ALLOW out")
-        vtysh_cmds.extend(
-            [
-                "exit-address-family",
-                "end",
-                "write memory",
-            ]
-        )
-
-        script.append("supervisorctl start bgpd >/dev/null 2>&1 || true")
-        script.append("")
-        script.append("vtysh <<'VTY'")
-        script.extend(vtysh_cmds)
-        script.append("VTY")
-
-        # Write config
-        config_path = os.path.join(self.output_dir, "configs", f"{spine_name}.sh")
-        with open(config_path, "w") as f:
-            f.write("\n".join(script) + "\n")
-
-        return config_path
 
     def _generate_leaf_config(self, leaf_idx: int) -> str:
         """Generate configuration for a leaf switch."""
         leaf_name = f"leaf{leaf_idx}"
         router_id = f"10.0.0.{10 + leaf_idx}"
         leaf_asn = self.config.leaf_asn_start + leaf_idx - 1
-
-        script = [
-            f"# Leaf {leaf_idx} Configuration",
-            "# Generated by NetOpsBench",
-            "set -e",
-            "",
-        ]
-
-        vtysh_cmds = [
-            "configure terminal",
-            "route-map RM-ALLOW permit 10",
-            "exit",
-            f"router bgp {leaf_asn}",
-            f"bgp router-id {router_id}",
-            "no bgp ebgp-requires-policy",
-        ]
+        configdb_interfaces: dict[str, dict[str, Any]] = {}
+        required_ports = self.config.num_spines + self.config.clients_per_leaf
+        neighbors: list[tuple[str, int]] = []
+        networks: list[str] = []
 
         # Add interfaces to spines
         for spine_idx in range(1, self.config.num_spines + 1):
             interface = self._sonic_port_name(spine_idx)
-            subnet_idx = spine_idx * 10 + leaf_idx
-            spine_ip = f"192.168.{subnet_idx}.1"
-            leaf_ip = f"192.168.{subnet_idx}.2"
+            spine_ip, leaf_ip = self._spine_leaf_ips(spine_idx, leaf_idx)
 
-            script.append(f"config interface startup {interface}")
-            script.append(f"config interface ip add {interface} {leaf_ip}/30")
-            script.append(f"config sflow interface enable {interface} || true")
-            script.append(f"config sflow interface sample-rate {interface} {self.sflow_sample_rate} || true")
-            vtysh_cmds.append(f"neighbor {spine_ip} remote-as {self.config.spine_asn}")
+            self._add_configdb_interface(configdb_interfaces, interface, f"{leaf_ip}/30")
+            neighbors.append((spine_ip, self.config.spine_asn))
 
         # Add client-facing interfaces (one per client)
         # Use point-to-point /30 subnets for each client to avoid subnet overlap
@@ -412,48 +606,18 @@ class TopologyGenerator:
             subnet_base = (client_idx - 1) * 4
             gateway_ip = subnet_base + 1
             interface = self._sonic_port_name(client_interface_idx)
-            script.append(f"config interface startup {interface}")
-            script.append(f"config interface ip add {interface} 192.168.{octet}.{gateway_ip}/30")
-            script.append(f"config sflow interface enable {interface} || true")
-            script.append(f"config sflow interface sample-rate {interface} {self.sflow_sample_rate} || true")
+            self._add_configdb_interface(configdb_interfaces, interface, f"192.168.{octet}.{gateway_ip}/30")
+            networks.append(f"192.168.{octet}.{subnet_base}/30")
 
-        # Telemetry services (best-effort)
-        script.extend(self._telemetry_config_lines())
-
-        vtysh_cmds.extend(
-            [
-                "address-family ipv4 unicast",
-            ]
+        return self._write_device_startup_artifacts(
+            device=leaf_name,
+            required_ports=required_ports,
+            interfaces=configdb_interfaces,
+            local_as=leaf_asn,
+            router_id=router_id,
+            neighbors=neighbors,
+            networks=networks,
         )
-        for spine_idx in range(1, self.config.num_spines + 1):
-            subnet_idx = spine_idx * 10 + leaf_idx
-            spine_ip = f"192.168.{subnet_idx}.1"
-            vtysh_cmds.append(f"neighbor {spine_ip} activate")
-            vtysh_cmds.append(f"neighbor {spine_ip} route-map RM-ALLOW out")
-        octet = self._client_subnet_octet(leaf_idx)
-        for client_idx in range(1, self.config.clients_per_leaf + 1):
-            subnet_base = (client_idx - 1) * 4
-            vtysh_cmds.append(f"network 192.168.{octet}.{subnet_base}/30 route-map RM-ALLOW")
-        vtysh_cmds.extend(
-            [
-                "exit-address-family",
-                "end",
-                "write memory",
-            ]
-        )
-
-        script.append("supervisorctl start bgpd >/dev/null 2>&1 || true")
-        script.append("")
-        script.append("vtysh <<'VTY'")
-        script.extend(vtysh_cmds)
-        script.append("VTY")
-
-        # Write config
-        config_path = os.path.join(self.output_dir, "configs", f"{leaf_name}.sh")
-        with open(config_path, "w") as f:
-            f.write("\n".join(script) + "\n")
-
-        return config_path
 
     def _generate_metadata(self) -> dict:
         """Generate topology metadata JSON."""
@@ -511,7 +675,7 @@ class TopologyGenerator:
                 client_idx = (i - 1) * self.config.clients_per_leaf + j
                 links.append({"endpoints": [f"leaf{i}", f"client{client_idx}"], "type": "leaf-client"})
 
-        return {
+        metadata = {
             "name": self.config.name,
             "management": {
                 "network": self.mgmt_network_name,
@@ -531,6 +695,7 @@ class TopologyGenerator:
                 "note": "Do not compare link_mtu 9232 directly against healthy SONiC port MTU 9100 when diagnosing faults.",
             },
             "scale": {
+                "name": self.config.scale_name,
                 "num_spines": self.config.num_spines,
                 "num_leafs": self.config.num_leafs,
                 "clients_per_leaf": self.config.clients_per_leaf,
@@ -547,6 +712,11 @@ class TopologyGenerator:
                 "bfd": True,
             },
         }
+        if self.config.scale_name:
+            metadata["topology_scale"] = self.config.scale_name
+        if self.config.scale_name == "xlarge":
+            metadata["pingmesh"] = {"max_dests_per_client": 16}
+        return metadata
 
 
 def generate_topology(
@@ -584,6 +754,7 @@ def generate_topology(
         collector_ip=collector_ip or base_config.collector_ip,
         spine_asn=base_config.spine_asn,
         leaf_asn_start=base_config.leaf_asn_start,
+        scale_name=scale,
     )
     generator = TopologyGenerator(config, output_dir)
     return generator.generate()

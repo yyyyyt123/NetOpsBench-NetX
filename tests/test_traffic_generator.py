@@ -39,3 +39,19 @@ def test_large_standard_profile_respects_switch_budget(tmp_path):
     assert config["stats"]["estimated_switch_pps"]["max_leaf_pps"] <= traffic_generator.SWITCH_PPS_LIMIT
     assert config["stats"]["estimated_switch_pps"]["max_spine_pps"] <= traffic_generator.SWITCH_PPS_LIMIT
     assert traffic_generator.validate_traffic_config(config, "large") is True
+
+
+def test_xlarge_standard_profile_respects_switch_budget(tmp_path):
+    topo_config = copy.deepcopy(TOPOLOGY_SCALES["xlarge"])
+    result = TopologyGenerator(config=topo_config, output_dir=str(tmp_path)).generate()
+
+    config = traffic_generator.generate_traffic_config_from_topology(
+        result["metadata"],
+        "xlarge",
+        "standard",
+    )
+
+    assert config["stats"]["total_flows"] > 0
+    assert config["stats"]["estimated_switch_pps"]["max_leaf_pps"] <= traffic_generator.SWITCH_PPS_LIMIT
+    assert config["stats"]["estimated_switch_pps"]["max_spine_pps"] <= traffic_generator.SWITCH_PPS_LIMIT
+    assert traffic_generator.validate_traffic_config(config, "xlarge") is True

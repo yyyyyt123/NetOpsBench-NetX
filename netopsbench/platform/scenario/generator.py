@@ -14,7 +14,10 @@ from typing import Any
 
 import yaml
 
+from netopsbench.platform.topology.configdb_payload import interface_names_for_config
+
 ROOT = Path(__file__).resolve().parents[3]
+SUPPORTED_SCALES = ("xs", "small", "medium", "large", "xlarge")
 
 
 @dataclass
@@ -69,10 +72,12 @@ def load_topology(scale: str, topology_dir: str | None) -> TopologyContext:
 
     config_dir = topo_dir / "configs"
     for device in spines + leafs:
-        cfg = config_dir / f"{device}.sh"
-        if device not in device_interfaces:
-            device_interfaces[device] = parse_network_interfaces(cfg)
-        bgp_info = parse_bgp_config(cfg)
+        cfg = _device_config_path(config_dir, device)
+        frr_cfg = config_dir / "frr" / f"{device}.conf"
+        parsed_interfaces = parse_network_interfaces(cfg)
+        if parsed_interfaces or device not in device_interfaces:
+            device_interfaces[device] = parsed_interfaces
+        bgp_info = parse_bgp_config(frr_cfg)
         if bgp_info.get("local_as") is not None:
             device_asns[device] = int(bgp_info["local_as"])
         bgp_neighbors[device] = list(bgp_info.get("neighbors") or [])
@@ -101,32 +106,16 @@ def load_topology(scale: str, topology_dir: str | None) -> TopologyContext:
     )
 
 
+def _device_config_path(config_dir: Path, device: str) -> Path:
+    return config_dir / "sonic" / device / "config_db.json"
+
+
 def parse_network_interfaces(cfg_path: Path) -> list[str]:
-    if not cfg_path.exists():
-        return ["Ethernet0"]
-
-    interfaces = set()
-    with cfg_path.open("r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            if line.startswith("config interface startup"):
-                parts = line.split()
-                if len(parts) >= 4:
-                    normalized = normalize_sonic_interface(parts[3])
-                    if normalized:
-                        interfaces.add(normalized)
-            elif line.startswith("config interface ip add"):
-                parts = line.split()
-                if len(parts) >= 5:
-                    normalized = normalize_sonic_interface(parts[4])
-                    if normalized:
-                        interfaces.add(normalized)
-
-    return sorted(interfaces) if interfaces else ["Ethernet0"]
+    return interface_names_for_config(cfg_path)
 
 
 def parse_bgp_config(cfg_path: Path) -> dict[str, Any]:
-    """Parse local ASN, neighbors, and advertised networks from one SONiC config script."""
+    """Parse local ASN, neighbors, and advertised networks from one FRR config."""
     info: dict[str, Any] = {"local_as": None, "neighbors": [], "networks": []}
     if not cfg_path.exists():
         return info
@@ -682,7 +671,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--scale",
         required=True,
-        choices=["xs", "small", "medium", "large"],
+        choices=SUPPORTED_SCALES,
         help="Topology scale to generate scenarios for",
     )
     parser.add_argument(

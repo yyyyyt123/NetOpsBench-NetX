@@ -8,6 +8,7 @@ from typing import Any
 
 from netopsbench.platform.worker.common import (
     _SCALE_SUBNET_BASE,
+    _SCALE_SUBNET_PREFIX,
     WorkerRuntimeError,
     _safe_label,
 )
@@ -48,8 +49,22 @@ def _worker_bucket(scale: str, worker_index: int) -> str:
     return f"network_data_{_safe_label(scale)}_w{worker_index:02d}"
 
 
+def _worker_mgmt_subnet_prefix(scale: str) -> int:
+    return _SCALE_SUBNET_PREFIX.get(scale, 24)
+
+
+def _worker_mgmt_subnet_stride(scale: str) -> int:
+    prefix = _worker_mgmt_subnet_prefix(scale)
+    return 1 if prefix >= 24 else 2 ** (24 - prefix)
+
+
 def _worker_mgmt_subnet(scale: str, worker_index: int) -> str:
-    third_octet = _SCALE_SUBNET_BASE.get(scale, 200) + worker_index
-    if third_octet > 254:
+    prefix = _worker_mgmt_subnet_prefix(scale)
+    stride = _worker_mgmt_subnet_stride(scale)
+    if prefix == 24:
+        third_octet = _SCALE_SUBNET_BASE.get(scale, 200) + worker_index
+    else:
+        third_octet = _SCALE_SUBNET_BASE.get(scale, 200) + ((worker_index - 1) * stride)
+    if third_octet + stride - 1 > 254:
         raise WorkerRuntimeError(f"Worker index {worker_index} exceeds available management subnet range")
-    return f"172.31.{third_octet}.0/24"
+    return f"172.31.{third_octet}.0/{prefix}"

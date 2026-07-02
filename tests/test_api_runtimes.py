@@ -20,6 +20,19 @@ def test_runtime_manager_create_workers_1_returns_runtime_pool(tmp_path):
     assert runtime.status() == {"id": runtime.id, "name": runtime.name, "scale": "small", "state": "created"}
 
 
+def test_xlarge_runtime_workers_use_non_overlapping_23_subnets(tmp_path):
+    from netopsbench.sdk.runtimes import RuntimeManager
+
+    runtime = RuntimeManager(workspace=tmp_path).create(scale="xlarge", workers=2, name="runtime-xlarge")
+
+    subnets = [worker.mgmt_subnet for worker in runtime.workers]
+    assert subnets[0].endswith("/23")
+    assert subnets[1].endswith("/23")
+    assert subnets[0] != subnets[1]
+    assert int(subnets[0].split(".")[2]) % 2 == 0
+    assert int(subnets[1].split(".")[2]) == int(subnets[0].split(".")[2]) + 2
+
+
 def test_runtime_manager_attach_list_get_roundtrip(tmp_path):
     from netopsbench.sdk.runtimes import RuntimeManager
 

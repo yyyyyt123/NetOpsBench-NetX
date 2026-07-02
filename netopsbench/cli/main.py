@@ -14,7 +14,7 @@ from netopsbench.platform.scenario import generator as scenario_generator
 from netopsbench.platform.topology.generator import generate_topology
 from netopsbench.sdk import NetOpsBench
 
-SUPPORTED_SCALES = ("xs", "small", "medium", "large")
+SUPPORTED_SCALES = ("xs", "small", "medium", "large", "xlarge")
 
 
 def build_parser() -> argparse.ArgumentParser:

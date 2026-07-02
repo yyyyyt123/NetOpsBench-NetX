@@ -50,7 +50,7 @@ def test_update_telegraf_config_uses_central_defaults_without_shadowing(tmp_path
     template_dir = repo_root / "observability"
     template_dir.mkdir(parents=True)
     (template_dir / "telegraf.conf.template").write_text(
-        "{{GNMI_ADDRESSES}}\n{{INFLUXDB_URL}}\n{{INFLUXDB_TOKEN}}\n{{INFLUXDB_ORG}}\n{{INFLUXDB_BUCKET}}\n{{TOPOLOGY_ID}}\n",
+        "{{GNMI_INPUTS}}\n{{INFLUXDB_URL}}\n{{INFLUXDB_TOKEN}}\n{{INFLUXDB_ORG}}\n{{INFLUXDB_BUCKET}}\n{{TOPOLOGY_ID}}\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(telegraf_mod, "REPO_ROOT", repo_root)
@@ -66,6 +66,39 @@ def test_update_telegraf_config_uses_central_defaults_without_shadowing(tmp_path
     assert "replace-me" in rendered
     assert "netopsbench" in rendered
     assert "demo-runtime" in rendered
+
+
+def test_update_telegraf_config_scopes_gnmi_subscriptions_by_device_role(tmp_path, monkeypatch):
+    import copy
+
+    from netopsbench.platform.topology.generator import TOPOLOGY_SCALES, TopologyGenerator
+    import netopsbench.platform.observability.telegraf as telegraf_mod
+
+    topology_dir = tmp_path / "topology"
+    topo_config = copy.deepcopy(TOPOLOGY_SCALES["xlarge"])
+    result = TopologyGenerator(config=topo_config, output_dir=str(topology_dir)).generate()
+    topology_file = topology_dir / "topology.json"
+    output_path = tmp_path / "telegraf.conf"
+
+    rc = telegraf_mod.update_telegraf_config(str(topology_file), output_file=str(output_path))
+
+    assert rc == 0
+    rendered = output_path.read_text(encoding="utf-8")
+    assert rendered.count("[[inputs.gnmi]]") == 2
+    assert "# gNMI role: spine" in rendered
+    assert "# gNMI role: leaf" in rendered
+
+    spine_block = rendered.split("# gNMI role: spine", 1)[1].split("# gNMI role: leaf", 1)[0]
+    leaf_block = rendered.split("# gNMI role: leaf", 1)[1].split("# 5. sFlow", 1)[0]
+
+    assert '"172.20.20.11:50051"' in spine_block
+    assert '"172.20.20.27:50051"' not in spine_block
+    assert 'path = "COUNTERS/Ethernet508"' in spine_block
+
+    assert '"172.20.20.27:50051"' in leaf_block
+    assert '"172.20.20.11:50051"' not in leaf_block
+    assert 'path = "COUNTERS/Ethernet64"' in leaf_block
+    assert 'path = "COUNTERS/Ethernet68"' not in leaf_block
 
 
 def test_grafana_configs_use_runtime_scoping_variables():
@@ -106,15 +139,96 @@ def test_network_overview_removes_cpu_memory_panels_and_enables_bgp_tail_input()
     dashboard_text = Path("observability/grafana/dashboards/network_overview.json").read_text(encoding="utf-8")
     telegraf_text = Path("observability/telegraf.conf.template").read_text(encoding="utf-8")
     start_worker_text = Path("scripts/observability/start_worker_telegraf.sh").read_text(encoding="utf-8")
+    deploy_text = Path("scripts/runtime/deploy.sh").read_text(encoding="utf-8")
+    deploy_worker_text = Path("scripts/runtime/deploy_worker.sh").read_text(encoding="utf-8")
 
     assert "CPU Usage (optional)" not in dashboard_text
     assert "Memory Utilization (optional)" not in dashboard_text
     assert "/var/lib/netopsbench/bgp_neighbors.lp" in telegraf_text
     assert "from_beginning = true" in telegraf_text
     assert 'watch_method = "poll"' in telegraf_text
+    assert 'metric_batch_size = 5000' in telegraf_text
+    assert 'metric_buffer_limit = 200000' in telegraf_text
+    assert 'debug = false' in telegraf_text
+    assert "[[processors.printer]]" not in telegraf_text
+    assert 'os.getenv("GNMI_SUBSCRIPTION_MODE", "sample")' in Path(
+        "netopsbench/platform/observability/telegraf.py"
+    ).read_text(encoding="utf-8")
     assert 'chmod 755 "$CONFIG_DIR"' in start_worker_text
     assert 'chmod 644 "$CONFIG_PATH" "$BGP_FILE_PATH"' in start_worker_text
+    assert "start_worker_telegraf.sh" in deploy_text
+    assert "TOPOLOGY_ID=${NETOPSBENCH_TOPOLOGY_ID:-$(basename \"$ACTUAL_TOPO_DIR\")}" in deploy_text
+    assert "scripts/runtime/run_bgp_collector.py" in deploy_text
+    assert "BGP_COLLECTOR_DETACH=(nohup setsid)" in deploy_text
+    assert '"${BGP_COLLECTOR_DETACH[@]}" $PYTHON scripts/runtime/run_bgp_collector.py' in deploy_text
+    assert '--parallelism "${NETOPSBENCH_BGP_COLLECTOR_PARALLELISM:-16}"' in deploy_text
+    assert "NETOPSBENCH_TOPOLOGY_ID=\"$TOPOLOGY_ID\"" in deploy_worker_text
+    assert "BGP_COLLECTOR_DETACH=(nohup setsid)" in deploy_worker_text
+    assert '"${BGP_COLLECTOR_DETACH[@]}" $PYTHON scripts/runtime/run_bgp_collector.py' in deploy_worker_text
+    assert '--parallelism "${NETOPSBENCH_BGP_COLLECTOR_PARALLELISM:-16}"' in deploy_worker_text
+    assert "docker restart telegraf" not in deploy_text
     assert dashboard_text.count('group(columns: [\\"source\\", \\"neighbor_address\\"])\\n  |> last()') >= 3
+
+
+def test_deploy_scripts_stop_stale_bgp_collector_before_starting_new_one():
+    deploy_text = Path("scripts/runtime/deploy.sh").read_text(encoding="utf-8")
+    deploy_worker_text = Path("scripts/runtime/deploy_worker.sh").read_text(encoding="utf-8")
+
+    for text in (deploy_text, deploy_worker_text):
+        assert 'BGP_PID=$(cat "$BGP_COLLECTOR_PID_FILE" 2>/dev/null || true)' in text
+        assert 'kill "$BGP_PID" >/dev/null 2>&1 || true' in text
+        assert 'rm -f "$BGP_COLLECTOR_PID_FILE"' in text
+        assert text.index('BGP_PID=$(cat "$BGP_COLLECTOR_PID_FILE" 2>/dev/null || true)') < text.index(
+            "start_worker_telegraf.sh"
+        )
+
+
+def test_deploy_uses_worker_telegraf_generation_only():
+    deploy_text = Path("scripts/runtime/deploy.sh").read_text(encoding="utf-8")
+
+    assert 'start_worker_telegraf.sh "$ACTUAL_TOPO_DIR" "telegraf-${LAB_NAME}"' in deploy_text
+    assert "$PYTHON -m netopsbench.platform.observability.telegraf \"$METADATA_FILE\"" not in deploy_text
+    assert "[4/7] Generating Telegraf configuration" not in deploy_text
+
+
+def test_bgp_collector_size_default_is_owned_by_collector():
+    deploy_text = Path("scripts/runtime/deploy.sh").read_text(encoding="utf-8")
+    deploy_worker_text = Path("scripts/runtime/deploy_worker.sh").read_text(encoding="utf-8")
+    collector_text = Path("scripts/runtime/run_bgp_collector.py").read_text(encoding="utf-8")
+
+    assert "NETOPSBENCH_BGP_COLLECTOR_MAX_BYTES" not in deploy_text
+    assert "NETOPSBENCH_BGP_COLLECTOR_MAX_BYTES" not in deploy_worker_text
+    assert "NETOPSBENCH_BGP_COLLECTOR_MAX_BYTES" in collector_text
+
+
+def test_runtime_scripts_use_bind_mounted_pingmesh_deploy_path():
+    deploy_text = Path("scripts/runtime/deploy.sh").read_text(encoding="utf-8")
+    deploy_worker_text = Path("scripts/runtime/deploy_worker.sh").read_text(encoding="utf-8")
+
+    assert "$PYTHON -m netopsbench.platform.pingmesh.deploy" in deploy_text
+    assert "$PYTHON -m netopsbench.platform.pingmesh.deploy" in deploy_worker_text
+    assert "$ACTUAL_TOPO_DIR/configs/pingmesh/pinglist.json" in deploy_text
+    assert "$TOPOLOGY_DIR/configs/pingmesh/pinglist.json" in deploy_worker_text
+    assert "$ACTUAL_TOPO_DIR/pinglist.json" not in deploy_text
+    assert "$TOPOLOGY_DIR/pinglist.json" not in deploy_worker_text
+
+
+def test_runtime_scripts_default_sonic_apply_parallelism_to_32():
+    deploy_text = Path("scripts/runtime/deploy.sh").read_text(encoding="utf-8")
+    deploy_worker_text = Path("scripts/runtime/deploy_worker.sh").read_text(encoding="utf-8")
+
+    assert "APPLY_CONFIG_PARALLEL=${NETOPSBENCH_APPLY_CONFIG_PARALLEL:-32}" in deploy_text
+    assert "APPLY_CONFIG_PARALLEL=${NETOPSBENCH_APPLY_CONFIG_PARALLEL:-32}" in deploy_worker_text
+    assert "NETOPSBENCH_APPLY_CONFIG_PARALLEL:-4" not in deploy_text
+    assert "NETOPSBENCH_APPLY_CONFIG_PARALLEL:-4" not in deploy_worker_text
+
+
+def test_env_example_documents_runtime_parallelism_and_bgp_retention():
+    env_example = Path(".env.example").read_text(encoding="utf-8")
+
+    assert "NETOPSBENCH_TRAFFIC_PARALLELISM=32" in env_example
+    assert "NETOPSBENCH_BGP_COLLECTOR_PARALLELISM=16" in env_example
+    assert "NETOPSBENCH_BGP_COLLECTOR_MAX_BYTES=134217728" in env_example
 
 
 def test_pingmesh_agent_can_run_without_repo_package_install(tmp_path):

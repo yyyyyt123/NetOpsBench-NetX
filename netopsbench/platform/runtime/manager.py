@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import builtins
+import ipaddress
 import json
 import re
 import shutil
@@ -13,23 +14,46 @@ from netopsbench.config import repo_root
 from netopsbench.logging_utils import get_logger
 from netopsbench.platform.utils.proc import safe_run, sudo_prefix
 from netopsbench.platform.worker.lifecycle import deploy_workers, teardown_workers
-from netopsbench.platform.worker.pool import WorkerSpec, _worker_bucket, _worker_mgmt_subnet
+from netopsbench.platform.worker.pool import (
+    WorkerSpec,
+    _worker_bucket,
+    _worker_mgmt_subnet,
+    _worker_mgmt_subnet_prefix,
+    _worker_mgmt_subnet_stride,
+)
 
 logger = get_logger(__name__)
 
 
-def _runtime_subnet_base(scale: str, runtime_name: str) -> int:
+def _subnet_third_octet(subnet: str) -> int:
+    return int(subnet.split(".")[2])
+
+
+def _runtime_subnet_base(scale: str, runtime_name: str, worker_count: int = 1) -> int:
     base = _worker_mgmt_subnet(scale, 1).split(".")[2]
     try:
-        base_value = int(base) - 1
+        base_value = int(base)
     except ValueError:
         base_value = 100
+    prefix = _worker_mgmt_subnet_prefix(scale)
+    stride = _worker_mgmt_subnet_stride(scale)
+    if prefix == 24:
+        base_value -= 1
+        range_blocks = 80
+    else:
+        range_blocks = max(1, 20 // stride)
     match = re.search(r"(\d+)(?!.*\d)", runtime_name or "")
     if match:
-        offset = int(match.group(1)) % 80
+        offset_seed = int(match.group(1))
     else:
-        offset = sum(ord(ch) for ch in (runtime_name or scale)) % 80
-    return min(254, base_value + offset)
+        offset_seed = sum(ord(ch) for ch in (runtime_name or scale))
+    usable_blocks = max(1, range_blocks - max(1, worker_count) + 1)
+    offset = offset_seed % usable_blocks
+    return min(254, base_value + (offset * stride))
+
+
+def _format_mgmt_subnet(scale: str, third_octet: int) -> str:
+    return f"172.31.{third_octet}.0/{_worker_mgmt_subnet_prefix(scale)}"
 
 
 @dataclass
@@ -124,7 +148,8 @@ class RuntimeManager:
         worker_count = max(1, int(workers))
         runtime_name = str(name or f"{scale}-{worker_count}").strip()
         runtime_root = Path(root_dir) if root_dir is not None else (self.runtime_root_dir / runtime_name)
-        subnet_base = _runtime_subnet_base(scale, runtime_name)
+        subnet_base = _runtime_subnet_base(scale, runtime_name, worker_count)
+        subnet_stride = _worker_mgmt_subnet_stride(scale)
         runtime_root.mkdir(parents=True, exist_ok=True)
         logs_dir = runtime_root / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
@@ -141,7 +166,10 @@ class RuntimeManager:
                     index=idx,
                     lab_name=(runtime_name if worker_count == 1 else f"{runtime_name}-w{idx:02d}"),
                     topology_dir=str(worker_dir),
-                    mgmt_subnet=f"172.31.{min(254, subnet_base + idx)}.0/24",
+                    mgmt_subnet=_format_mgmt_subnet(
+                        scale,
+                        min(254, subnet_base + ((idx - 1) * subnet_stride if subnet_stride > 1 else idx)),
+                    ),
                     bucket=_worker_bucket(scale, idx),
                     shard_dir=str(worker_dir / "scenarios"),
                     report_path=str(logs_dir / f"worker_{idx:02d}.report.json"),
@@ -192,11 +220,20 @@ class RuntimeManager:
 
     def _allocate_management_subnets(self, scale: str, worker_count: int) -> builtins.list[str]:
         used = self._used_management_subnets()
-        start = int(_worker_mgmt_subnet(scale, 1).split(".")[2])
+        used_networks = []
+        for subnet in used:
+            try:
+                used_networks.append(ipaddress.ip_network(subnet, strict=False))
+            except ValueError:
+                logger.debug("ignoring unparsable docker subnet: %s", subnet)
+        start = _subnet_third_octet(_worker_mgmt_subnet(scale, 1))
+        stride = _worker_mgmt_subnet_stride(scale)
         selected: list[str] = []
-        for octet in range(start, 255):
-            subnet = f"172.31.{octet}.0/24"
-            if subnet in used or subnet in selected:
+        for octet in range(start, 255, stride):
+            subnet = _format_mgmt_subnet(scale, octet)
+            candidate_network = ipaddress.ip_network(subnet, strict=False)
+            selected_networks = [ipaddress.ip_network(item, strict=False) for item in selected]
+            if any(candidate_network.overlaps(network) for network in used_networks + selected_networks):
                 continue
             selected.append(subnet)
             if len(selected) == worker_count:

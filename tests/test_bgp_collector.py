@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from scripts.runtime.run_bgp_collector import build_bgp_lines, collect_bgp_lines, normalize_bgp_state
+from scripts.runtime.run_bgp_collector import build_bgp_lines, collect_bgp_lines, normalize_bgp_state, run_once, _write_lines
 
 
 def test_build_bgp_lines_normalizes_states_and_fields():
@@ -69,3 +69,56 @@ Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down Sta
     assert calls[1][:3] == ["docker", "exec", "clab-demo-leaf1"]
     assert all('session_state="ESTABLISHED"' in line for line in lines)
     assert all(",topology_id=runtime-xs " in line for line in lines)
+
+
+def test_collect_bgp_lines_supports_parallelism(monkeypatch, tmp_path):
+    metadata_file = tmp_path / "topology.json"
+    metadata_file.write_text(
+        '{"name":"demo","devices":{"spines":[{"name":"spine1"},{"name":"spine2"}],"leafs":[{"name":"leaf1"}]}}',
+        encoding="utf-8",
+    )
+
+    calls = []
+
+    class _Result:
+        returncode = 0
+        stdout = """
+Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
+192.168.11.2    4      65011       310       309       20    0    0 04:54:34            2       16 N/A
+"""
+
+    def fake_run(args, capture_output, text, check, timeout):
+        calls.append(args[2])
+        return _Result()
+
+    monkeypatch.setattr("scripts.runtime.run_bgp_collector.subprocess.run", fake_run)
+    monkeypatch.setattr("scripts.runtime.run_bgp_collector._docker_prefix", lambda: [])
+
+    lines = collect_bgp_lines(Path(metadata_file), timestamp_ns=9, parallelism=2)
+
+    assert len(lines) == 3
+    assert sorted(calls) == ["clab-demo-leaf1", "clab-demo-spine1", "clab-demo-spine2"]
+    assert all(line.endswith(" 9") for line in lines)
+
+
+def test_run_once_writes_snapshot_and_exits(monkeypatch, tmp_path):
+    metadata_file = tmp_path / "topology.json"
+    metadata_file.write_text('{"name":"demo","devices":{"spines":[],"leafs":[]}}', encoding="utf-8")
+    output_file = tmp_path / "bgp.lp"
+
+    monkeypatch.setattr(
+        "scripts.runtime.run_bgp_collector.collect_bgp_lines",
+        lambda metadata, parallelism=1: ["bgp_neighbors,source=spine1 value=1i 7"],
+    )
+
+    assert run_once(metadata_file, output_file, parallelism=4) == 0
+    assert output_file.read_text(encoding="utf-8") == "bgp_neighbors,source=spine1 value=1i 7\n"
+
+
+def test_write_lines_truncates_existing_bgp_file_when_size_limit_would_be_exceeded(tmp_path):
+    output_file = tmp_path / "bgp.lp"
+    output_file.write_text("old_snapshot value=1i 1\n" * 4, encoding="utf-8")
+
+    _write_lines(output_file, ["new_snapshot value=2i 2"], max_bytes=32)
+
+    assert output_file.read_text(encoding="utf-8") == "new_snapshot value=2i 2\n"

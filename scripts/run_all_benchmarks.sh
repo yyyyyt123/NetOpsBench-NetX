@@ -34,11 +34,14 @@ declare -A SCALE_WORKERS=(
     [small]="${BENCH_WORKERS_SMALL:-3}"
     [medium]="${BENCH_WORKERS_MEDIUM:-2}"
     [large]="${BENCH_WORKERS_LARGE:-2}"
+    [xlarge]="${BENCH_WORKERS_XLARGE:-1}"
 )
 # Limit worker deployment fan-out to avoid simultaneous SONiC-VS boot pressure.
-declare -A SCALE_DEPLOY_JOBS=( [xs]=2 [small]=2 [medium]=2 [large]=1 )
-# Health check BGP retries: large needs more time (16 leafs vs 4 for medium)
-declare -A SCALE_HEALTH_RETRIES=( [xs]=12 [small]=12 [medium]=12 [large]=36 )
+declare -A SCALE_DEPLOY_JOBS=( [xs]=2 [small]=2 [medium]=2 [large]=1 [xlarge]=1 )
+# Health check BGP retries: larger fabrics need more convergence time.
+declare -A SCALE_HEALTH_RETRIES=( [xs]=12 [small]=12 [medium]=12 [large]=36 [xlarge]=48 )
+# Worker deploy timeout in seconds; xlarge has 272 containers per worker.
+declare -A SCALE_DEPLOY_TIMEOUTS=( [xs]=1800 [small]=1800 [medium]=1800 [large]=2700 [xlarge]=3600 )
 # Ordered list of scales to run (override with BENCH_SCALES="xs small")
 IFS=' ' read -ra SCALES <<< "${BENCH_SCALES:-xs small medium large}"
 
@@ -123,6 +126,7 @@ for scale in "${SCALES[@]}"; do
 
     if NETOPSBENCH_WORKER_DEPLOY_JOBS="${SCALE_DEPLOY_JOBS[$scale]:-${workers}}" \
        NETOPSBENCH_WORKER_HEALTH_RETRIES="${SCALE_HEALTH_RETRIES[$scale]:-12}" \
+       NETOPSBENCH_WORKER_DEPLOY_TIMEOUT="${SCALE_DEPLOY_TIMEOUTS[$scale]:-1800}" \
        PYTHONPATH="$REPO_ROOT" "$PYTHON" examples/03_run_scale_benchmark.py \
             --vendor "$VENDOR" --scale "$scale" --workers "$workers" \
             > "$log_file" 2>&1; then
@@ -236,7 +240,7 @@ for rj in report_paths:
         if not sid:
             raw_ids = (data.get("raw") or {}).get("scenario_ids") or []
             sid = raw_ids[0] if raw_ids else ""
-        for sc in ("xs", "small", "medium", "large"):
+        for sc in ("xs", "small", "medium", "large", "xlarge"):
             if f"_{sc}_" in sid:
                 scale = sc
                 break
@@ -272,7 +276,7 @@ if not reports:
     sys.exit(0)
 
 # Sort by vendor, scale
-scale_order = {"xs": 0, "small": 1, "medium": 2, "large": 3}
+scale_order = {"xs": 0, "small": 1, "medium": 2, "large": 3, "xlarge": 4}
 reports.sort(key=lambda r: (r["vendor"], scale_order.get(r["scale"], 99), r["started_at"]))
 
 # Write CSV

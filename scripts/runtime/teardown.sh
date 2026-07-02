@@ -67,6 +67,14 @@ if [ -n "$TOPOLOGY_FILE" ] && [ -f "$TOPOLOGY_FILE" ]; then
         MGMT_NETWORK="$($PYTHON -c 'import json, sys; topo = json.load(open(sys.argv[1])); print((topo.get("management", {}) or {}).get("network", ""))' "$METADATA_FILE")"
     fi
     TELEGRAF_CONTAINER="telegraf-${LAB_NAME}"
+    BGP_COLLECTOR_PID_FILE="$TOPO_DIR/bgp_collector.pid"
+    if [ -f "$BGP_COLLECTOR_PID_FILE" ]; then
+        BGP_PID=$(cat "$BGP_COLLECTOR_PID_FILE" 2>/dev/null || true)
+        if [ -n "$BGP_PID" ] && kill -0 "$BGP_PID" >/dev/null 2>&1; then
+            kill "$BGP_PID" >/dev/null 2>&1 || true
+        fi
+        rm -f "$BGP_COLLECTOR_PID_FILE"
+    fi
     "${SUDO[@]}" docker rm -f "$TELEGRAF_CONTAINER" >/dev/null 2>&1 || true
     if [ -n "$MGMT_NETWORK" ]; then
         "${SUDO[@]}" docker network disconnect "$MGMT_NETWORK" influxdb >/dev/null 2>&1 || true

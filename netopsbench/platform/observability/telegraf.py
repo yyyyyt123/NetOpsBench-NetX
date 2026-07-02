@@ -13,10 +13,93 @@ from pathlib import Path
 
 from netopsbench.config import config, repo_root
 from netopsbench.logging_utils import get_logger
+from netopsbench.platform.topology.configdb_payload import interface_names_from_configdb
 
 logger = get_logger(__name__)
 
 REPO_ROOT = repo_root()
+
+
+def _port_key(name: str) -> int:
+    return int(name.replace("Ethernet", "")) if name.startswith("Ethernet") else 0
+
+
+def _port_names_for_count(count: int) -> list[str]:
+    return [f"Ethernet{idx * 4}" for idx in range(max(0, int(count)))]
+
+
+def _device_config_interfaces(topology_dir: Path, device_name: str) -> list[str]:
+    config_path = topology_dir / "configs" / "sonic" / device_name / "config_db.json"
+    return interface_names_from_configdb(config_path)
+
+
+def _role_port_names(topology_dir: Path, devices: list[dict], fallback_count: int) -> list[str]:
+    port_names: set[str] = set()
+    for device in devices:
+        port_names.update(_device_config_interfaces(topology_dir, str(device.get("name", ""))))
+    if not port_names:
+        port_names.update(_port_names_for_count(fallback_count))
+    return sorted(port_names, key=_port_key)
+
+
+def _gnmi_addresses(devices: list[dict]) -> list[str]:
+    addresses: list[str] = []
+    for device in devices:
+        mgmt_ip = str(device["mgmt_ip"]).split("/")[0]
+        addresses.append(f'"{mgmt_ip}:{device["gnmi_port"]}"')
+    return addresses
+
+
+def _render_gnmi_subscriptions(
+    port_names: list[str],
+    gnmi_subscription_mode: str,
+    gnmi_sample_interval: str,
+) -> str:
+    subscriptions = []
+    for port in port_names:
+        subscription_lines = [
+            "  [[inputs.gnmi.subscription]]",
+            '    name = "interfaces"',
+            f'    path = "COUNTERS/{port}"',
+            f'    subscription_mode = "{gnmi_subscription_mode}"',
+        ]
+        if gnmi_subscription_mode == "sample":
+            subscription_lines.append(f'    sample_interval = "{gnmi_sample_interval}"')
+        subscriptions.append("\n".join(subscription_lines) + "\n")
+    return "\n".join(subscriptions)
+
+
+def _render_gnmi_input(
+    role: str,
+    devices: list[dict],
+    port_names: list[str],
+    *,
+    gnmi_username: str,
+    gnmi_password: str,
+    gnmi_encoding: str,
+    gnmi_target: str,
+    gnmi_subscription_mode: str,
+    gnmi_sample_interval: str,
+) -> str:
+    if not devices or not port_names:
+        return ""
+    addresses = ",\n       ".join(_gnmi_addresses(devices))
+    subscriptions = _render_gnmi_subscriptions(port_names, gnmi_subscription_mode, gnmi_sample_interval)
+    return f'''# gNMI role: {role}
+[[inputs.gnmi]]
+  addresses = [
+       {addresses}
+  ]
+  username = "{gnmi_username}"
+  password = "{gnmi_password}"
+  encoding = "{gnmi_encoding}"
+  redial = "10s"
+  path_guessing_strategy = "subscription"
+  tls_enable = false
+  insecure_skip_verify = true
+  target = "{gnmi_target}"
+
+{subscriptions}'''
 
 
 def update_telegraf_config(
@@ -41,7 +124,7 @@ def update_telegraf_config(
         topology_id: Optional topology identifier tag override
 
     Generates telegraf.conf with:
-    - {{GNMI_ADDRESSES}}: List of device management IPs for gNMI polling
+    - {{GNMI_INPUTS}}: Role-scoped SONiC gNMI inputs and subscriptions
     - {{IP_MAPPINGS}}: Processor rules to map IPs to hostnames
     """
     # Read topology metadata
@@ -64,7 +147,7 @@ def update_telegraf_config(
     gnmi_subscription_mode = (
         os.getenv(
             "SONIC_GNMI_SUBSCRIPTION_MODE",
-            os.getenv("GNMI_SUBSCRIPTION_MODE", "on_change"),
+            os.getenv("GNMI_SUBSCRIPTION_MODE", "sample"),
         )
         .strip()
         .lower()
@@ -96,11 +179,9 @@ def update_telegraf_config(
         sflow_service_address = f"udp://{sflow_service_address}"
 
     # Extract device information
-    devices = []
-
-    # Add spines
+    spine_devices = []
     for spine in topo["devices"]["spines"]:
-        devices.append(
+        spine_devices.append(
             {
                 "name": spine["name"],
                 "mgmt_ip": spine["mgmt_ip"].split("/")[0],  # Remove CIDR notation
@@ -108,56 +189,62 @@ def update_telegraf_config(
             }
         )
 
-    # Add leafs
+    leaf_devices = []
     for leaf in topo["devices"]["leafs"]:
-        devices.append(
+        leaf_devices.append(
             {
                 "name": leaf["name"],
                 "mgmt_ip": leaf["mgmt_ip"].split("/")[0],  # Remove CIDR notation
                 "gnmi_port": gnmi_port,
             }
         )
+    devices = spine_devices + leaf_devices
 
     logger.info("Found %d network devices:", len(devices))
     for d in devices:
         logger.info("  - %s: %s", d["name"], d["mgmt_ip"])
 
-    # Derive SONiC front-panel ports used by this topology (Ethernet0/4/8...)
+    # Derive SONiC front-panel ports used by each device role (Ethernet0/4/8...).
     scale = topo.get("scale", {})
     num_spines = int(scale.get("num_spines", 0))
     num_leafs = int(scale.get("num_leafs", 0))
     clients_per_leaf = int(scale.get("clients_per_leaf", 0))
+    topology_dir = topology_path.parent
+    spine_port_names = _role_port_names(topology_dir, spine_devices, fallback_count=num_leafs)
+    leaf_port_names = _role_port_names(
+        topology_dir,
+        leaf_devices,
+        fallback_count=num_spines + clients_per_leaf,
+    )
 
-    port_set = set()
-    for leaf_idx in range(1, num_leafs + 1):
-        port_set.add(f"Ethernet{(leaf_idx - 1) * 4}")
-    for spine_idx in range(1, num_spines + 1):
-        port_set.add(f"Ethernet{(spine_idx - 1) * 4}")
-    for client_idx in range(1, clients_per_leaf + 1):
-        port_set.add(f"Ethernet{(num_spines + client_idx - 1) * 4}")
-
-    def _port_key(name: str) -> int:
-        return int(name.replace("Ethernet", "")) if name.startswith("Ethernet") else 0
-
-    port_names = sorted(port_set, key=_port_key)
-
-    # Generate gNMI address list
-    gnmi_addresses = [f'"{d["mgmt_ip"]}:{d["gnmi_port"]}"' for d in devices]
-    gnmi_addresses_str = ",\n       ".join(gnmi_addresses)
-
-    # Generate gNMI subscriptions (explicit per-port paths)
-    gnmi_subscriptions = []
-    for port in port_names:
-        subscription_lines = [
-            "  [[inputs.gnmi.subscription]]",
-            '    name = "interfaces"',
-            f'    path = "COUNTERS/{port}"',
-            f'    subscription_mode = "{gnmi_subscription_mode}"',
+    gnmi_inputs_str = "\n".join(
+        block
+        for block in [
+            _render_gnmi_input(
+                "spine",
+                spine_devices,
+                spine_port_names,
+                gnmi_username=gnmi_username,
+                gnmi_password=gnmi_password,
+                gnmi_encoding=gnmi_encoding,
+                gnmi_target=gnmi_target,
+                gnmi_subscription_mode=gnmi_subscription_mode,
+                gnmi_sample_interval=gnmi_sample_interval,
+            ),
+            _render_gnmi_input(
+                "leaf",
+                leaf_devices,
+                leaf_port_names,
+                gnmi_username=gnmi_username,
+                gnmi_password=gnmi_password,
+                gnmi_encoding=gnmi_encoding,
+                gnmi_target=gnmi_target,
+                gnmi_subscription_mode=gnmi_subscription_mode,
+                gnmi_sample_interval=gnmi_sample_interval,
+            ),
         ]
-        if gnmi_subscription_mode == "sample":
-            subscription_lines.append(f'    sample_interval = "{gnmi_sample_interval}"')
-        gnmi_subscriptions.append("\n".join(subscription_lines) + "\n")
-    gnmi_subscriptions_str = "\n".join(gnmi_subscriptions)
+        if block
+    )
 
     # Generate IP to hostname mappings (processor rules)
     ip_mappings = []
@@ -183,12 +270,7 @@ def update_telegraf_config(
         template = f.read()
 
     # Replace placeholders
-    rendered_config = template.replace("{{GNMI_ADDRESSES}}", gnmi_addresses_str)
-    rendered_config = rendered_config.replace("{{GNMI_USERNAME}}", gnmi_username)
-    rendered_config = rendered_config.replace("{{GNMI_PASSWORD}}", gnmi_password)
-    rendered_config = rendered_config.replace("{{GNMI_ENCODING}}", gnmi_encoding)
-    rendered_config = rendered_config.replace("{{GNMI_TARGET}}", gnmi_target)
-    rendered_config = rendered_config.replace("{{GNMI_SUBSCRIPTIONS}}", gnmi_subscriptions_str)
+    rendered_config = template.replace("{{GNMI_INPUTS}}", gnmi_inputs_str)
     rendered_config = rendered_config.replace("{{SFLOW_SERVICE_ADDRESS}}", sflow_service_address)
     rendered_config = rendered_config.replace("{{IP_MAPPINGS}}", ip_mappings_str)
     rendered_config = rendered_config.replace("{{INFLUXDB_URL}}", resolved_influxdb_url)
@@ -213,7 +295,9 @@ def update_telegraf_config(
 
     logger.info("Telegraf configuration updated: %s", output_path)
     logger.info("  - %d devices configured", len(devices))
-    logger.info("  - gNMI targets: %d", len(gnmi_addresses))
+    logger.info("  - gNMI targets: %d", len(devices))
+    logger.info("  - gNMI spine subscriptions: %d", len(spine_port_names))
+    logger.info("  - gNMI leaf subscriptions: %d", len(leaf_port_names))
     logger.info("  - gNMI subscription mode: %s", gnmi_subscription_mode)
     logger.info("  - IP mappings: %d", len(ip_mappings))
     logger.info("  - InfluxDB bucket: %s", resolved_influxdb_bucket)

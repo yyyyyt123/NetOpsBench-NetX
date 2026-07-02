@@ -5,13 +5,13 @@
 [agent]
   interval = "10s"
   round_interval = true
-  metric_batch_size = 1000
-  metric_buffer_limit = 10000
+  metric_batch_size = 5000
+  metric_buffer_limit = 200000
   collection_jitter = "0s"
-  flush_interval = "10s"
-  flush_jitter = "0s"
+  flush_interval = "5s"
+  flush_jitter = "1s"
   precision = ""
-  debug = true
+  debug = false
 
 # --- OUTPUTS ---
 [[outputs.influxdb_v2]]
@@ -54,9 +54,6 @@ def apply(metric):
   namepass = ["syslog"]
 
   # Drop logs tagged as drop_me
-[[processors.printer]]
-  # This processor prints to stdout, useful for debugging if needed, but we mainly want to filter.
-
 [[processors.regex]]
   namepass = ["syslog"]
 
@@ -119,20 +116,7 @@ def apply(metric):
     result_key = "bgp_peer"
 
 # 4. gNMI - Interface Counters - DYNAMIC
-[[inputs.gnmi]]
-  addresses = [
-       {{GNMI_ADDRESSES}}
-  ]
-  username = "{{GNMI_USERNAME}}"
-  password = "{{GNMI_PASSWORD}}"
-  encoding = "{{GNMI_ENCODING}}"
-  redial = "10s"
-  path_guessing_strategy = "subscription"
-  tls_enable = false
-  insecure_skip_verify = true
-  target = "{{GNMI_TARGET}}"
-
-{{GNMI_SUBSCRIPTIONS}}
+{{GNMI_INPUTS}}
 
 [[processors.regex]]
   namepass = ["interfaces"]

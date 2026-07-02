@@ -49,7 +49,8 @@ TOPOLOGY_SPECS = {
     "xs": TopologySpec(scale="xs", num_clients=4, num_leafs=2, num_spines=2, max_pps_per_client=250),
     "small": TopologySpec(scale="small", num_clients=8, num_leafs=4, num_spines=2, max_pps_per_client=250),
     "medium": TopologySpec(scale="medium", num_clients=16, num_leafs=8, num_spines=4, max_pps_per_client=200),
-    "large": TopologySpec(scale="large", num_clients=32, num_leafs=16, num_spines=8, max_pps_per_client=150),
+    "large": TopologySpec(scale="large", num_clients=64, num_leafs=16, num_spines=4, max_pps_per_client=150),
+    "xlarge": TopologySpec(scale="xlarge", num_clients=128, num_leafs=128, num_spines=16, max_pps_per_client=100),
 }
 
 

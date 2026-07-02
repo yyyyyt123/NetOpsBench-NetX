@@ -1,0 +1,198 @@
+import subprocess
+
+from netopsbench.platform.runtime import apply_configs
+
+
+def _completed(args, returncode=0, stdout="", stderr=""):
+    return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_wait_for_sonic_requires_configdb_after_vtysh(monkeypatch):
+    calls = []
+
+    def fake_safe_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "supervisorctl" in cmd and "status" in cmd and "start.sh" in cmd:
+            return _completed(cmd, stdout="start.sh EXITED Jun 16 06:32 AM\n")
+        if "supervisorctl" in cmd and "status" in cmd:
+            return _completed(
+                cmd,
+                stdout=(
+                    "redis-server RUNNING pid 10\n"
+                    "orchagent RUNNING pid 11\n"
+                    "zebra RUNNING pid 12\n"
+                ),
+            )
+        if "sonic-cfggen" in cmd:
+            return _completed(cmd, returncode=0)
+        if "vtysh" in cmd:
+            return _completed(cmd, returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(apply_configs, "sudo_prefix", lambda: [])
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+
+    assert apply_configs._wait_for_sonic("spine1", "clab-demo-spine1", max_tries=1, delay=0)
+    assert any("sonic-cfggen" in cmd for cmd in calls)
+    assert any("vtysh" in cmd for cmd in calls)
+
+
+def test_wait_for_sonic_ignores_fatal_startup_when_services_are_ready(monkeypatch):
+    calls = []
+
+    def fake_safe_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "supervisorctl" in cmd and "status" in cmd and "start.sh" in cmd:
+            return _completed(cmd, returncode=3, stdout="start.sh FATAL Exited too quickly\n")
+        if "supervisorctl" in cmd and "status" in cmd:
+            return _completed(
+                cmd,
+                stdout=(
+                    "redis-server RUNNING pid 10\n"
+                    "orchagent RUNNING pid 11\n"
+                    "zebra RUNNING pid 12\n"
+                    "bgpd RUNNING pid 13\n"
+                ),
+            )
+        if "sonic-cfggen" in cmd:
+            return _completed(cmd, returncode=0)
+        if "vtysh" in cmd:
+            return _completed(cmd, returncode=0)
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(apply_configs, "sudo_prefix", lambda: [])
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+
+    assert apply_configs._wait_for_sonic("spine1", "clab-demo-spine1", max_tries=1, delay=0)
+    repair_calls = [cmd for cmd in calls if "bash" in cmd and any("start.sh" in part for part in cmd)]
+    assert repair_calls == []
+
+
+def test_wait_for_sonic_does_not_repair_fatal_startup_without_configdb(monkeypatch):
+    calls = []
+
+    def fake_safe_run(cmd, **kwargs):
+        calls.append(cmd)
+        if "supervisorctl" in cmd and "status" in cmd and "start.sh" in cmd:
+            return _completed(cmd, returncode=3, stdout="start.sh FATAL Exited too quickly\n")
+        if "supervisorctl" in cmd and "status" in cmd:
+            return _completed(cmd, stdout="")
+        if "sonic-cfggen" in cmd:
+            return _completed(cmd, returncode=1, stderr="redis unavailable")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(apply_configs, "sudo_prefix", lambda: [])
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+
+    assert not apply_configs._wait_for_sonic("spine12", "clab-demo-spine12", max_tries=2, delay=0)
+    repair_calls = [cmd for cmd in calls if "bash" in cmd and any("start.sh" in part for part in cmd)]
+    assert repair_calls == []
+
+
+def test_wait_for_sonic_requires_key_supervisor_services(monkeypatch):
+    def fake_safe_run(cmd, **kwargs):
+        if "supervisorctl" in cmd and "status" in cmd and "start.sh" in cmd:
+            return _completed(cmd, stdout="start.sh FATAL Exited too quickly\n")
+        if "sonic-cfggen" in cmd:
+            return _completed(cmd, returncode=0)
+        if "vtysh" in cmd:
+            return _completed(cmd, returncode=0)
+        if "supervisorctl" in cmd and "status" in cmd:
+            return _completed(
+                cmd,
+                returncode=3,
+                stdout=(
+                    "redis-server RUNNING pid 10\n"
+                    "orchagent STOPPED Not started\n"
+                    "zebra RUNNING pid 12\n"
+                    "bgpd RUNNING pid 13\n"
+                ),
+            )
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(apply_configs, "sudo_prefix", lambda: [])
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+
+    assert not apply_configs._wait_for_sonic("spine1", "clab-demo-spine1", max_tries=1, delay=0)
+
+
+def test_discover_devices_uses_preseed_layout_only(tmp_path):
+    sonic_dir = tmp_path / "configs" / "sonic"
+    (sonic_dir / "spine1").mkdir(parents=True)
+    (sonic_dir / "leaf1").mkdir(parents=True)
+    (sonic_dir / "spine1" / "config_db.json").write_text("{}\n", encoding="utf-8")
+    (sonic_dir / "leaf1" / "config_db.json").write_text("{}\n", encoding="utf-8")
+    stale_dir = tmp_path / "configs"
+    (stale_dir / "spine9.sh").write_text("# stale generated file from an old run\n", encoding="utf-8")
+
+    assert apply_configs._discover_devices(str(tmp_path)) == ["spine1", "leaf1"]
+
+
+def test_apply_single_device_preseed_activates_without_shell_copy(monkeypatch, tmp_path):
+    config_dir = tmp_path / "configs" / "sonic" / "spine1"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config_db.json").write_text("{}\n", encoding="utf-8")
+    (config_dir / "port_config.ini").write_text("# ports\n", encoding="utf-8")
+    (tmp_path / "configs" / "sonic" / "start.sh").write_text("# wrapper\n", encoding="utf-8")
+    calls = []
+
+    def fake_safe_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _completed(cmd, returncode=0)
+
+    monkeypatch.setattr(apply_configs, "sudo_prefix", lambda: [])
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    monkeypatch.setattr(apply_configs, "_wait_for_sonic", lambda *args, **kwargs: True)
+
+    device, success, message, _elapsed, _ready_elapsed, _activation_elapsed = apply_configs._apply_single_device(
+        "spine1", str(tmp_path), "demo"
+    )
+
+    assert (device, success, message) == ("spine1", True, "post-deploy activation")
+    assert not any(cmd[:2] == ["docker", "cp"] for cmd in calls)
+    assert not any(cmd[-2:] == ["bash", "/tmp/config.sh"] for cmd in calls)
+    joined = "\n".join(" ".join(cmd) for cmd in calls)
+    assert "fib_multipath_hash_policy=1" in joined
+    assert "vtysh -b" in joined
+    assert "/usr/sbin/telemetry -port 50051 -noTLS -client_auth none" in joined
+
+
+def test_apply_single_device_requires_preseed_config(monkeypatch, tmp_path):
+    wait_called = False
+
+    def fake_wait(*_args, **_kwargs):
+        nonlocal wait_called
+        wait_called = True
+        return True
+
+    monkeypatch.setattr(apply_configs, "_wait_for_sonic", fake_wait)
+
+    device, success, message, _elapsed, _ready_elapsed, _activation_elapsed = apply_configs._apply_single_device(
+        "spine1", str(tmp_path), "demo"
+    )
+
+    assert (device, success) == ("spine1", False)
+    assert "preseed config not found" in message
+    assert wait_called is False
+
+
+def test_apply_single_device_requires_startup_wrapper(monkeypatch, tmp_path):
+    config_dir = tmp_path / "configs" / "sonic" / "spine1"
+    config_dir.mkdir(parents=True)
+    (config_dir / "config_db.json").write_text("{}\n", encoding="utf-8")
+    wait_called = False
+
+    def fake_wait(*_args, **_kwargs):
+        nonlocal wait_called
+        wait_called = True
+        return True
+
+    monkeypatch.setattr(apply_configs, "_wait_for_sonic", fake_wait)
+
+    device, success, message, _elapsed, _ready_elapsed, _activation_elapsed = apply_configs._apply_single_device(
+        "spine1", str(tmp_path), "demo"
+    )
+
+    assert (device, success) == ("spine1", False)
+    assert "startup wrapper not found" in message
+    assert wait_called is False

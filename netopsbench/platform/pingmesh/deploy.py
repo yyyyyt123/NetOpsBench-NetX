@@ -1,8 +1,9 @@
 """Deploy Pingmesh agents to all client containers for a topology.
 
 Replaces ``scripts/runtime/deploy_pingmesh.sh`` with a pure-Python
-implementation that provides proper error handling, structured logging,
-and direct integration with the topology metadata helpers.
+implementation that stages the agent runtime once on the host, relies on the
+Containerlab ``configs/pingmesh:/tmp/pingmesh:ro`` bind for clients, and starts
+agents with bounded parallelism.
 
 CLI usage (backward-compatible with the shell script)::
 
@@ -19,11 +20,15 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import time
 from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+
+import yaml
 
 from netopsbench.config import config, repo_root
 from netopsbench.logging_utils import get_logger
@@ -35,7 +40,7 @@ from netopsbench.platform.utils.proc import safe_run, sudo_prefix
 logger = get_logger(__name__)
 
 
-# Agent files that must be copied into each client container.
+# Agent files staged once under configs/pingmesh and bind-mounted into clients.
 _AGENT_FILES: list[str] = [
     "netopsbench/platform/pingmesh/agent.py",
     "netopsbench/platform/pingmesh/cli.py",
@@ -46,6 +51,13 @@ _AGENT_FILES: list[str] = [
     "netopsbench/platform/pingmesh/_agent_runtime.py",
     "scripts/runtime/run_pingmesh_agent.py",
 ]
+
+_RUNTIME_SUBDIR = os.path.join("configs", "pingmesh")
+_CONTAINER_RUNTIME_DIR = "/tmp/pingmesh"
+_CONTAINER_PINGLIST = "/tmp/pingmesh/pinglist.json"
+_CONTAINER_AGENT = "/tmp/pingmesh/run_pingmesh_agent.py"
+_PINGMESH_BIND = "configs/pingmesh:/tmp/pingmesh:ro"
+_DEFAULT_DEPLOY_PARALLELISM = 32
 
 
 @dataclass
@@ -82,6 +94,141 @@ def _load_topology_metadata(topology_dir: str) -> dict:
         return json.load(fh)
 
 
+def _runtime_dir(topology_dir: str) -> str:
+    return os.path.join(topology_dir, _RUNTIME_SUBDIR)
+
+
+def _staged_pinglist_path(topology_dir: str) -> str:
+    return os.path.join(_runtime_dir(topology_dir), "pinglist.json")
+
+
+def _deploy_parallelism() -> int:
+    raw = os.environ.get("NETOPSBENCH_PINGMESH_DEPLOY_PARALLELISM", str(_DEFAULT_DEPLOY_PARALLELISM))
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning(
+            "Ignoring invalid NETOPSBENCH_PINGMESH_DEPLOY_PARALLELISM=%r; using %d",
+            raw,
+            _DEFAULT_DEPLOY_PARALLELISM,
+        )
+        value = _DEFAULT_DEPLOY_PARALLELISM
+    return max(1, value)
+
+
+def _stage_runtime(root: str, topology_dir: str, pinglist_file: str, topology_id: str) -> str:
+    runtime_dir = _runtime_dir(topology_dir)
+    os.makedirs(runtime_dir, exist_ok=True)
+
+    staged_pinglist = _staged_pinglist_path(topology_dir)
+    metadata_file = os.path.join(topology_dir, "topology.json")
+    generate_pinglist_from_topology(metadata_file, staged_pinglist, topology_id=topology_id)
+    if not os.path.isfile(staged_pinglist):
+        raise RuntimeError("Pinglist generation failed")
+
+    requested_pinglist = os.path.abspath(pinglist_file)
+    if requested_pinglist != os.path.abspath(staged_pinglist):
+        requested_dir = os.path.dirname(requested_pinglist)
+        if requested_dir:
+            os.makedirs(requested_dir, exist_ok=True)
+        shutil.copy2(staged_pinglist, requested_pinglist)
+
+    for rel_path in _AGENT_FILES:
+        source = os.path.join(root, rel_path)
+        if not os.path.isfile(source):
+            raise FileNotFoundError(f"Pingmesh runtime source not found: {source}")
+        shutil.copy2(source, os.path.join(runtime_dir, os.path.basename(source)))
+
+    required = [staged_pinglist, os.path.join(runtime_dir, "run_pingmesh_agent.py")]
+    missing = [path for path in required if not os.path.isfile(path)]
+    if missing:
+        raise RuntimeError(f"Pingmesh runtime staging failed: missing {', '.join(missing)}")
+    return staged_pinglist
+
+
+def _topology_yaml_path(topology_dir: str, lab_name: str) -> str:
+    candidate = os.path.join(topology_dir, f"{lab_name}.clab.yaml")
+    if os.path.isfile(candidate):
+        return candidate
+    matches = sorted(
+        os.path.join(topology_dir, name)
+        for name in os.listdir(topology_dir)
+        if name.endswith(".clab.yaml")
+    )
+    return matches[0] if matches else candidate
+
+
+def _validate_pingmesh_bind(topology_dir: str, lab_name: str) -> None:
+    yaml_path = _topology_yaml_path(topology_dir, lab_name)
+    if not os.path.isfile(yaml_path):
+        raise RuntimeError(
+            f"Containerlab topology YAML not found: {yaml_path}. Regenerate topology before deploying Pingmesh."
+        )
+
+    with open(yaml_path, encoding="utf-8") as fh:
+        topology = yaml.safe_load(fh) or {}
+    linux_kind = ((topology.get("topology") or {}).get("kinds") or {}).get("linux") or {}
+    binds = linux_kind.get("binds") or []
+    if _PINGMESH_BIND not in binds:
+        raise RuntimeError(
+            f"Pingmesh bind missing from {yaml_path}: expected linux kind bind {_PINGMESH_BIND}. "
+            "Regenerate topology before deploying Pingmesh."
+        )
+
+
+def _env_assignment(name: str, value: str | int | float | None) -> str:
+    return f"{name}={shlex.quote(str(value or ''))}"
+
+
+def _start_client_agent(
+    *,
+    client_name: str,
+    container: str,
+    cycle_interval: int,
+    topology_id: str,
+    influxdb_url: str,
+    influxdb_token: str,
+    influxdb_org: str,
+    influxdb_bucket: str,
+) -> tuple[str, bool, str]:
+    env_values: dict[str, str | int] = {
+        "PYTHONPATH": f"{_CONTAINER_RUNTIME_DIR}:/tmp",
+        "NETOPSBENCH_TOPOLOGY_ID": topology_id,
+        "NETOPSBENCH_INFLUXDB_URL": influxdb_url,
+        "NETOPSBENCH_INFLUXDB_TOKEN": influxdb_token,
+        "NETOPSBENCH_INFLUXDB_ORG": influxdb_org,
+        "NETOPSBENCH_INFLUXDB_BUCKET": influxdb_bucket,
+    }
+    for env_name in ("PINGMESH_RTT_PORTS_PER_CYCLE", "PINGMESH_DF_PORTS_PER_CYCLE"):
+        if os.environ.get(env_name):
+            env_values[env_name] = os.environ[env_name]
+
+    env_block = " ".join(_env_assignment(name, value) for name, value in env_values.items())
+    command = (
+        "set -e; "
+        "mkdir -p /var/log/pingmesh; "
+        f"test -r {_CONTAINER_AGENT}; "
+        f"test -r {_CONTAINER_PINGLIST}; "
+        f"for pid in $(pgrep -f {shlex.quote(_CONTAINER_AGENT)} || true); do "
+        '[ "$pid" = "$$" ] && continue; '
+        'kill "$pid" >/dev/null 2>&1 || true; '
+        "done; "
+        f"{env_block} nohup python3 {_CONTAINER_AGENT} {_CONTAINER_PINGLIST} {cycle_interval} "
+        "> /var/log/pingmesh/agent.log 2>&1 </dev/null &"
+    )
+    ret = _docker("exec", container, "sh", "-c", command, check=False, capture=True, timeout=30)
+    if ret.returncode == 0:
+        return client_name, True, ""
+
+    detail = (ret.stderr or ret.stdout or "").strip() or f"docker exec exited with code {ret.returncode}"
+    message = (
+        "failed to start Pingmesh agent; expected /tmp/pingmesh bind and staged runtime to be readable. "
+        "Regenerate the topology if the runtime files are missing."
+        f" docker output: {detail}"
+    )
+    return client_name, False, message
+
+
 def deploy_pingmesh(
     topology_dir: str,
     pinglist_file: str | None = None,
@@ -91,7 +238,7 @@ def deploy_pingmesh(
     influxdb_org: str | None = None,
     influxdb_bucket: str | None = None,
     topology_id: str | None = None,
-    verify: bool = True,
+    verify: bool = False,
 ) -> DeployResult:
     """Deploy Pingmesh agents to every client container in *topology_dir*.
 
@@ -101,7 +248,7 @@ def deploy_pingmesh(
     root = str(repo_root())
 
     # --- resolve parameters from env with fallbacks ---
-    pinglist_file = pinglist_file or os.path.join(topology_dir, "pinglist.json")
+    pinglist_file = pinglist_file or _staged_pinglist_path(topology_dir)
     cycle_interval = int(os.environ.get("PINGMESH_CYCLE_INTERVAL", cycle_interval))
     topology_id = topology_id or config.topology_id or os.path.basename(topology_dir)
     influxdb_url = influxdb_url or config.pingmesh_influxdb_url
@@ -120,6 +267,7 @@ def deploy_pingmesh(
 
     if not clients:
         raise RuntimeError(f"No clients found in topology metadata: {topology_dir}/topology.json")
+    _validate_pingmesh_bind(topology_dir, lab_name)
 
     # --- validate running containers ---
     _emit("=== Deploying Pingmesh Agents ===")
@@ -127,6 +275,7 @@ def deploy_pingmesh(
     _emit(f"Topology ID: {topology_id}")
     _emit(f"InfluxDB: {influxdb_url} bucket={influxdb_bucket}")
     _emit(f"Cycle interval: {cycle_interval}s")
+    _emit(f"Deploy parallelism: {_deploy_parallelism()}")
     _emit("")
 
     running = set(_running_containers())
@@ -145,84 +294,69 @@ def deploy_pingmesh(
     _emit(f"[0/3] Validated {len(running_clients)}/{len(expected)} client containers")
     _emit("")
 
-    # --- generate pinglist ---
-    _emit("[1/3] Generating pinglist...")
-    metadata_file = os.path.join(topology_dir, "topology.json")
-    generate_pinglist_from_topology(metadata_file, pinglist_file, topology_id=topology_id)
-    if not os.path.isfile(pinglist_file):
-        raise RuntimeError("Pinglist generation failed")
+    # --- stage runtime files and pinglist ---
+    _emit("[1/3] Staging Pingmesh runtime...")
+    stage_started = time.monotonic()
+    staged_pinglist = _stage_runtime(root, topology_dir, pinglist_file, topology_id)
+    stage_elapsed = time.monotonic() - stage_started
+    _emit(f"  Runtime: {_runtime_dir(topology_dir)}")
+    _emit(f"  Pinglist: {staged_pinglist}")
+    _emit(f"  Staged in {stage_elapsed:.1f}s")
     _emit("")
 
-    # --- deploy to each client ---
-    _emit("[2/3] Deploying agents to client containers...")
+    # --- start agents in each client ---
+    _emit("[2/3] Starting agents in client containers...")
     result = DeployResult()
+    start_started = time.monotonic()
+    outcomes: dict[str, tuple[bool, str]] = {}
+    futures = {}
+    deploy_parallelism = _deploy_parallelism()
+    with ThreadPoolExecutor(max_workers=deploy_parallelism) as executor:
+        for client_name in clients:
+            container = clab_container_name(lab_name, client_name)
+            if container not in running:
+                outcomes[client_name] = (False, "container is not running")
+                continue
+            futures[
+                executor.submit(
+                    _start_client_agent,
+                    client_name=client_name,
+                    container=container,
+                    cycle_interval=cycle_interval,
+                    topology_id=topology_id,
+                    influxdb_url=influxdb_url,
+                    influxdb_token=influxdb_token,
+                    influxdb_org=influxdb_org,
+                    influxdb_bucket=influxdb_bucket,
+                )
+            ] = client_name
 
-    agent_sources = [os.path.join(root, src) for src in _AGENT_FILES]
+        for future in as_completed(futures):
+            client_name, ok, message = future.result()
+            outcomes[client_name] = (ok, message)
 
     for client_name in clients:
         container = clab_container_name(lab_name, client_name)
-        if container not in running:
-            logger.warning("%s: not running, skipping", container)
+        ok, message = outcomes.get(client_name, (False, "not scheduled"))
+        if ok:
+            result.deployed += 1
+        else:
+            logger.error("%s: %s", container, message)
             result.failed.append(client_name)
-            continue
 
-        _emit(f"  Deploying to {container}...")
-
-        # Create directories
-        ret = _docker("exec", container, "mkdir", "-p", "/tmp/pingmesh", "/var/log/pingmesh", check=False)
-        if ret.returncode != 0:
-            logger.error("%s: failed to create directories, skipping", container)
-            result.failed.append(client_name)
-            continue
-
-        # Copy agent files
-        copy_ok = True
-        for src in agent_sources:
-            dst = f"{container}:/tmp/pingmesh/{os.path.basename(src)}"
-            ret = _docker("cp", src, dst, check=False)
-            if ret.returncode != 0:
-                logger.error(
-                    "%s: failed to copy %s, skipping",
-                    container,
-                    os.path.basename(src),
-                )
-                copy_ok = False
-                break
-        if not copy_ok:
-            result.failed.append(client_name)
-            continue
-
-        # Copy pinglist
-        _docker("cp", pinglist_file, f"{container}:/tmp/pingmesh/pinglist.json", check=False)
-
-        # Kill any existing agent, then start the new one
-        _docker("exec", container, "pkill", "-f", "/tmp/pingmesh/run_pingmesh_agent.py", check=False, capture=True)
-
-        optional_env = ""
-        for env_name in ("PINGMESH_RTT_PORTS_PER_CYCLE", "PINGMESH_DF_PORTS_PER_CYCLE"):
-            if os.environ.get(env_name):
-                optional_env += f"{env_name}={shlex.quote(os.environ[env_name])} "
-
-        env_block = (
-            f"PYTHONPATH=/tmp "
-            f"NETOPSBENCH_TOPOLOGY_ID='{topology_id}' "
-            f"NETOPSBENCH_INFLUXDB_URL='{influxdb_url}' "
-            f"NETOPSBENCH_INFLUXDB_TOKEN='{influxdb_token}' "
-            f"NETOPSBENCH_INFLUXDB_ORG='{influxdb_org}' "
-            f"NETOPSBENCH_INFLUXDB_BUCKET='{influxdb_bucket}' "
-            f"{optional_env}"
-            f"nohup python3 /tmp/pingmesh/run_pingmesh_agent.py "
-            f"/tmp/pingmesh/pinglist.json {cycle_interval} "
-            f"> /var/log/pingmesh/agent.log 2>&1 &"
-        )
-        _docker("exec", "-d", container, "sh", "-c", env_block, check=False)
-        result.deployed += 1
+    start_elapsed = time.monotonic() - start_started
+    _emit(f"  Started {result.deployed}/{len(clients)} clients in {start_elapsed:.1f}s")
 
     if result.failed:
         logger.warning(
             "%d client(s) failed: %s",
             len(result.failed),
             ", ".join(result.failed),
+        )
+    if result.deployed == 0:
+        raise RuntimeError(
+            "Pingmesh deployment failed for all clients; /tmp/pingmesh bind or staged runtime is not readable. "
+            "Regenerate the topology before deploying Pingmesh."
         )
 
     # --- verify ---
@@ -248,7 +382,7 @@ def deploy_pingmesh(
     _emit("")
     _emit("=== Pingmesh Deployment Complete ===")
     _emit(f"  Deployed to {result.deployed} clients")
-    _emit(f"  Pinglist: {pinglist_file}")
+    _emit(f"  Pinglist: {staged_pinglist}")
     return result
 
 

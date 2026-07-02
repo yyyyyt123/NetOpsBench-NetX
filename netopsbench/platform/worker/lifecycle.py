@@ -161,6 +161,8 @@ def deploy_worker(
     if skip_observability_core_start:
         env["NETOPSBENCH_SKIP_OBSERVABILITY_CORE_START"] = "1"
     _append_worker_log_header(worker.deploy_log_path, f"worker deploy {worker.lab_name}")
+    raw_deploy_timeout = str(os.environ.get("NETOPSBENCH_WORKER_DEPLOY_TIMEOUT", "")).strip()
+    deploy_timeout = int(raw_deploy_timeout) if raw_deploy_timeout.isdigit() else 1800
     try:
         with open(worker.deploy_log_path, "a", encoding="utf-8") as log_fp:
             safe_run(
@@ -178,7 +180,7 @@ def deploy_worker(
                 stdout=log_fp,
                 stderr=subprocess.STDOUT,
                 check=True,
-                timeout=1800,
+                timeout=deploy_timeout,
             )
     except subprocess.CalledProcessError:
         _emit(f"[Worker Deploy Failed] {worker.lab_name} (see {worker.deploy_log_path})")

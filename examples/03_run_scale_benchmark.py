@@ -28,7 +28,7 @@ from examples.agents import MinimalDeepAgent
 from netopsbench.sdk import NetOpsBench
 
 DEFAULT_SCALE = "xs"
-SCALE_CHOICES = ["xs", "small", "medium", "large"]
+SCALE_CHOICES = ["xs", "small", "medium", "large", "xlarge"]
 
 
 def main(

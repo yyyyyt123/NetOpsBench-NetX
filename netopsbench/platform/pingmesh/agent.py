@@ -2,8 +2,8 @@
 """Pingmesh probe agent library.
 
 Defines :class:`PingmeshAgent`. The CLI entrypoint lives in
-:mod:`netopsbench.platform.pingmesh.cli` (also copied into each client
-container by :mod:`netopsbench.platform.pingmesh.deploy`).
+:mod:`netopsbench.platform.pingmesh.cli` (also staged and bind-mounted into
+each client container by :mod:`netopsbench.platform.pingmesh.deploy`).
 """
 
 from __future__ import annotations

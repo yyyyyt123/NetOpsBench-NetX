@@ -1,0 +1,54 @@
+{
+  "DEVICE_METADATA": {
+    "localhost": {
+      "mac": "2a:69:12:f9:25:59",
+      "switch_type": "switch",
+      "buffer_model": "traditional",
+      "hwsku": "Force10-S6000"
+    }
+  },
+  "FEATURE": {
+    "swss": {
+      "state": "enabled"
+    },
+    "bgp": {
+      "state": "enabled"
+    },
+    "teamd": {
+      "state": "enabled"
+    },
+    "nat": {
+      "state": "enabled"
+    },
+    "database": {
+      "state": "enabled"
+    },
+    "lldp": {
+      "state": "enabled"
+    },
+    "dhcp_relay": {
+      "state": "enabled"
+    },
+    "macsec": {
+      "state": "enabled"
+    }
+  },
+  "FLEX_COUNTER_TABLE": {
+    "PORT": {
+      "FLEX_COUNTER_STATUS": "enable",
+      "POLL_INTERVAL": "1000"
+    }
+  },
+  "GNMI": {
+    "gnmi": {
+      "port": "50051",
+      "client_auth": "false",
+      "log_level": "2"
+    },
+    "certs": {
+      "ca_crt": "/etc/sonic/telemetry/dsmsroot.cer",
+      "server_crt": "/etc/sonic/telemetry/streamingtelemetryserver.cer",
+      "server_key": "/etc/sonic/telemetry/streamingtelemetryserver.key"
+    }
+  }
+}

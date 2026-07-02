@@ -68,10 +68,18 @@ if [ ! -f "$TOPOLOGY_FILE" ]; then
 fi
 
 echo "[3/8] Deploying containerlab topology..."
-"${SUDO[@]}" containerlab deploy -t "$TOPOLOGY_FILE" --reconfigure
+CLAB_DEPLOY_ARGS=(deploy -t "$TOPOLOGY_FILE" --reconfigure)
+if [ -n "${NETOPSBENCH_CONTAINERLAB_MAX_WORKERS:-}" ]; then
+    CLAB_DEPLOY_ARGS+=(--max-workers "$NETOPSBENCH_CONTAINERLAB_MAX_WORKERS")
+fi
+if [ -n "${NETOPSBENCH_CONTAINERLAB_TIMEOUT:-}" ]; then
+    CLAB_DEPLOY_ARGS+=(--timeout "$NETOPSBENCH_CONTAINERLAB_TIMEOUT")
+fi
+"${SUDO[@]}" containerlab "${CLAB_DEPLOY_ARGS[@]}"
 
 echo "[4/8] Applying SONiC configs..."
-$PYTHON -m netopsbench.platform.runtime.apply_configs "$TOPOLOGY_DIR" 4 "$LAB_NAME"
+APPLY_CONFIG_PARALLEL=${NETOPSBENCH_APPLY_CONFIG_PARALLEL:-32}
+$PYTHON -m netopsbench.platform.runtime.apply_configs "$TOPOLOGY_DIR" "$APPLY_CONFIG_PARALLEL" "$LAB_NAME"
 
 readarray -t WORKER_META < <($PYTHON - <<PY
 import json
@@ -94,20 +102,31 @@ if ! "${SUDO[@]}" docker inspect influxdb >/dev/null 2>&1; then
     exit 1
 fi
 "${SUDO[@]}" docker network connect "$MGMT_NETWORK" influxdb --alias influxdb >/dev/null 2>&1 || true
+BGP_COLLECTOR_PID_FILE="$TOPOLOGY_DIR/bgp_collector.pid"
+BGP_COLLECTOR_LOG_FILE="$TOPOLOGY_DIR/bgp_collector.log"
+BGP_COLLECTOR_OUTPUT_FILE="$TOPOLOGY_DIR/bgp_neighbors.lp"
+BGP_PID=$(cat "$BGP_COLLECTOR_PID_FILE" 2>/dev/null || true)
+if [ -n "$BGP_PID" ] && kill -0 "$BGP_PID" >/dev/null 2>&1; then
+    kill "$BGP_PID" >/dev/null 2>&1 || true
+fi
+rm -f "$BGP_COLLECTOR_PID_FILE"
 NETOPSBENCH_TOPOLOGY_ID="$TOPOLOGY_ID" \
 NETOPSBENCH_INFLUXDB_BUCKET="$INFLUXDB_BUCKET" \
 NETOPSBENCH_TELEGRAF_INFLUXDB_URL="http://influxdb:8086" \
     bash scripts/observability/start_worker_telegraf.sh "$TOPOLOGY_DIR" "telegraf-${LAB_NAME}"
 
 echo "[6/8] Starting BGP collector..."
-BGP_COLLECTOR_PID_FILE="$TOPOLOGY_DIR/bgp_collector.pid"
-BGP_COLLECTOR_LOG_FILE="$TOPOLOGY_DIR/bgp_collector.log"
-BGP_COLLECTOR_OUTPUT_FILE="$TOPOLOGY_DIR/bgp_neighbors.lp"
-rm -f "$BGP_COLLECTOR_PID_FILE"
-$PYTHON scripts/runtime/run_bgp_collector.py \
+if command -v setsid >/dev/null 2>&1; then
+    BGP_COLLECTOR_DETACH=(nohup setsid)
+else
+    BGP_COLLECTOR_DETACH=(nohup)
+fi
+NETOPSBENCH_TOPOLOGY_ID="$TOPOLOGY_ID" \
+    "${BGP_COLLECTOR_DETACH[@]}" $PYTHON scripts/runtime/run_bgp_collector.py \
     "$TOPOLOGY_DIR/topology.json" \
     --output "$BGP_COLLECTOR_OUTPUT_FILE" \
     --interval "${NETOPSBENCH_BGP_POLL_INTERVAL_SECONDS:-10}" \
+    --parallelism "${NETOPSBENCH_BGP_COLLECTOR_PARALLELISM:-16}" \
     >> "$BGP_COLLECTOR_LOG_FILE" 2>&1 &
 echo $! > "$BGP_COLLECTOR_PID_FILE"
 
@@ -115,12 +134,10 @@ echo "[7/8] Deploying Pingmesh agents..."
 NETOPSBENCH_TOPOLOGY_ID="$TOPOLOGY_ID" \
 NETOPSBENCH_INFLUXDB_BUCKET="$INFLUXDB_BUCKET" \
 NETOPSBENCH_PINGMESH_INFLUXDB_URL="http://influxdb:8086" \
-    $PYTHON -m netopsbench.platform.pingmesh.deploy "$TOPOLOGY_DIR/pinglist.json" "$TOPOLOGY_DIR"
+    $PYTHON -m netopsbench.platform.pingmesh.deploy "$TOPOLOGY_DIR/configs/pingmesh/pinglist.json" "$TOPOLOGY_DIR"
 
 echo "[8/8] Validating worker health..."
-# Accept either NETOPSBENCH_WORKER_HEALTH_RETRIES (set by run_all_benchmarks.sh) or
-# the legacy NETOPSBENCH_WORKER_HEALTH_ATTEMPTS name, defaulting to 5.
-HEALTH_ATTEMPTS=${NETOPSBENCH_WORKER_HEALTH_RETRIES:-${NETOPSBENCH_WORKER_HEALTH_ATTEMPTS:-5}}
+HEALTH_ATTEMPTS=${NETOPSBENCH_WORKER_HEALTH_RETRIES:-5}
 HEALTH_RETRY_DELAY_SECONDS=${NETOPSBENCH_WORKER_HEALTH_RETRY_DELAY_SECONDS:-20}
 HEALTH_OK=0
 for attempt in $(seq 1 "$HEALTH_ATTEMPTS"); do

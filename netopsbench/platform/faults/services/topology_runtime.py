@@ -5,6 +5,8 @@ from __future__ import annotations
 import os
 from typing import TYPE_CHECKING, Any
 
+from netopsbench.platform.topology.configdb_payload import interface_names_for_config
+
 if TYPE_CHECKING:
     from ..context import FaultContext
     from .interface_runtime import InterfaceRuntime
@@ -37,32 +39,14 @@ class TopologyRuntime:
         return {"client1": clients[0], "client2": clients[1]}
 
     def device_config_path(self, device: str) -> str:
-        return os.path.join(self._ctx.clab_dir, "configs", f"{device}.sh")
+        return os.path.join(self._ctx.clab_dir, "configs", "sonic", device, "config_db.json")
 
     def load_device_config_lines(self, device: str) -> list[str]:
-        config_path = self.device_config_path(device)
-        if os.path.exists(config_path):
-            with open(config_path, encoding="utf-8") as handle:
-                return handle.read().splitlines()
-
         result = self._sonic.vtysh(device, ["show running-config"])
         if result.returncode == 0:
             return (result.stdout or "").splitlines()
         return []
 
     def configured_device_interfaces(self, device: str) -> list[str]:
-        interfaces: list[str] = []
-        seen = set()
-        for raw_line in self.load_device_config_lines(device):
-            line = raw_line.strip()
-            parts = line.split()
-            if line.startswith("config interface startup") and len(parts) >= 4:
-                interface = self._iface.resolve_sonic(parts[3])
-            elif line.startswith("config interface ip add") and len(parts) >= 5:
-                interface = self._iface.resolve_sonic(parts[4])
-            else:
-                continue
-            if interface not in seen:
-                seen.add(interface)
-                interfaces.append(interface)
-        return interfaces
+        configdb_interfaces = interface_names_for_config(self.device_config_path(device))
+        return [self._iface.resolve_sonic(interface) for interface in configdb_interfaces]

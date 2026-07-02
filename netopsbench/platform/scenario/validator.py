@@ -11,6 +11,7 @@ from netopsbench.platform.faults.specs import (
     get_fault_spec,
     get_supported_scenario_faults,
 )
+from netopsbench.platform.topology.configdb_payload import interface_names_for_config
 from netopsbench.platform.utils.interface_names import interface_aliases
 
 from .models import Scenario
@@ -20,7 +21,7 @@ from .parser import episode_from_dict, episode_to_dict
 # Constants
 # ---------------------------------------------------------------------------
 
-_SUPPORTED_TOPOLOGY_SCALES = ["xs", "small", "medium", "large"]
+_SUPPORTED_TOPOLOGY_SCALES = ["xs", "small", "medium", "large", "xlarge"]
 _SUPPORTED_TRAFFIC_PROFILES = ["light", "standard", "stress"]
 
 CLIENT_COUNT_TO_SCALE = {
@@ -30,6 +31,7 @@ CLIENT_COUNT_TO_SCALE = {
     16: "medium",
     32: "large",
     64: "large",
+    128: "xlarge",
 }
 
 NETWORK_DEVICE_PREFIXES = ("spine", "leaf")
@@ -149,26 +151,7 @@ def _all_topology_device_names(metadata: dict) -> set[str]:
 
 
 def _parse_config_interfaces(config_path: str) -> set[str]:
-    interfaces: set[str] = set()
-    if not os.path.exists(config_path):
-        return interfaces
-
-    try:
-        with open(config_path, encoding="utf-8") as handle:
-            for raw_line in handle:
-                line = raw_line.strip()
-                if line.startswith("config interface startup"):
-                    parts = line.split()
-                    if len(parts) >= 4:
-                        interfaces.add(parts[3])
-                elif line.startswith("config interface ip add"):
-                    parts = line.split()
-                    if len(parts) >= 5:
-                        interfaces.add(parts[4])
-    except (OSError, ValueError):
-        return set()
-
-    return interfaces
+    return set(interface_names_for_config(config_path))
 
 
 def _validate_episode_target_interface(
@@ -183,7 +166,7 @@ def _validate_episode_target_interface(
     if not target_device.startswith(NETWORK_DEVICE_PREFIXES):
         return []
 
-    config_path = os.path.join(topology_dir, "configs", f"{target_device}.sh")
+    config_path = os.path.join(topology_dir, "configs", "sonic", target_device, "config_db.json")
     config_interfaces = _parse_config_interfaces(config_path)
 
     if not config_interfaces:

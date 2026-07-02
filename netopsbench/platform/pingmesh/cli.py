@@ -2,8 +2,8 @@
 """CLI entrypoint for the Pingmesh probe agent.
 
 Separated from :mod:`netopsbench.platform.pingmesh.agent` so the agent
-class stays a pure library object. This module is also copied into each
-client container by :mod:`netopsbench.platform.pingmesh.deploy`, so the
+class stays a pure library object. This module is also staged and bind-mounted
+into each client container by :mod:`netopsbench.platform.pingmesh.deploy`, so the
 in-container ``python3 /tmp/pingmesh/run_pingmesh_agent.py ...`` invocation
 keeps working when the package layout is not on ``sys.path``.
 """
