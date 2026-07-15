@@ -5,10 +5,6 @@ implementation that stages the agent runtime once on the host, relies on the
 Containerlab ``configs/pingmesh:/tmp/pingmesh:ro`` bind for clients, and starts
 agents with bounded parallelism.
 
-CLI usage (backward-compatible with the shell script)::
-
-    python -m netopsbench.platform.pingmesh.deploy <pinglist_file> <topology_dir>
-
 Programmatic usage::
 
     from netopsbench.platform.pingmesh.deploy import deploy_pingmesh
@@ -17,47 +13,45 @@ Programmatic usage::
 
 from __future__ import annotations
 
-import json
 import os
 import shlex
 import shutil
 import subprocess
-import sys
 import time
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from importlib.resources import files
+from pathlib import Path
 
 import yaml
 
-from netopsbench.config import config, repo_root
+from netopsbench.config import config
 from netopsbench.logging_utils import get_logger
 from netopsbench.platform.pingmesh.generator import generate_pinglist_from_topology
-from netopsbench.platform.topology.topology_utils import clab_container_name
-from netopsbench.platform.utils.events import emit as _emit
-from netopsbench.platform.utils.proc import safe_run, sudo_prefix
+from netopsbench.platform.topology.topology_utils import clab_container_name, load_topology_manifest
+from netopsbench.platform.utils.proc import docker_prefix, safe_run
 
 logger = get_logger(__name__)
 
 
 # Agent files staged once under configs/pingmesh and bind-mounted into clients.
-_AGENT_FILES: list[str] = [
-    "netopsbench/platform/pingmesh/agent.py",
-    "netopsbench/platform/pingmesh/cli.py",
-    "netopsbench/platform/pingmesh/_agent_support.py",
-    "netopsbench/platform/pingmesh/_agent_probe.py",
-    "netopsbench/platform/pingmesh/_agent_responder.py",
-    "netopsbench/platform/pingmesh/_agent_influx.py",
-    "netopsbench/platform/pingmesh/_agent_runtime.py",
-    "scripts/runtime/run_pingmesh_agent.py",
-]
-
+_AGENT_MODULES: tuple[str, ...] = (
+    "agent.py",
+    "cli.py",
+    "_agent_probe.py",
+    "_agent_responder.py",
+    "_agent_influx.py",
+    "_agent_runtime.py",
+)
+_PACKAGE_MODULES: tuple[str, ...] = ("config.py", "logging_utils.py")
 _RUNTIME_SUBDIR = os.path.join("configs", "pingmesh")
 _CONTAINER_RUNTIME_DIR = "/tmp/pingmesh"
 _CONTAINER_PINGLIST = "/tmp/pingmesh/pinglist.json"
-_CONTAINER_AGENT = "/tmp/pingmesh/run_pingmesh_agent.py"
+_CONTAINER_AGENT_MODULE = "netopsbench.platform.pingmesh.cli"
+_CONTAINER_AGENT_SOURCE = "/tmp/pingmesh/netopsbench/platform/pingmesh/cli.py"
 _PINGMESH_BIND = "configs/pingmesh:/tmp/pingmesh:ro"
 _DEFAULT_DEPLOY_PARALLELISM = 32
+_INTERNAL_INFLUXDB_URL = "http://influxdb:8086"
 
 
 @dataclass
@@ -73,7 +67,7 @@ def _docker(*args: str, check: bool = True, capture: bool = False, **kwargs) -> 
     """Run a docker command, raising on failure when *check* is set."""
     kwargs.setdefault("timeout", 60)
     return safe_run(
-        [*sudo_prefix(), "docker", *args],
+        [*docker_prefix(), "docker", *args],
         check=check,
         capture_output=capture,
         text=True,
@@ -86,12 +80,11 @@ def _running_containers() -> list[str]:
     return result.stdout.strip().splitlines() if result.returncode == 0 else []
 
 
-def _load_topology_metadata(topology_dir: str) -> dict:
+def _load_topology_metadata(topology_dir: str):
     metadata_path = os.path.join(topology_dir, "topology.json")
     if not os.path.isfile(metadata_path):
         raise FileNotFoundError(f"Topology metadata not found: {metadata_path}")
-    with open(metadata_path, encoding="utf-8") as fh:
-        return json.load(fh)
+    return load_topology_manifest(metadata_path)
 
 
 def _runtime_dir(topology_dir: str) -> str:
@@ -102,21 +95,12 @@ def _staged_pinglist_path(topology_dir: str) -> str:
     return os.path.join(_runtime_dir(topology_dir), "pinglist.json")
 
 
-def _deploy_parallelism() -> int:
-    raw = os.environ.get("NETOPSBENCH_PINGMESH_DEPLOY_PARALLELISM", str(_DEFAULT_DEPLOY_PARALLELISM))
-    try:
-        value = int(raw)
-    except ValueError:
-        logger.warning(
-            "Ignoring invalid NETOPSBENCH_PINGMESH_DEPLOY_PARALLELISM=%r; using %d",
-            raw,
-            _DEFAULT_DEPLOY_PARALLELISM,
-        )
-        value = _DEFAULT_DEPLOY_PARALLELISM
-    return max(1, value)
+def _copy_resource(source, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source.read_bytes())
 
 
-def _stage_runtime(root: str, topology_dir: str, pinglist_file: str, topology_id: str) -> str:
+def _stage_runtime(topology_dir: str, pinglist_file: str, topology_id: str) -> str:
     runtime_dir = _runtime_dir(topology_dir)
     os.makedirs(runtime_dir, exist_ok=True)
 
@@ -133,13 +117,30 @@ def _stage_runtime(root: str, topology_dir: str, pinglist_file: str, topology_id
             os.makedirs(requested_dir, exist_ok=True)
         shutil.copy2(staged_pinglist, requested_pinglist)
 
-    for rel_path in _AGENT_FILES:
-        source = os.path.join(root, rel_path)
-        if not os.path.isfile(source):
-            raise FileNotFoundError(f"Pingmesh runtime source not found: {source}")
-        shutil.copy2(source, os.path.join(runtime_dir, os.path.basename(source)))
+    staged_root = Path(runtime_dir)
+    package_dir = staged_root / "netopsbench" / "platform" / "pingmesh"
+    for package_init in (
+        staged_root / "netopsbench" / "__init__.py",
+        staged_root / "netopsbench" / "platform" / "__init__.py",
+        package_dir / "__init__.py",
+    ):
+        package_init.parent.mkdir(parents=True, exist_ok=True)
+        package_init.write_text("", encoding="utf-8")
 
-    required = [staged_pinglist, os.path.join(runtime_dir, "run_pingmesh_agent.py")]
+    pingmesh_resources = files("netopsbench.platform.pingmesh")
+    for module in _AGENT_MODULES:
+        source = pingmesh_resources.joinpath(module)
+        if not source.is_file():
+            raise FileNotFoundError(f"Packaged Pingmesh runtime source not found: {module}")
+        _copy_resource(source, package_dir / module)
+    package_resources = files("netopsbench")
+    for module in _PACKAGE_MODULES:
+        source = package_resources.joinpath(module)
+        if not source.is_file():
+            raise FileNotFoundError(f"Packaged Pingmesh dependency not found: {module}")
+        _copy_resource(source, staged_root / "netopsbench" / module)
+
+    required = [staged_pinglist, str(package_dir / "cli.py")]
     missing = [path for path in required if not os.path.isfile(path)]
     if missing:
         raise RuntimeError(f"Pingmesh runtime staging failed: missing {', '.join(missing)}")
@@ -151,9 +152,7 @@ def _topology_yaml_path(topology_dir: str, lab_name: str) -> str:
     if os.path.isfile(candidate):
         return candidate
     matches = sorted(
-        os.path.join(topology_dir, name)
-        for name in os.listdir(topology_dir)
-        if name.endswith(".clab.yaml")
+        os.path.join(topology_dir, name) for name in os.listdir(topology_dir) if name.endswith(".clab.yaml")
     )
     return matches[0] if matches else candidate
 
@@ -184,7 +183,6 @@ def _start_client_agent(
     *,
     client_name: str,
     container: str,
-    cycle_interval: int,
     topology_id: str,
     influxdb_url: str,
     influxdb_token: str,
@@ -199,21 +197,17 @@ def _start_client_agent(
         "NETOPSBENCH_INFLUXDB_ORG": influxdb_org,
         "NETOPSBENCH_INFLUXDB_BUCKET": influxdb_bucket,
     }
-    for env_name in ("PINGMESH_RTT_PORTS_PER_CYCLE", "PINGMESH_DF_PORTS_PER_CYCLE"):
-        if os.environ.get(env_name):
-            env_values[env_name] = os.environ[env_name]
-
     env_block = " ".join(_env_assignment(name, value) for name, value in env_values.items())
     command = (
         "set -e; "
         "mkdir -p /var/log/pingmesh; "
-        f"test -r {_CONTAINER_AGENT}; "
+        f"test -r {_CONTAINER_AGENT_SOURCE}; "
         f"test -r {_CONTAINER_PINGLIST}; "
-        f"for pid in $(pgrep -f {shlex.quote(_CONTAINER_AGENT)} || true); do "
+        f"for pid in $(pgrep -f {shlex.quote(_CONTAINER_AGENT_MODULE)} || true); do "
         '[ "$pid" = "$$" ] && continue; '
         'kill "$pid" >/dev/null 2>&1 || true; '
         "done; "
-        f"{env_block} nohup python3 {_CONTAINER_AGENT} {_CONTAINER_PINGLIST} {cycle_interval} "
+        f"{env_block} nohup python3 -m {_CONTAINER_AGENT_MODULE} {_CONTAINER_PINGLIST} "
         "> /var/log/pingmesh/agent.log 2>&1 </dev/null &"
     )
     ret = _docker("exec", container, "sh", "-c", command, check=False, capture=True, timeout=30)
@@ -232,36 +226,34 @@ def _start_client_agent(
 def deploy_pingmesh(
     topology_dir: str,
     pinglist_file: str | None = None,
-    cycle_interval: int = 1,
     influxdb_url: str | None = None,
     influxdb_token: str | None = None,
     influxdb_org: str | None = None,
     influxdb_bucket: str | None = None,
     topology_id: str | None = None,
     verify: bool = False,
+    parallelism: int = _DEFAULT_DEPLOY_PARALLELISM,
 ) -> DeployResult:
     """Deploy Pingmesh agents to every client container in *topology_dir*.
 
     Returns a :class:`DeployResult` with deployment counts and per-client
     verification status.
     """
-    root = str(repo_root())
-
-    # --- resolve parameters from env with fallbacks ---
+    # --- resolve parameters from the canonical runtime topology ---
     pinglist_file = pinglist_file or _staged_pinglist_path(topology_dir)
-    cycle_interval = int(os.environ.get("PINGMESH_CYCLE_INTERVAL", cycle_interval))
-    topology_id = topology_id or config.topology_id or os.path.basename(topology_dir)
-    influxdb_url = influxdb_url or config.pingmesh_influxdb_url
+    influxdb_url = influxdb_url or _INTERNAL_INFLUXDB_URL
     influxdb_token = influxdb_token or config.influxdb_token
     influxdb_org = influxdb_org or config.influxdb_org
     influxdb_bucket = influxdb_bucket or config.influxdb_bucket
 
     # --- load topology metadata ---
     topo = _load_topology_metadata(topology_dir)
-    lab_name = (topo.get("name") or "dcn").strip()
+    cycle_interval = topo.pingmesh.cycle_interval_seconds
+    topology_id = topology_id or topo.topology_id
+    lab_name = topo.name.strip()
     clients: list[str] = []
-    for client in (topo.get("devices", {}) or {}).get("clients", []):
-        name = str(client.get("name") or "").strip()
+    for client in topo.clients():
+        name = client.name.strip()
         if name:
             clients.append(name)
 
@@ -270,13 +262,14 @@ def deploy_pingmesh(
     _validate_pingmesh_bind(topology_dir, lab_name)
 
     # --- validate running containers ---
-    _emit("=== Deploying Pingmesh Agents ===")
-    _emit(f"Topology: {topology_dir}")
-    _emit(f"Topology ID: {topology_id}")
-    _emit(f"InfluxDB: {influxdb_url} bucket={influxdb_bucket}")
-    _emit(f"Cycle interval: {cycle_interval}s")
-    _emit(f"Deploy parallelism: {_deploy_parallelism()}")
-    _emit("")
+    logger.info("=== Deploying Pingmesh Agents ===")
+    logger.info(f"Topology: {topology_dir}")
+    logger.info(f"Topology ID: {topology_id}")
+    logger.info(f"InfluxDB: {influxdb_url} bucket={influxdb_bucket}")
+    logger.info(f"Cycle interval: {cycle_interval}s")
+    deploy_parallelism = max(1, int(parallelism))
+    logger.info(f"Deploy parallelism: {deploy_parallelism}")
+    logger.info("")
 
     running = set(_running_containers())
     expected = {clab_container_name(lab_name, c) for c in clients}
@@ -291,26 +284,25 @@ def deploy_pingmesh(
             ", ".join(sorted(missing)),
         )
 
-    _emit(f"[0/3] Validated {len(running_clients)}/{len(expected)} client containers")
-    _emit("")
+    logger.info(f"[0/3] Validated {len(running_clients)}/{len(expected)} client containers")
+    logger.info("")
 
     # --- stage runtime files and pinglist ---
-    _emit("[1/3] Staging Pingmesh runtime...")
+    logger.info("[1/3] Staging Pingmesh runtime...")
     stage_started = time.monotonic()
-    staged_pinglist = _stage_runtime(root, topology_dir, pinglist_file, topology_id)
+    staged_pinglist = _stage_runtime(topology_dir, pinglist_file, topology_id)
     stage_elapsed = time.monotonic() - stage_started
-    _emit(f"  Runtime: {_runtime_dir(topology_dir)}")
-    _emit(f"  Pinglist: {staged_pinglist}")
-    _emit(f"  Staged in {stage_elapsed:.1f}s")
-    _emit("")
+    logger.info(f"  Runtime: {_runtime_dir(topology_dir)}")
+    logger.info(f"  Pinglist: {staged_pinglist}")
+    logger.info(f"  Staged in {stage_elapsed:.1f}s")
+    logger.info("")
 
     # --- start agents in each client ---
-    _emit("[2/3] Starting agents in client containers...")
+    logger.info("[2/3] Starting agents in client containers...")
     result = DeployResult()
     start_started = time.monotonic()
     outcomes: dict[str, tuple[bool, str]] = {}
     futures = {}
-    deploy_parallelism = _deploy_parallelism()
     with ThreadPoolExecutor(max_workers=deploy_parallelism) as executor:
         for client_name in clients:
             container = clab_container_name(lab_name, client_name)
@@ -322,7 +314,6 @@ def deploy_pingmesh(
                     _start_client_agent,
                     client_name=client_name,
                     container=container,
-                    cycle_interval=cycle_interval,
                     topology_id=topology_id,
                     influxdb_url=influxdb_url,
                     influxdb_token=influxdb_token,
@@ -345,7 +336,7 @@ def deploy_pingmesh(
             result.failed.append(client_name)
 
     start_elapsed = time.monotonic() - start_started
-    _emit(f"  Started {result.deployed}/{len(clients)} clients in {start_elapsed:.1f}s")
+    logger.info(f"  Started {result.deployed}/{len(clients)} clients in {start_elapsed:.1f}s")
 
     if result.failed:
         logger.warning(
@@ -361,8 +352,8 @@ def deploy_pingmesh(
 
     # --- verify ---
     if verify:
-        _emit("")
-        _emit("[3/3] Verifying deployment...")
+        logger.info("")
+        logger.info("[3/3] Verifying deployment...")
         time.sleep(2)
         for client_name in clients[:3]:
             container = clab_container_name(lab_name, client_name)
@@ -374,32 +365,13 @@ def deploy_pingmesh(
                 check=False,
                 capture=True,
             )
-            agent_running = "run_pingmesh_agent.py" in (ret.stdout or "")
+            agent_running = _CONTAINER_AGENT_MODULE in (ret.stdout or "")
             result.verified[client_name] = agent_running
             status = "✓ running" if agent_running else "✗ NOT running"
-            _emit(f"  {container}: Agent {status}")
+            logger.info(f"  {container}: Agent {status}")
 
-    _emit("")
-    _emit("=== Pingmesh Deployment Complete ===")
-    _emit(f"  Deployed to {result.deployed} clients")
-    _emit(f"  Pinglist: {staged_pinglist}")
+    logger.info("")
+    logger.info("=== Pingmesh Deployment Complete ===")
+    logger.info(f"  Deployed to {result.deployed} clients")
+    logger.info(f"  Pinglist: {staged_pinglist}")
     return result
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point (backward-compatible with shell script args)."""
-    args = list(argv if argv is not None else sys.argv[1:])
-
-    pinglist_file = args[0] if len(args) > 0 else None
-    topology_dir = args[1] if len(args) > 1 else (config.topology_dir or "generated_topology")
-
-    try:
-        deploy_pingmesh(topology_dir=topology_dir, pinglist_file=pinglist_file)
-    except (FileNotFoundError, RuntimeError) as exc:
-        logger.error("%s", exc)
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

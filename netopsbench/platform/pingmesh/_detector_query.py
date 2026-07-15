@@ -3,66 +3,97 @@
 from __future__ import annotations
 
 import csv
-import glob
-import json
-import os
+from dataclasses import dataclass
 from io import StringIO
 
-import requests
+from netopsbench.platform.observability.influxdb import query_flux
 
-from netopsbench.config import config
+_SNAPSHOT_FIELDS = (
+    "rtt_min",
+    "rtt_avg",
+    "rtt_max",
+    "packets_sent",
+    "packets_lost",
+    "df_packets_sent",
+    "df_packets_lost",
+    "df_mtu_drops",
+    "probe_cycle",
+    "destination_batch_index",
+    "port_batch_index",
+    "rtt_ports_active",
+    "rtt_ports_total",
+)
+_SNAPSHOT_QUERY_TIMEOUT_SECONDS = 60
 
-try:
-    from netopsbench.logging_utils import get_logger
-except ModuleNotFoundError:
-    import logging
 
-    def get_logger(name: str):
-        logging.basicConfig(
-            level=logging.INFO,
-            format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-            datefmt="%Y-%m-%d %H:%M:%S",
-        )
-        return logging.getLogger(name)
+@dataclass(frozen=True)
+class SnapshotQueryResult:
+    status: str
+    rows: list[dict]
+    error: str | None = None
 
 
-logger = get_logger(__name__)
+def _endpoint_name(endpoint) -> str | None:
+    if isinstance(endpoint, dict):
+        raw = endpoint.get("device") or endpoint.get("name")
+    else:
+        raw = endpoint
+    if not isinstance(raw, str):
+        return None
+    return raw.split(":", 1)[0].strip() or None
 
 
 class DetectorQueryMixin:
-    def _query_influxdb(self, query: str) -> list[dict]:
-        headers = {
-            "Authorization": f"Token {self.token}",
-            "Content-Type": "application/vnd.flux",
-            "Accept": "application/csv",
-        }
-        try:
-            self.last_query_error = None
-            response = requests.post(
-                f"{self.influxdb_url}/api/v2/query?org={self.org}",
-                headers=headers,
-                data=query,
-                timeout=30,
-                proxies={"http": "", "https": ""},
-            )
-            response.raise_for_status()
-            results = []
-            csv_data = StringIO(response.text)
-            reader = csv.DictReader(csv_data)
-            for row in reader:
-                raw_value = row.get("_value")
-                if row.get("result", "") == "result" or raw_value in (None, ""):
+    @staticmethod
+    def _safe_flux_string(value: str) -> str:
+        return str(value).replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
+    def _parse_snapshot_csv(text: str) -> list[dict]:
+        data_lines = [line for line in text.splitlines() if line and not line.startswith("#")]
+        if not data_lines:
+            return []
+        rows = []
+        for row in csv.DictReader(StringIO("\n".join(data_lines))):
+            if row.get("_time") in (None, "", "_time"):
+                continue
+            parsed = {key: value for key, value in row.items() if key and value not in (None, "")}
+            for field in _SNAPSHOT_FIELDS:
+                if field not in parsed:
                     continue
                 try:
-                    row["value"] = float(raw_value)
-                except (ValueError, KeyError):
-                    continue
-                results.append(row)
-            return results
-        except Exception as e:
-            self.last_query_error = str(e)
-            logger.error("InfluxDB query error: %s", e)
-            return []
+                    parsed[field] = float(parsed[field])
+                except (TypeError, ValueError):
+                    parsed.pop(field, None)
+            rows.append(parsed)
+        return rows
+
+    def _query_snapshot(self, start_time: str, end_time: str) -> SnapshotQueryResult:
+        bucket = self._safe_flux_string(self.bucket)
+        start = self._safe_flux_string(start_time)
+        end = self._safe_flux_string(end_time)
+        fields = " or ".join(f'r._field == "{field}"' for field in _SNAPSHOT_FIELDS)
+        query = (
+            f'from(bucket: "{bucket}")\n'
+            f'  |> range(start: time(v: "{start}"), stop: time(v: "{end}"))\n'
+            '  |> filter(fn: (r) => r._measurement == "pingmesh")\n'
+            + self._topology_filter()
+            + f"  |> filter(fn: (r) => {fields})\n"
+            '  |> keep(columns: ["_time", "_field", "_value", "src_ip", "dst_ip", '
+            '"src_name", "dst_name", "src_leaf", "dst_leaf", "path_type"])\n'
+            '  |> pivot(rowKey: ["_time", "src_ip", "dst_ip", "src_name", "dst_name", '
+            '"src_leaf", "dst_leaf", "path_type"], columnKey: ["_field"], valueColumn: "_value")\n'
+        )
+        result = query_flux(
+            self.influxdb_url,
+            self.token,
+            self.org,
+            query,
+            timeout=_SNAPSHOT_QUERY_TIMEOUT_SECONDS,
+        )
+        if result.status != "ok":
+            return SnapshotQueryResult(status="error", rows=[], error=result.error)
+        return SnapshotQueryResult(status="ok", rows=self._parse_snapshot_csv(result.text))
 
     def _topology_filter(self) -> str:
         if not self.topology_id:
@@ -79,60 +110,44 @@ class DetectorQueryMixin:
             if isinstance(name, str) and isinstance(leaf, str) and name and leaf:
                 self.client_to_leaf[name] = leaf
 
-        # Build leaf → spines mapping from topology links or spine/leaf lists.
+        # Build leaf/edge → core/spine mapping from topology links or role lists.
         spines = devices.get("spines", []) if isinstance(devices, dict) else []
         leafs = devices.get("leafs", []) if isinstance(devices, dict) else []
+        cores = devices.get("cores", []) if isinstance(devices, dict) else []
+        aggs = devices.get("aggs", []) if isinstance(devices, dict) else []
+        edges = devices.get("edges", []) if isinstance(devices, dict) else []
         spine_names = [s.get("name") for s in spines if isinstance(s, dict) and s.get("name")]
-        if not hasattr(self, "leaf_to_spines"):
-            self.leaf_to_spines = {}
+        core_names = [c.get("name") for c in cores if isinstance(c, dict) and c.get("name")]
+        agg_names = [a.get("name") for a in aggs if isinstance(a, dict) and a.get("name")]
+        edge_names = [e.get("name") for e in edges if isinstance(e, dict) and e.get("name")]
         links = metadata.get("links", []) if isinstance(metadata, dict) else []
         if links:
-            spine_set = set(spine_names)
+            adjacency: dict[str, set[str]] = {}
             for link in links:
                 if not isinstance(link, dict):
                     continue
                 endpoints = link.get("endpoints", [])
                 if len(endpoints) != 2:
                     continue
-                a, b = endpoints[0], endpoints[1]
-                a_name = a.get("device") if isinstance(a, dict) else None
-                b_name = b.get("device") if isinstance(b, dict) else None
-                if a_name in spine_set and b_name not in spine_set:
-                    self.leaf_to_spines.setdefault(b_name, [])
-                    if a_name not in self.leaf_to_spines[b_name]:
-                        self.leaf_to_spines[b_name].append(a_name)
-                elif b_name in spine_set and a_name not in spine_set:
-                    self.leaf_to_spines.setdefault(a_name, [])
-                    if b_name not in self.leaf_to_spines[a_name]:
-                        self.leaf_to_spines[a_name].append(b_name)
-        elif spine_names and leafs:
-            # Full-mesh assumption: every leaf connects to every spine.
-            for leaf in leafs:
-                leaf_name = leaf.get("name") if isinstance(leaf, dict) else None
-                if leaf_name:
-                    self.leaf_to_spines[leaf_name] = list(spine_names)
+                a_name = _endpoint_name(endpoints[0])
+                b_name = _endpoint_name(endpoints[1])
+                if not a_name or not b_name:
+                    continue
+                adjacency.setdefault(a_name, set()).add(b_name)
+                adjacency.setdefault(b_name, set()).add(a_name)
 
-    def _load_topology_metadata_from_disk(self) -> dict | None:
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        env_dir = config.topology_dir
-        candidates = []
-        if env_dir:
-            candidates.append(os.path.join(env_dir, "topology.json"))
-        generated_dirs = sorted(
-            glob.glob(os.path.join(base_dir, "lab-topology", "generated_topology_*")),
-            key=os.path.getmtime,
-            reverse=True,
-        )
-        for candidate_dir in generated_dirs:
-            candidates.append(os.path.join(candidate_dir, "topology.json"))
-        candidates.append(os.path.join(base_dir, "lab-topology", "topology.json"))
-        for metadata_file in candidates:
-            if not os.path.exists(metadata_file):
-                continue
-            try:
-                with open(metadata_file, encoding="utf-8") as f:
-                    return json.load(f)
-            except Exception:
-                logger.debug("failed to read topology metadata %s", metadata_file, exc_info=True)
-                continue
-        return None
+            if core_names and agg_names and edge_names:
+                core_set = set(core_names)
+                agg_set = set(agg_names)
+                for edge_name in edge_names:
+                    reachable_cores: set[str] = set()
+                    for agg_name in adjacency.get(edge_name, set()) & agg_set:
+                        reachable_cores.update(adjacency.get(agg_name, set()) & core_set)
+                    if reachable_cores:
+                        self.leaf_to_spines[edge_name] = sorted(reachable_cores)
+            else:
+                spine_set = set(spine_names)
+                for leaf_name in [leaf.get("name") for leaf in leafs if isinstance(leaf, dict) and leaf.get("name")]:
+                    peers = sorted(adjacency.get(leaf_name, set()) & spine_set)
+                    if peers:
+                        self.leaf_to_spines[leaf_name] = peers

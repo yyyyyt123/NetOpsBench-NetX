@@ -18,12 +18,11 @@ def build_candidate_flow(
     src_client: dict,
     dst_client: dict,
     protocol: str,
-    profile,
+    bandwidth_by_protocol: dict[str, str],
     link_mtu_bytes: int,
     dst_port: int,
     udp_payload_len_bytes: int,
     tcp_mss_bytes: int,
-    get_bandwidth,
 ) -> dict:
     src_ip = src_client.get("data_ip") or src_client.get("ip")
     dst_ip = dst_client.get("data_ip") or dst_client.get("ip")
@@ -40,7 +39,7 @@ def build_candidate_flow(
         "dst_ip": dst_ip,
         "dst_port": dst_port,
         "protocol": protocol,
-        "bandwidth": get_bandwidth(profile, protocol),
+        "bandwidth": bandwidth_by_protocol[protocol],
         "duration": 0,
         "parallel": 1,
     }
@@ -57,8 +56,9 @@ def generate_traffic_config_from_topology(
     *,
     topology: dict,
     scale: str,
-    profile,
-    spec,
+    flows_per_client: int,
+    max_pps_per_client: int,
+    bandwidth_by_protocol: dict[str, str],
     link_mtu_bytes: int,
     switch_pps_limit,
     iperf_server_port_base: int,
@@ -69,25 +69,23 @@ def generate_traffic_config_from_topology(
     estimate_switch_pps_fn,
 ) -> dict:
     clients = [d for d in topology["devices"]["clients"]]
-    client_to_leaf = {client["name"]: client.get("leaf") for client in clients}
-    leaf_to_clients: dict[str, list[dict]] = {}
-    for client in clients:
-        leaf_name = client.get("leaf")
-        if leaf_name:
-            leaf_to_clients.setdefault(leaf_name, []).append(client)
-
-    flows = []
+    client_to_leaf: dict[str, str] = {
+        client["name"]: attached_switch
+        for client in clients
+        if isinstance((attached_switch := client.get("leaf")), str)
+    }
+    flows: list[dict] = []
     flow_id = 0
-    rejected_candidates = 0
     leaf_pps = {leaf["name"]: 0.0 for leaf in topology.get("devices", {}).get("leafs", [])}
     spine_pps = {spine["name"]: 0.0 for spine in topology.get("devices", {}).get("spines", [])}
     spine_count = len(spine_pps)
     client_pps = {client["name"]: 0.0 for client in clients}
     source_flow_count = {client["name"]: 0 for client in clients}
-    source_used_dsts = {client["name"]: set() for client in clients}
+    source_used_dsts: dict[str, set[str]] = {client["name"]: set() for client in clients}
     incoming_flow_count = {client["name"]: 0 for client in clients}
     cross_leaf_flows = 0
     intra_leaf_flows = 0
+    rejected = {"source_budget": 0, "destination_budget": 0, "pps_budget": 0}
 
     def flow_type(src_name: str, dst_name: str) -> str:
         src_leaf = client_to_leaf.get(src_name)
@@ -96,32 +94,33 @@ def generate_traffic_config_from_topology(
             return "cross"
         return "intra"
 
-    def can_admit(flow: dict) -> bool:
-        nonlocal rejected_candidates
+    def admission_error(flow: dict) -> str | None:
         src_name = flow["src"]
         dst_name = flow["dst"]
+        if source_flow_count[src_name] >= flows_per_client:
+            return "source_budget"
+        if incoming_flow_count[dst_name] >= flows_per_client:
+            return "destination_budget"
         pps = estimate_flow_pps_fn(flow)
-        if client_pps.get(src_name, 0.0) + pps > spec.max_pps_per_client:
-            return False
+        if client_pps.get(src_name, 0.0) + pps > max_pps_per_client:
+            return "pps_budget"
         src_leaf = client_to_leaf.get(src_name)
         dst_leaf = client_to_leaf.get(dst_name)
         if switch_pps_limit is not None:
             leaf_additions: dict[str, float] = {}
-            if src_leaf in leaf_pps:
+            if src_leaf is not None and src_leaf in leaf_pps:
                 leaf_additions[src_leaf] = leaf_additions.get(src_leaf, 0.0) + pps
-            if dst_leaf in leaf_pps:
+            if dst_leaf is not None and dst_leaf in leaf_pps:
                 leaf_additions[dst_leaf] = leaf_additions.get(dst_leaf, 0.0) + pps
             for leaf_name, added_pps in leaf_additions.items():
                 if (leaf_pps[leaf_name] + added_pps) > switch_pps_limit:
-                    return False
+                    return "pps_budget"
         if switch_pps_limit is not None and src_leaf and dst_leaf and src_leaf != dst_leaf and spine_count > 0:
             per_spine_pps = pps / spine_count
             for current in spine_pps.values():
                 if (current + per_spine_pps) > switch_pps_limit:
-                    return False
-        if source_flow_count[src_name] >= profile.flows_per_client:
-            return False
-        return True
+                    return "pps_budget"
+        return None
 
     def admit_flow(flow: dict):
         nonlocal flow_id, cross_leaf_flows, intra_leaf_flows
@@ -149,7 +148,7 @@ def generate_traffic_config_from_topology(
         flows.append(flow)
         flow_id += 1
 
-    def candidate_pools(src_idx: int) -> tuple[list[dict], list[dict]]:
+    def candidate_pools(src_idx: int) -> dict[str, list[dict]]:
         src_client = clients[src_idx]
         src_leaf = src_client.get("leaf")
         cross_candidates: list[dict] = []
@@ -162,81 +161,75 @@ def generate_traffic_config_from_topology(
                 cross_candidates.append(dst_client)
             else:
                 intra_candidates.append(dst_client)
-        return cross_candidates, intra_candidates
+        return {"cross": cross_candidates, "intra": intra_candidates}
 
     def try_add_from_pool(src_idx: int, pool_type: str) -> bool:
-        nonlocal rejected_candidates
         src_client = clients[src_idx]
-        cross_pool, intra_pool = candidate_pools(src_idx)
-        candidate_pool = cross_pool if pool_type == "cross" else intra_pool
-        for dst_client in candidate_pool:
-            protocol = "udp" if (flow_id % 2 == 0) else "tcp"
+        candidate_pool = candidate_pools(src_idx)[pool_type]
+        cyclic_rank = {candidate["name"]: rank for rank, candidate in enumerate(candidate_pool)}
+        ordered_candidates = sorted(
+            candidate_pool,
+            key=lambda candidate: (
+                incoming_flow_count[candidate["name"]],
+                cyclic_rank[candidate["name"]],
+            ),
+        )
+        for dst_client in ordered_candidates:
             dst_name = dst_client["name"]
-            dst_port = iperf_server_port_base + (incoming_flow_count.get(dst_name, 0) % iperf_server_port_pool_size)
+            incoming_slot = incoming_flow_count[dst_name]
+            if incoming_slot >= iperf_server_port_pool_size:
+                rejected["destination_budget"] += 1
+                continue
+            protocol = "udp" if source_flow_count[src_client["name"]] % 2 == 0 else "tcp"
             candidate_flow = build_candidate_flow_fn(
                 flow_id=flow_id,
                 src_client=src_client,
                 dst_client=dst_client,
                 protocol=protocol,
-                profile=profile,
+                bandwidth_by_protocol=bandwidth_by_protocol,
                 link_mtu_bytes=link_mtu_bytes,
-                dst_port=dst_port,
+                dst_port=iperf_server_port_base + incoming_slot,
             )
-            if can_admit(candidate_flow):
+            if error := admission_error(candidate_flow):
+                rejected[error] += 1
+            else:
                 admit_flow(candidate_flow)
                 return True
-            rejected_candidates += 1
         return False
 
-    for src_idx, src_client in enumerate(clients):
-        src_leaf = src_client.get("leaf")
-        same_leaf_peers = [c for c in leaf_to_clients.get(src_leaf, []) if c["name"] != src_client["name"]]
-        has_cross_candidates = len(clients) > len(leaf_to_clients.get(src_leaf, []))
-        if has_cross_candidates:
-            try_add_from_pool(src_idx, "cross")
-        if same_leaf_peers:
-            try_add_from_pool(src_idx, "intra")
-
-    progress = True
-    while progress:
-        progress = False
+    preferred_pools = ["cross", "cross", "cross", "intra"]
+    for round_index in range(flows_per_client):
+        preferred_pool = preferred_pools[min(round_index, len(preferred_pools) - 1)]
+        fallback_pool = "intra" if preferred_pool == "cross" else "cross"
         for src_idx, src_client in enumerate(clients):
-            src_name = src_client["name"]
-            if source_flow_count[src_name] >= profile.flows_per_client:
+            if source_flow_count[src_client["name"]] >= flows_per_client:
+                rejected["source_budget"] += 1
                 continue
-            src_total_flows = source_flow_count[src_name]
-            src_cross_flows = sum(1 for f in flows if f["src"] == src_name and flow_type(f["src"], f["dst"]) == "cross")
-            preferred_pool = (
-                "cross"
-                if src_total_flows == 0 or (src_cross_flows / src_total_flows) < profile.cross_leaf_target_ratio
-                else "intra"
-            )
             if try_add_from_pool(src_idx, preferred_pool):
-                progress = True
                 continue
-            fallback_pool = "intra" if preferred_pool == "cross" else "cross"
-            if try_add_from_pool(src_idx, fallback_pool):
-                progress = True
+            try_add_from_pool(src_idx, fallback_pool)
 
     total_path_flows = cross_leaf_flows + intra_leaf_flows
     cross_leaf_ratio = (cross_leaf_flows / total_path_flows) if total_path_flows else 0.0
     per_client_pps = estimate_client_pps_fn(flows)
-    per_client_udp_pps = {}
+    per_client_udp_pps: dict[str, float] = {}
     for flow in flows:
         if flow["protocol"] == "udp":
             src_name = flow["src"]
             per_client_udp_pps[src_name] = per_client_udp_pps.get(src_name, 0.0) + estimate_flow_pps_fn(flow)
     switch_pps = estimate_switch_pps_fn(topology, flows)
+    required_listener_ports = sorted({int(flow["dst_port"]) for flow in flows})
+    incoming_values = list(incoming_flow_count.values())
 
     return {
         "profile": {
-            "name": profile.name,
-            "description": profile.description,
+            "name": f"{scale}_standard",
+            "description": f"Canonical standard traffic for {scale} topology",
             "scale": scale,
-            "max_pps_per_client": spec.max_pps_per_client,
+            "max_pps_per_client": max_pps_per_client,
             "switch_pps_limit": switch_pps_limit,
-            "cross_leaf_target_ratio": profile.cross_leaf_target_ratio,
-            "target_client_utilization": profile.target_client_utilization,
+            "cross_leaf_target_ratio": 0.75,
+            "target_client_utilization": 1.0,
             "link_mtu_bytes": link_mtu_bytes,
         },
         "flows": flows,
@@ -244,7 +237,15 @@ def generate_traffic_config_from_topology(
             "total_flows": len(flows),
             "udp_flows": sum(1 for f in flows if f["protocol"] == "udp"),
             "tcp_flows": sum(1 for f in flows if f["protocol"] == "tcp"),
-            "rejected_candidates": rejected_candidates,
+            "rejected_candidates": sum(rejected.values()),
+            "rejected_by_source_budget": rejected["source_budget"],
+            "rejected_by_destination_budget": rejected["destination_budget"],
+            "rejected_by_pps_budget": rejected["pps_budget"],
+            "outgoing_flows_per_client": dict(sorted(source_flow_count.items())),
+            "incoming_flows_per_client": dict(sorted(incoming_flow_count.items())),
+            "min_incoming_flows": min(incoming_values) if incoming_values else 0,
+            "max_incoming_flows": max(incoming_values) if incoming_values else 0,
+            "required_listener_ports": required_listener_ports,
             "estimated_pps_per_client": {client: round(pps, 2) for client, pps in per_client_pps.items()},
             "estimated_max_pps_per_client": round(max(per_client_pps.values()) if per_client_pps else 0.0, 2),
             "estimated_udp_pps_per_client": {client: round(pps, 2) for client, pps in per_client_udp_pps.items()},
@@ -253,7 +254,16 @@ def generate_traffic_config_from_topology(
             ),
             "cross_leaf_flows": cross_leaf_flows,
             "intra_leaf_flows": intra_leaf_flows,
+            "cross_switch_flows": cross_leaf_flows,
+            "same_switch_flows": intra_leaf_flows,
             "cross_leaf_flow_ratio": round(cross_leaf_ratio, 3),
             "estimated_switch_pps": switch_pps,
         },
     }
+
+
+__all__ = [
+    "build_candidate_flow",
+    "candidate_destinations",
+    "generate_traffic_config_from_topology",
+]

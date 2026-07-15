@@ -2,34 +2,27 @@
 Traffic Controller - Manages background iperf3 traffic flows
 """
 
-import os
-import shlex
 import subprocess
 import uuid
 from collections import defaultdict
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from time import monotonic
+from typing import Any
 
 from netopsbench.logging_utils import get_logger
-from netopsbench.platform.utils.events import emit as _emit
-from netopsbench.platform.utils.proc import safe_run, sudo_prefix
+from netopsbench.platform.utils.proc import docker_prefix, safe_run
+
+from .commands import IperfCommandBuilder
+from .settings import DEFAULT_TRAFFIC_PARALLELISM, TrafficSettings
 
 logger = get_logger(__name__)
-_DEFAULT_TRAFFIC_PARALLELISM = 32
+_DEFAULT_TRAFFIC_PARALLELISM = DEFAULT_TRAFFIC_PARALLELISM
 
 
 def _traffic_parallelism() -> int:
-    raw = os.environ.get("NETOPSBENCH_TRAFFIC_PARALLELISM", str(_DEFAULT_TRAFFIC_PARALLELISM))
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        logger.warning(
-            "Ignoring invalid NETOPSBENCH_TRAFFIC_PARALLELISM=%r; using %d",
-            raw,
-            _DEFAULT_TRAFFIC_PARALLELISM,
-        )
-        value = _DEFAULT_TRAFFIC_PARALLELISM
-    return max(1, value)
+    return TrafficSettings.from_env().parallelism
 
 
 def _flow_summary(flow: "TrafficFlow") -> str:
@@ -67,6 +60,33 @@ class TrafficFlow:
     flow_id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
+@dataclass(frozen=True)
+class TrafficStartStats:
+    """Timings and retry counters for the latest matrix start."""
+
+    server_duration_seconds: float = 0.0
+    source_duration_seconds: float = 0.0
+    server_first_attempt_successes: int = 0
+    server_first_attempt_failures: int = 0
+    retry_count: int = 0
+    timeout_count: int = 0
+    started_flow_count: int = 0
+    failed_flow_count: int = 0
+
+    def to_dict(self) -> dict[str, float | int]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
+class _BatchPhaseResult:
+    failures: dict[str, Exception]
+    duration_seconds: float
+    first_attempt_successes: int
+    first_attempt_failures: int
+    retry_count: int
+    timeout_count: int
+
+
 class TrafficController:
     """
     Controls iperf3 traffic flows between client containers.
@@ -74,7 +94,12 @@ class TrafficController:
     Manages starting/stopping background traffic for benchmark realism.
     """
 
-    def __init__(self, container_names: dict[str, str]):
+    def __init__(
+        self,
+        container_names: dict[str, str],
+        command_builder: IperfCommandBuilder | None = None,
+        parallelism: int | None = None,
+    ):
         """
         Initialize traffic controller.
 
@@ -83,30 +108,16 @@ class TrafficController:
                             e.g., {"client1": "clab-dcn-client1"}
         """
         self.container_names = container_names
+        self.command_builder = command_builder or IperfCommandBuilder()
+        self.parallelism = max(1, parallelism or _traffic_parallelism())
+        self.server_parallelism = min(16, max(1, (self.parallelism + 1) // 2))
+        self.retry_parallelism = min(4, self.server_parallelism)
         self.active_flows: dict[str, TrafficFlow] = {}
         self.started_server_ports: dict[str, set] = {}
+        self.last_start_stats = TrafficStartStats()
         # Bound external command latency to avoid benchmark hangs.
         self.command_timeout_seconds = 15
         self.start_retries = 1
-
-    def _ensure_iperf_server(self, dst_client: str, dst_port: int):
-        """Ensure destination has an iperf3 server listening on dst_port."""
-        dst_container = self.container_names.get(dst_client)
-        if not dst_container:
-            raise ValueError(f"Unknown destination client: {dst_client}")
-
-        started_ports = self.started_server_ports.setdefault(dst_container, set())
-        if dst_port in started_ports:
-            return
-
-        check_cmd = f"ss -lnt 2>/dev/null | grep -q ':{dst_port} ' " f"|| iperf3 -s -D -p {dst_port}"
-        safe_run(
-            [*sudo_prefix(), "docker", "exec", dst_container, "sh", "-lc", check_cmd],
-            check=True,
-            capture_output=True,
-            timeout=self.command_timeout_seconds,
-        )
-        started_ports.add(dst_port)
 
     def _ensure_iperf_servers_batch(self, dst_container: str, dst_ports: set[int]) -> None:
         """Ensure a destination container has all required iperf3 server ports."""
@@ -115,149 +126,71 @@ class TrafficController:
         if not missing_ports:
             return
 
-        listener_checks = [f"ss -lnt 2>/dev/null | grep -q ':{port} '" for port in missing_ports]
-        start_commands = []
-        for port, check in zip(missing_ports, listener_checks, strict=True):
-            start_commands.extend(
-                [
-                    f"if ! {check}; then iperf3 -s -D -p {port}; fi",
-                    f"for _attempt in 1 2 3 4 5; do {check} && break; sleep 0.1; done",
-                    check,
-                ]
-            )
-        script = "\n".join(["set -e", *start_commands])
+        script = self.command_builder.server_batch_script(missing_ports)
         safe_run(
-            [*sudo_prefix(), "docker", "exec", dst_container, "sh", "-lc", script],
+            [*docker_prefix(), "docker", "exec", dst_container, "sh", "-lc", script],
             check=True,
             capture_output=True,
             timeout=max(self.command_timeout_seconds, 15),
         )
         started_ports.update(missing_ports)
 
-    def _client_command(self, flow: TrafficFlow) -> str:
-        cmd_parts = [
-            "iperf3",
-            "-c",
-            flow.dst_ip,
-            "-p",
-            str(flow.dst_port),
-            "-P",
-            str(flow.parallel),
-        ]
-        if flow.protocol == "udp":
-            cmd_parts.extend(["-u", "-b", flow.bandwidth, "-l", str(flow.udp_payload_len)])
-        elif flow.bandwidth:
-            cmd_parts.extend(["-b", flow.bandwidth])
-            if flow.tcp_mss > 0:
-                cmd_parts.extend(["-M", str(flow.tcp_mss)])
-        cmd_parts.extend(["-t", str(flow.duration)])
-        return " ".join(shlex.quote(part) for part in cmd_parts)
-
     def _start_source_flows_batch(self, src_container: str, flows: list[TrafficFlow]) -> None:
-        script = "\n".join(f"nohup {self._client_command(flow)} >/dev/null 2>&1 &" for flow in flows)
+        script = self.command_builder.source_batch_script(flows)
         safe_run(
-            [*sudo_prefix(), "docker", "exec", src_container, "sh", "-lc", script],
+            [*docker_prefix(), "docker", "exec", src_container, "sh", "-lc", script],
             check=True,
             capture_output=True,
             timeout=max(self.command_timeout_seconds, 15),
         )
 
-    def start_flow(self, flow: TrafficFlow) -> str:
-        """
-        Start a single iperf3 traffic flow.
-
-        Args:
-            flow: TrafficFlow specification
-
-        Returns:
-            flow_id of the started flow
-        """
-        src_container = self.container_names.get(flow.src)
-        if not src_container:
-            raise ValueError(f"Unknown client: {flow.src}")
-
-        # Build iperf3 command
-        cmd_parts = [
-            *sudo_prefix(),
-            "docker",
-            "exec",
-            "-d",
-            src_container,
-            "iperf3",
-            "-c",
-            flow.dst_ip,
-            "-p",
-            str(flow.dst_port),
-            "-P",
-            str(flow.parallel),
-        ]
-
-        if flow.protocol == "udp":
-            cmd_parts.extend(["-u", "-b", flow.bandwidth, "-l", str(flow.udp_payload_len)])
-        elif flow.bandwidth:
-            cmd_parts.extend(["-b", flow.bandwidth])
-            if flow.tcp_mss > 0:
-                cmd_parts.extend(["-M", str(flow.tcp_mss)])
-
-        # Keep continuous semantics explicit
-        cmd_parts.extend(["-t", str(flow.duration)])
-
-        # Start flow in background
-        last_error: Exception | None = None
+    def _run_batch_phase(
+        self,
+        groups: dict[str, Any],
+        operation: Callable[[str, Any], None],
+        initial_parallelism: int,
+    ) -> _BatchPhaseResult:
+        """Run one grouped Docker phase, retrying transient failures at lower pressure."""
+        started_at = monotonic()
+        pending = dict(groups)
+        failures: dict[str, Exception] = {}
+        first_attempt_successes = 0
+        first_attempt_failures = 0
+        retry_count = 0
+        timeout_count = 0
         for attempt in range(self.start_retries + 1):
-            try:
-                self._ensure_iperf_server(flow.dst, flow.dst_port)
-                safe_run(
-                    cmd_parts,
-                    check=True,
-                    capture_output=True,
-                    timeout=self.command_timeout_seconds,
-                )
-                self.active_flows[flow.flow_id] = flow
-                _emit(f"  Started flow: {flow.src} -> {flow.dst} ({flow.bandwidth})")
-                return flow.flow_id
-            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-                last_error = e
-                if attempt < self.start_retries:
-                    _emit(
-                        f"  Warning: flow start retry {attempt + 1}/{self.start_retries} "
-                        f"for {flow.src} -> {flow.dst}"
-                    )
-                    continue
+            if not pending:
                 break
-
-        _emit(f"  Failed to start flow {flow.src} -> {flow.dst}: {last_error}")
-        raise RuntimeError(f"Failed to start flow {flow.src}->{flow.dst}: {last_error}")
-
-    def stop_flow(self, flow_id: str):
-        """
-        Stop a specific traffic flow.
-
-        Args:
-            flow_id: ID of flow to stop
-        """
-        if flow_id not in self.active_flows:
-            _emit(f"  Warning: Flow {flow_id} not found")
-            return
-
-        flow = self.active_flows[flow_id]
-        src_container = self.container_names.get(flow.src)
-
-        if src_container:
-            try:
-                # Kill iperf3 client processes
-                safe_run(
-                    [*sudo_prefix(), "docker", "exec", src_container, "pkill", "-f", f"iperf3 -c {flow.dst_ip}"],
-                    check=False,  # Don't fail if process already stopped
-                    capture_output=True,
-                    timeout=15,
-                )
-                _emit(f"  Stopped flow: {flow.src} -> {flow.dst}")
-
-            except Exception as e:
-                _emit(f"  Warning: Failed to stop flow {flow_id}: {e}", level="warning")
-
-        del self.active_flows[flow_id]
+            max_workers = initial_parallelism if attempt == 0 else self.retry_parallelism
+            current = pending
+            pending = {}
+            failures = {}
+            if attempt > 0:
+                retry_count += len(current)
+            with ThreadPoolExecutor(max_workers=min(max_workers, len(current))) as executor:
+                future_map = {
+                    executor.submit(operation, container, value): container for container, value in current.items()
+                }
+                for future in as_completed(future_map):
+                    container = future_map[future]
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        pending[container] = current[container]
+                        failures[container] = exc
+                        if isinstance(exc, subprocess.TimeoutExpired):
+                            timeout_count += 1
+            if attempt == 0:
+                first_attempt_failures = len(pending)
+                first_attempt_successes = len(current) - first_attempt_failures
+        return _BatchPhaseResult(
+            failures=failures,
+            duration_seconds=monotonic() - started_at,
+            first_attempt_successes=first_attempt_successes,
+            first_attempt_failures=first_attempt_failures,
+            retry_count=retry_count,
+            timeout_count=timeout_count,
+        )
 
     def start_matrix(self, flows: list[TrafficFlow]) -> list[str]:
         """
@@ -270,7 +203,8 @@ class TrafficController:
             List of flow_ids
         """
         if not flows:
-            _emit("\n  Started 0/0 flows")
+            self.last_start_stats = TrafficStartStats()
+            logger.info("Started 0/0 flows")
             return []
 
         valid_flows: list[TrafficFlow] = []
@@ -280,33 +214,25 @@ class TrafficController:
             src_container = self.container_names.get(flow.src)
             dst_container = self.container_names.get(flow.dst)
             if not src_container:
-                _emit(f"  Warning: Skipping flow with unknown source: {_flow_summary(flow)}", level="warning")
+                logger.warning("Skipping flow with unknown source: %s", _flow_summary(flow))
                 continue
             if not dst_container:
-                _emit(f"  Warning: Skipping flow with unknown destination: {_flow_summary(flow)}", level="warning")
+                logger.warning("Skipping flow with unknown destination: %s", _flow_summary(flow))
                 continue
             valid_flows.append(flow)
             dst_ports_by_container[dst_container].add(flow.dst_port)
             flows_by_dst_container[dst_container].append(flow)
 
         failed_flows: set[str] = set()
-        parallelism = min(_traffic_parallelism(), max(len(dst_ports_by_container), 1))
-        with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            future_map = {
-                executor.submit(self._ensure_iperf_servers_batch, dst_container, dst_ports): dst_container
-                for dst_container, dst_ports in dst_ports_by_container.items()
-            }
-            for future in as_completed(future_map):
-                dst_container = future_map[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    for flow in flows_by_dst_container.get(dst_container, []):
-                        failed_flows.add(flow.flow_id)
-                        _emit(
-                            f"  Warning: Failed to ensure server for {_flow_summary(flow)}: {_error_detail(exc)}",
-                            level="warning",
-                        )
+        server_result = self._run_batch_phase(
+            dst_ports_by_container,
+            self._ensure_iperf_servers_batch,
+            self.server_parallelism,
+        )
+        for dst_container, exc in server_result.failures.items():
+            for flow in flows_by_dst_container.get(dst_container, []):
+                failed_flows.add(flow.flow_id)
+                logger.warning("Failed to ensure server for %s: %s", _flow_summary(flow), _error_detail(exc))
 
         source_groups: dict[str, list[TrafficFlow]] = defaultdict(list)
         for flow in valid_flows:
@@ -314,31 +240,46 @@ class TrafficController:
                 continue
             source_groups[self.container_names[flow.src]].append(flow)
 
-        parallelism = min(_traffic_parallelism(), max(len(source_groups), 1))
-        with ThreadPoolExecutor(max_workers=parallelism) as executor:
-            future_map = {
-                executor.submit(self._start_source_flows_batch, src_container, src_flows): (src_container, src_flows)
-                for src_container, src_flows in source_groups.items()
-            }
-            for future in as_completed(future_map):
-                src_container, src_flows = future_map[future]
-                try:
-                    future.result()
-                except Exception as exc:
-                    for flow in src_flows:
-                        failed_flows.add(flow.flow_id)
-                        _emit(
-                            "  Warning: Failed to start flow on "
-                            f"{src_container}: {_flow_summary(flow)}: {_error_detail(exc)}",
-                            level="warning",
-                        )
-                    continue
+        source_result = self._run_batch_phase(
+            source_groups,
+            self._start_source_flows_batch,
+            self.parallelism,
+        )
+        for src_container, src_flows in source_groups.items():
+            source_error = source_result.failures.get(src_container)
+            if source_error is not None:
                 for flow in src_flows:
-                    self.active_flows[flow.flow_id] = flow
-                _emit(f"  Started {len(src_flows)} flow(s) from {src_flows[0].src}")
+                    failed_flows.add(flow.flow_id)
+                    logger.warning(
+                        "Failed to start flow on %s: %s: %s",
+                        src_container,
+                        _flow_summary(flow),
+                        _error_detail(source_error),
+                    )
+                continue
+            for flow in src_flows:
+                self.active_flows[flow.flow_id] = flow
+            logger.debug("Started %d flow(s) from %s", len(src_flows), src_flows[0].src)
 
         flow_ids = [flow.flow_id for flow in valid_flows if flow.flow_id in self.active_flows]
-        _emit(f"\n  Started {len(flow_ids)}/{len(flows)} flows")
+        self.last_start_stats = TrafficStartStats(
+            server_duration_seconds=server_result.duration_seconds,
+            source_duration_seconds=source_result.duration_seconds,
+            server_first_attempt_successes=server_result.first_attempt_successes,
+            server_first_attempt_failures=server_result.first_attempt_failures,
+            retry_count=server_result.retry_count + source_result.retry_count,
+            timeout_count=server_result.timeout_count + source_result.timeout_count,
+            started_flow_count=len(flow_ids),
+            failed_flow_count=len(flows) - len(flow_ids),
+        )
+        logger.info(
+            "Traffic phases: servers=%.1fs sources=%.1fs retries=%d timeouts=%d",
+            server_result.duration_seconds,
+            source_result.duration_seconds,
+            self.last_start_stats.retry_count,
+            self.last_start_stats.timeout_count,
+        )
+        logger.info("Started %d/%d flows", len(flow_ids), len(flows))
         return flow_ids
 
     def stop_all(self):
@@ -355,13 +296,21 @@ class TrafficController:
 
         def stop_container(src_container: str) -> None:
             safe_run(
-                [*sudo_prefix(), "docker", "exec", src_container, "sh", "-lc", "pkill -f 'iperf3 -c' || true"],
+                [
+                    *docker_prefix(),
+                    "docker",
+                    "exec",
+                    src_container,
+                    "sh",
+                    "-lc",
+                    self.command_builder.stop_clients_script(),
+                ],
                 check=False,
                 capture_output=True,
                 timeout=15,
             )
 
-        parallelism = min(_traffic_parallelism(), max(len(flows_by_src_container), 1))
+        parallelism = min(self.parallelism, max(len(flows_by_src_container), 1))
         with ThreadPoolExecutor(max_workers=parallelism) as executor:
             future_map = {
                 executor.submit(stop_container, src_container): (src_container, src_flows)
@@ -371,18 +320,11 @@ class TrafficController:
                 src_container, src_flows = future_map[future]
                 try:
                     future.result()
-                    _emit(f"  Stopped {len(src_flows)} flow(s) from {src_flows[0].src}")
+                    logger.debug("Stopped %d flow(s) from %s", len(src_flows), src_flows[0].src)
                 except Exception as exc:
-                    _emit(
-                        f"  Warning: Failed to stop flows on {src_container}: {_error_detail(exc)}",
-                        level="warning",
-                    )
+                    logger.warning("Failed to stop flows on %s: %s", src_container, _error_detail(exc))
                 finally:
                     for flow in src_flows:
                         self.active_flows.pop(flow.flow_id, None)
 
-        _emit(f"  Stopped all {len(flow_ids)} flows")
-
-    def get_active_flows(self) -> list[TrafficFlow]:
-        """Get list of all active flows."""
-        return list(self.active_flows.values())
+        logger.info("Stopped all %d flows", len(flow_ids))

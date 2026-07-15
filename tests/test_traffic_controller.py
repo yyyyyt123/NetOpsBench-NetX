@@ -1,5 +1,7 @@
 import subprocess
 
+import pytest
+
 from netopsbench.platform.traffic import controller as controller_mod
 from netopsbench.platform.traffic.controller import TrafficController, TrafficFlow
 
@@ -61,8 +63,58 @@ def test_batched_server_ensure_fails_fast_and_verifies_listeners(monkeypatch):
 
     script = calls[0][-1]
     assert script.startswith("set -e\n")
-    assert script.count("ss -lnt 2>/dev/null | grep -q ':5201 '") >= 2
-    assert script.count("ss -lnt 2>/dev/null | grep -q ':5202 '") >= 2
+    assert script.count("ss -lntH") == 2
+    assert "required_ports='5201 5202'" in script
+    assert "for port in $required_ports" in script
+    assert "missing=0" in script
+
+
+def test_batched_source_start_is_idempotent_for_safe_retry(monkeypatch):
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        controller_mod,
+        "safe_run",
+        lambda cmd, **kwargs: calls.append([str(part) for part in cmd]) or subprocess.CompletedProcess(cmd, 0, "", ""),
+    )
+
+    _controller().start_matrix(_flows())
+
+    source_scripts = [call[-1] for call in calls if "iperf3 -c" in " ".join(call)]
+    assert source_scripts
+    assert all("flow_running" in script for script in source_scripts)
+    assert all("/tmp/netopsbench-traffic/" in script for script in source_scripts)
+    assert all("/proc/$pid/cmdline" in script for script in source_scripts)
+    assert all("</dev/null &" in script for script in source_scripts)
+    assert all("missing=0" in script for script in source_scripts)
+    assert all("pgrep -f" not in script for script in source_scripts)
+
+
+def test_start_matrix_retries_transient_batch_failure_at_lower_parallelism(monkeypatch):
+    attempts: dict[str, int] = {}
+
+    def fake_safe_run(cmd, **kwargs):
+        text = " ".join(str(part) for part in cmd)
+        container = next(part for part in cmd if str(part).startswith("clab-test-client"))
+        key = f"{container}:{'server' if 'iperf3 -s' in text else 'source'}"
+        attempts[key] = attempts.get(key, 0) + 1
+        if key == "clab-test-client3:server" and attempts[key] == 1:
+            raise subprocess.TimeoutExpired(cmd, 15)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(controller_mod, "safe_run", fake_safe_run)
+
+    controller = _controller()
+    flow_ids = controller.start_matrix(_flows())
+
+    assert len(flow_ids) == 4
+    assert attempts["clab-test-client3:server"] == 2
+    assert controller.last_start_stats.server_first_attempt_successes == 1
+    assert controller.last_start_stats.server_first_attempt_failures == 1
+    assert controller.last_start_stats.retry_count == 1
+    assert controller.last_start_stats.timeout_count == 1
+    assert controller.last_start_stats.started_flow_count == 4
+    assert controller.last_start_stats.failed_flow_count == 0
 
 
 def test_stop_all_kills_iperf_clients_once_per_source_container(monkeypatch):
@@ -81,9 +133,9 @@ def test_stop_all_kills_iperf_clients_once_per_source_container(monkeypatch):
     controller.stop_all()
 
     command_texts = [" ".join(call) for call in calls]
-    pkill_calls = [text for text in command_texts if "pkill" in text]
-    assert len(pkill_calls) == 2
-    assert all("iperf3 -c" in text for text in pkill_calls)
+    stop_calls = [text for text in command_texts if "/tmp/netopsbench-traffic" in text]
+    assert len(stop_calls) == 2
+    assert all("flow_running" in text for text in stop_calls)
     assert controller.active_flows == {}
 
 
@@ -98,6 +150,18 @@ def test_traffic_parallelism_env_override_and_invalid_value(monkeypatch):
     assert controller_mod._traffic_parallelism() == 32
 
 
+@pytest.mark.parametrize(
+    ("configured", "server", "retry"),
+    [(32, 16, 4), (8, 4, 4), (1, 1, 1), (64, 16, 4)],
+)
+def test_controller_derives_server_and_retry_parallelism(configured, server, retry):
+    controller = TrafficController({}, parallelism=configured)
+
+    assert controller.parallelism == configured
+    assert controller.server_parallelism == server
+    assert controller.retry_parallelism == retry
+
+
 def test_start_matrix_partial_failure_records_only_started_flows(monkeypatch):
     messages: list[str] = []
 
@@ -108,7 +172,11 @@ def test_start_matrix_partial_failure_records_only_started_flows(monkeypatch):
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr(controller_mod, "safe_run", fake_safe_run)
-    monkeypatch.setattr(controller_mod, "_emit", lambda message, **kwargs: messages.append(message))
+    monkeypatch.setattr(
+        controller_mod.logger,
+        "warning",
+        lambda message, *args, **kwargs: messages.append(message % args if args else message),
+    )
     monkeypatch.setenv("NETOPSBENCH_TRAFFIC_PARALLELISM", "2")
 
     controller = _controller()

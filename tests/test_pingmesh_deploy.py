@@ -18,9 +18,35 @@ def _write_topology(topology_dir: Path, *, clients: int = 3, include_bind: bool 
     (topology_dir / "topology.json").write_text(
         json.dumps(
             {
+                "schema_version": "3",
+                "topology_id": "demo",
                 "name": "demo",
-                "devices": {"clients": [{"name": name} for name in client_names]},
-                "pingmesh": {"max_dests_per_client": 16},
+                "scale": "test",
+                "family": "clos",
+                "management": {"network": "clab-mgmt-demo", "ipv4_subnet": "172.20.20.0/24"},
+                "collector": {"ipv4": "172.20.20.200"},
+                "defaults": {},
+                "facts": {
+                    "num_leafs": 1,
+                    "clients_per_attached_switch": max(1, clients),
+                    "total_clients": clients,
+                    "total_switches": 1,
+                },
+                "routing": {"ecmp_hash_policy_by_role": {"leaf": 1}},
+                "devices": [
+                    {"name": "leaf1", "role": "leaf"},
+                    *[
+                        {
+                            "name": name,
+                            "role": "client",
+                            "attached_switch": "leaf1",
+                            "data_ip": f"192.168.101.{index + 1}",
+                        }
+                        for index, name in enumerate(client_names, start=1)
+                    ],
+                ],
+                "links": [],
+                "pingmesh": {"destination_batch_size": 16},
             }
         ),
         encoding="utf-8",
@@ -81,7 +107,6 @@ def test_deploy_pingmesh_stages_runtime_once_and_starts_clients_in_parallel(tmp_
     generator_calls: list[Path] = []
     docker_calls: list[tuple[str, ...]] = []
 
-    monkeypatch.setenv("NETOPSBENCH_PINGMESH_DEPLOY_PARALLELISM", "7")
     monkeypatch.setattr(deploy_mod, "ThreadPoolExecutor", _RecordingExecutor, raising=False)
     monkeypatch.setattr(deploy_mod, "generate_pinglist_from_topology", _fake_pinglist_generator(generator_calls))
     monkeypatch.setattr(
@@ -96,26 +121,32 @@ def test_deploy_pingmesh_stages_runtime_once_and_starts_clients_in_parallel(tmp_
         if args[0] == "exec" and args[2:4] == ("sh", "-c"):
             command = args[4]
             assert "mkdir -p /var/log/pingmesh" in command
-            assert "test -r /tmp/pingmesh/run_pingmesh_agent.py" in command
+            assert "test -r /tmp/pingmesh/netopsbench/platform/pingmesh/cli.py" in command
             assert "test -r /tmp/pingmesh/pinglist.json" in command
-            assert "pgrep -f /tmp/pingmesh/run_pingmesh_agent.py" in command
+            assert "pgrep -f netopsbench.platform.pingmesh.cli" in command
             assert '[ "$pid" = "$$" ] && continue' in command
             assert 'kill "$pid"' in command
-            assert "nohup python3 /tmp/pingmesh/run_pingmesh_agent.py" in command
+            assert "nohup python3 -m netopsbench.platform.pingmesh.cli" in command
             return subprocess.CompletedProcess(["docker", *args], 0, stdout="", stderr="")
         if args[0] == "exec" and args[2:] == ("ps", "aux"):
-            return subprocess.CompletedProcess(["docker", *args], 0, stdout="run_pingmesh_agent.py", stderr="")
+            return subprocess.CompletedProcess(
+                ["docker", *args], 0, stdout="netopsbench.platform.pingmesh.cli", stderr=""
+            )
         raise AssertionError(f"unexpected docker call: {args}")
 
     monkeypatch.setattr(deploy_mod, "_docker", _docker)
 
-    result = deploy_mod.deploy_pingmesh(str(topology_dir), verify=False)
+    result = deploy_mod.deploy_pingmesh(str(topology_dir), verify=False, parallelism=7)
 
     runtime_dir = topology_dir / "configs" / "pingmesh"
     assert generator_calls == [runtime_dir / "pinglist.json"]
     assert (runtime_dir / "pinglist.json").is_file()
-    for source in deploy_mod._AGENT_FILES:
-        assert (runtime_dir / Path(source).name).is_file()
+    assert not (runtime_dir / "run_pingmesh_agent.py").exists()
+    for module in deploy_mod._AGENT_MODULES:
+        assert (runtime_dir / "netopsbench" / "platform" / "pingmesh" / module).is_file()
+    for module in deploy_mod._PACKAGE_MODULES:
+        assert (runtime_dir / "netopsbench" / module).is_file()
+    assert not (runtime_dir / "agent.py").exists()
 
     start_calls = [args for args in docker_calls if args[0] == "exec"]
     assert len(start_calls) == len(clients)

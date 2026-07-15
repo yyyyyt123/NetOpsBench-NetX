@@ -22,11 +22,9 @@ import socket
 import struct
 import time
 
-try:
-    from ._agent_support import logger
-except ImportError:  # standalone in-container deployment
-    from _agent_support import logger  # type: ignore[no-redef]
+from netopsbench.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
 # ---------------------------------------------------------------------------
 # Linux IP_MTU_DISCOVER constants (define locally so the module is portable
@@ -82,16 +80,13 @@ class UdpProbeMixin:
     Required attributes on the host class:
         udp_dst_port (int)
         n_rtt_ports (int)
-        n_df_ports (int)
         rtt_ports_per_cycle (int, optional)
-        df_ports_per_cycle (int, optional)
         rtt_src_port_base (int)
-        df_src_port_base (int)
         df_payload_size (int)
-        burst_timeout_s (float)
+        interval (float)
     """
 
-    def _open_burst_sockets(
+    def _open_probe_sockets(
         self,
         src_ip: str,
         src_port_base: int,
@@ -133,23 +128,15 @@ class UdpProbeMixin:
     def _close_udp_probe_sockets(self) -> None:
         """Close persistent UDP probe sockets owned by this agent."""
         self._close_socket_pool(getattr(self, "_udp_rtt_sockets", []))
-        self._close_socket_pool(getattr(self, "_udp_df_sockets", []))
         self._udp_rtt_sockets = []
-        self._udp_df_sockets = []
         self._udp_probe_src_ip = None
-        self._udp_rtt_socket_cursor = 0
-        self._udp_df_socket_cursor = 0
 
     def _ensure_udp_probe_sockets(
         self,
         src_ip: str,
         include_rtt: bool = True,
-        include_df: bool | None = None,
-    ) -> tuple[list, list]:
+    ) -> list:
         """Create persistent source-port socket pools on first use."""
-        if include_df is None:
-            include_df = bool(getattr(self, "enable_df_probe", True))
-
         bind_ip = src_ip or ""
         current_src_ip = getattr(self, "_udp_probe_src_ip", None)
         if current_src_ip is not None and current_src_ip != bind_ip:
@@ -164,24 +151,22 @@ class UdpProbeMixin:
             self._udp_probe_src_ip = bind_ip
         if not hasattr(self, "_udp_rtt_sockets"):
             self._udp_rtt_sockets = []
-        if not hasattr(self, "_udp_df_sockets"):
-            self._udp_df_sockets = []
 
         if include_rtt and not self._udp_rtt_sockets:
-            self._udp_rtt_sockets = self._open_burst_sockets(
+            self._udp_rtt_sockets = self._open_probe_sockets(
                 src_ip=bind_ip,
                 src_port_base=self.rtt_src_port_base,
                 n_ports=self.n_rtt_ports,
                 set_df=True,
             )
-        if include_df and not self._udp_df_sockets:
-            self._udp_df_sockets = self._open_burst_sockets(
-                src_ip=bind_ip,
-                src_port_base=self.df_src_port_base,
-                n_ports=self.n_df_ports,
-                set_df=True,
-            )
-        return self._udp_rtt_sockets, self._udp_df_sockets
+            if len(self._udp_rtt_sockets) != int(self.n_rtt_ports):
+                opened_ports = {src_port for src_port, _sock in self._udp_rtt_sockets}
+                expected_ports = set(range(self.rtt_src_port_base, self.rtt_src_port_base + self.n_rtt_ports))
+                missing = sorted(expected_ports - opened_ports)
+                self._close_socket_pool(self._udp_rtt_sockets)
+                self._udp_rtt_sockets = []
+                raise RuntimeError(f"Unable to bind the complete Pingmesh source-port pool; missing ports: {missing}")
+        return self._udp_rtt_sockets
 
     def _next_udp_probe_seq(self) -> int:
         seq = int(getattr(self, "_udp_probe_seq", 0)) & 0xFFFFFFFFFFFFFFFF
@@ -200,91 +185,79 @@ class UdpProbeMixin:
                 break
         return src_ip
 
-    def _active_socket_count(self, sockets: list, attr_name: str, fallback_attr_name: str) -> int:
-        """Return the clamped number of sockets to use in this cycle."""
+    def _socket_batch(self, sockets: list, batch_index: int) -> list:
+        """Select the configured, non-overlapping source-port batch."""
         if not sockets:
-            return 0
-        requested = getattr(self, attr_name, getattr(self, fallback_attr_name, len(sockets)))
-        try:
-            requested_int = int(requested)
-        except (TypeError, ValueError):
-            requested_int = len(sockets)
-        return max(0, min(requested_int, len(sockets)))
-
-    def _select_rotating_sockets(self, sockets: list, active_count: int, cursor_attr: str) -> list:
-        """Select ``active_count`` sockets and advance a round-robin cursor."""
-        if active_count <= 0 or not sockets:
             return []
-        if active_count >= len(sockets):
-            return list(sockets)
-        cursor = int(getattr(self, cursor_attr, 0)) % len(sockets)
-        selected = [sockets[(cursor + offset) % len(sockets)] for offset in range(active_count)]
-        setattr(self, cursor_attr, (cursor + active_count) % len(sockets))
-        return selected
+        batch_size = max(1, int(self.rtt_ports_per_cycle))
+        batch_count = max(1, (len(sockets) + batch_size - 1) // batch_size)
+        start = (int(batch_index) % batch_count) * batch_size
+        return sockets[start : start + batch_size]
 
-    def _udp_fanout(
+    @staticmethod
+    def _new_probe_stats(probes: list[dict]) -> list[dict]:
+        return [{"sent": 0, "received": 0, "rtts": [], "mtu_drops": 0} for _probe in probes]
+
+    @staticmethod
+    def _drain_socket(sock: socket.socket) -> None:
+        """Discard replies left by a completed cycle before sockets are reused."""
+        while True:
+            try:
+                sock.recvfrom(65535)
+            except BlockingIOError:
+                return
+            except OSError:
+                return
+
+    @staticmethod
+    def _build_send_queue(probes: list[dict], rtt_sockets: list, enable_df: bool) -> list:
+        """Build a stable queue where each DF probe reuses one active RTT tuple."""
+        send_queue: list[tuple[str, int, socket.socket, str]] = []
+        for probe_index, probe in enumerate(probes):
+            dst_ip = str(probe.get("dst_ip") or "")
+            if not dst_ip:
+                continue
+            for _src_port, rtt_socket in rtt_sockets:
+                send_queue.append(("rtt", probe_index, rtt_socket, dst_ip))
+            if enable_df and rtt_sockets:
+                _src_port, df_socket = rtt_sockets[probe_index % len(rtt_sockets)]
+                send_queue.append(("df", probe_index, df_socket, dst_ip))
+        return send_queue
+
+    def _run_udp_cycle(
         self,
         probes: list[dict],
-        sockets: list,
-        payload_size: int,
-        timeout_s: float,
-    ) -> list[dict]:
-        """Fan out one payload per socket/probe pair and collect echoes."""
-        stats = [
-            {
-                "sent": 0,
-                "received": 0,
-                "rtts": [],
-                "mtu_drops": 0,
-            }
-            for _probe in probes
-        ]
-        if not probes or not sockets:
-            return stats
+        rtt_sockets: list,
+        enable_df: bool,
+    ) -> tuple[list[dict], list[dict]]:
+        """Schedule RTT and DF datagrams in one non-blocking event loop."""
+        rtt_stats = self._new_probe_stats(probes)
+        df_stats = self._new_probe_stats(probes)
+        active_sockets = [sock for _src_port, sock in rtt_sockets]
+        for sock in active_sockets:
+            self._drain_socket(sock)
 
-        payload_size = max(payload_size, _MIN_PAYLOAD_BYTES)
-        padding = b"\x00" * (payload_size - _HEADER_SIZE)
-        pending: dict[int, tuple[int, socket.socket, int]] = {}
-        socket_pending: dict[socket.socket, int] = {}
+        payloads = {
+            "rtt": b"\x00" * (max(_DEFAULT_RTT_PAYLOAD_BYTES, _MIN_PAYLOAD_BYTES) - _HEADER_SIZE),
+            "df": b"\x00" * (max(self.df_payload_size, _MIN_PAYLOAD_BYTES) - _HEADER_SIZE),
+        }
+        stats_by_kind = {"rtt": rtt_stats, "df": df_stats}
+        send_queue = self._build_send_queue(probes, rtt_sockets, enable_df)
 
-        for _src_port, sock in sockets:
-            for probe_index, probe in enumerate(probes):
-                dst_ip = probe.get("dst_ip")
-                if not dst_ip:
-                    continue
-                seq = self._next_udp_probe_seq()
-                send_time_ns = time.time_ns()
-                payload = struct.pack(_HEADER_FMT, send_time_ns, seq) + padding
-                try:
-                    sock.sendto(payload, (dst_ip, self.udp_dst_port))
-                    stats[probe_index]["sent"] += 1
-                    pending[seq] = (probe_index, sock, send_time_ns)
-                    socket_pending[sock] = socket_pending.get(sock, 0) + 1
-                except OSError as exc:
-                    # EMSGSIZE (errno 90) means the kernel's cached PMTU
-                    # cannot accommodate this packet with DF set; count it as
-                    # a sent-but-dropped probe because it is the MTU signal.
-                    if getattr(exc, "errno", None) == 90:
-                        stats[probe_index]["sent"] += 1
-                        stats[probe_index]["mtu_drops"] += 1
-                    else:
-                        logger.debug("sendto %s failed: %s", dst_ip, exc)
+        interval = max(0.001, float(self.interval))
+        cycle_started = time.monotonic()
+        cycle_deadline = cycle_started + interval
+        send_window = interval / 2.0
+        send_spacing = send_window / max(1, len(send_queue) - 1)
+        next_send_at = cycle_started
+        send_index = 0
+        pending: dict[int, tuple[str, int, int]] = {}
 
-        deadline = time.monotonic() + timeout_s
-        while pending and socket_pending:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                break
-            try:
-                readable, _, _ = select.select(list(socket_pending), [], [], remaining)
-            except (OSError, ValueError):
-                break
-            if not readable:
-                break
-            for sock in readable:
+        def drain_readable(readable: list[socket.socket]) -> None:
+            for readable_socket in readable:
                 while True:
                     try:
-                        data, _addr = sock.recvfrom(65535)
+                        data, _addr = readable_socket.recvfrom(65535)
                     except BlockingIOError:
                         break
                     except OSError as exc:
@@ -292,22 +265,49 @@ class UdpProbeMixin:
                         break
                     if len(data) < _HEADER_SIZE:
                         continue
-                    sent_ns, seq = struct.unpack(_HEADER_FMT, data[:_HEADER_SIZE])
+                    _payload_sent_ns, seq = struct.unpack(_HEADER_FMT, data[:_HEADER_SIZE])
                     pending_item = pending.pop(seq, None)
                     if pending_item is None:
                         continue
-                    probe_index, pending_sock, _send_time_ns = pending_item
-                    count = socket_pending.get(pending_sock, 0) - 1
-                    if count > 0:
-                        socket_pending[pending_sock] = count
-                    else:
-                        socket_pending.pop(pending_sock, None)
-                    rtt_ms = (time.time_ns() - sent_ns) / 1e6
+                    kind, probe_index, recorded_sent_ns = pending_item
+                    rtt_ms = (time.time_ns() - recorded_sent_ns) / 1e6
                     if rtt_ms >= 0:
-                        stats[probe_index]["received"] += 1
-                        stats[probe_index]["rtts"].append(rtt_ms)
+                        stats_by_kind[kind][probe_index]["received"] += 1
+                        stats_by_kind[kind][probe_index]["rtts"].append(rtt_ms)
 
-        return stats
+        while time.monotonic() < cycle_deadline and (send_index < len(send_queue) or pending):
+            now = time.monotonic()
+            if send_index < len(send_queue) and now >= next_send_at:
+                kind, probe_index, sock, dst_ip = send_queue[send_index]
+                seq = self._next_udp_probe_seq()
+                send_time_ns = time.time_ns()
+                payload = struct.pack(_HEADER_FMT, send_time_ns, seq) + payloads[kind]
+                stats = stats_by_kind[kind][probe_index]
+                try:
+                    sock.sendto(payload, (dst_ip, self.udp_dst_port))
+                    stats["sent"] += 1
+                    pending[seq] = (kind, probe_index, send_time_ns)
+                except OSError as exc:
+                    if getattr(exc, "errno", None) == 90:
+                        stats["sent"] += 1
+                        stats["mtu_drops"] += 1
+                    else:
+                        logger.debug("sendto %s failed: %s", dst_ip, exc)
+                send_index += 1
+                next_send_at = max(next_send_at + send_spacing, time.monotonic())
+
+            now = time.monotonic()
+            wake_at = min(next_send_at, cycle_deadline) if send_index < len(send_queue) else cycle_deadline
+            timeout = max(0.0, wake_at - now)
+            try:
+                readable, _, _ = select.select(active_sockets, [], [], timeout)
+            except (OSError, ValueError):
+                break
+            drain_readable(readable)
+
+        for sock in active_sockets:
+            self._drain_socket(sock)
+        return rtt_stats, df_stats
 
     def _rtt_result_from_stats(self, stats: dict, expected_sent: int) -> dict:
         sent = int(stats["sent"])
@@ -362,50 +362,25 @@ class UdpProbeMixin:
             "mtu_drops": mtu_drops,
         }
 
-    def udp_probe_cycle(self, probes: list[dict]) -> list[dict]:
+    def udp_probe_cycle(self, probes: list[dict], port_batch_index: int) -> list[dict]:
         """Probe all destinations once using persistent source-port sockets."""
         if not probes:
             return []
 
         src_ip = self._probe_bind_src_ip(probes)
-        rtt_sockets, df_sockets = self._ensure_udp_probe_sockets(
+        rtt_sockets = self._ensure_udp_probe_sockets(
             src_ip=src_ip,
             include_rtt=True,
-            include_df=bool(getattr(self, "enable_df_probe", True)),
         )
-        rtt_active_count = self._active_socket_count(rtt_sockets, "rtt_ports_per_cycle", "n_rtt_ports")
-        df_active_count = (
-            self._active_socket_count(df_sockets, "df_ports_per_cycle", "n_df_ports")
-            if getattr(self, "enable_df_probe", True)
-            else 0
-        )
-        active_rtt_sockets = self._select_rotating_sockets(
-            rtt_sockets,
-            rtt_active_count,
-            "_udp_rtt_socket_cursor",
-        )
-        active_df_sockets = self._select_rotating_sockets(
-            df_sockets,
-            df_active_count,
-            "_udp_df_socket_cursor",
-        )
+        active_rtt_sockets = self._socket_batch(rtt_sockets, port_batch_index)
+        enable_df = bool(getattr(self, "enable_df_probe", True))
 
         try:
-            rtt_stats = self._udp_fanout(
-                probes=probes,
-                sockets=active_rtt_sockets,
-                payload_size=_DEFAULT_RTT_PAYLOAD_BYTES,
-                timeout_s=self.burst_timeout_s,
+            rtt_stats, df_stats = self._run_udp_cycle(
+                probes,
+                active_rtt_sockets,
+                enable_df,
             )
-            if getattr(self, "enable_df_probe", True):
-                df_stats = self._udp_fanout(
-                    probes=probes,
-                    sockets=active_df_sockets,
-                    payload_size=self.df_payload_size,
-                    timeout_s=self.burst_timeout_s,
-                )
-            else:
-                df_stats = []
         except Exception as exc:
             logger.warning("UDP fanout probe cycle failed: %s", exc)
             return [{"success": False, "probe": probe, "error": str(exc)} for probe in probes]
@@ -415,16 +390,18 @@ class UdpProbeMixin:
             result = self._rtt_result_from_stats(rtt_stats[probe_index], len(active_rtt_sockets))
             result["rtt_ports_active"] = len(active_rtt_sockets)
             result["rtt_ports_total"] = len(rtt_sockets)
-            if getattr(self, "enable_df_probe", True):
-                df_result = self._df_result_from_stats(df_stats[probe_index], len(active_df_sockets))
+            result["port_batch_index"] = int(port_batch_index)
+            if enable_df:
+                expected_df_packets = 1 if active_rtt_sockets else 0
+                df_result = self._df_result_from_stats(df_stats[probe_index], expected_df_packets)
                 result["df_success"] = 1 if df_result.get("success") else 0
                 result["df_loss_pct"] = float(df_result.get("loss_pct", 100.0))
                 result["df_rtt_avg"] = float(df_result.get("rtt_avg", 0.0))
                 result["df_mtu_drops"] = int(df_result.get("mtu_drops", 0))
                 result["df_packets_sent"] = int(df_result.get("packets_sent", 0))
                 result["df_packets_lost"] = int(df_result.get("packets_lost", 0))
-                result["df_ports_active"] = len(active_df_sockets)
-                result["df_ports_total"] = len(df_sockets)
+                result["df_ports_active"] = expected_df_packets
+                result["df_ports_total"] = len(rtt_sockets)
             else:
                 result["df_success"] = 0
                 result["df_loss_pct"] = 0.0
@@ -436,49 +413,3 @@ class UdpProbeMixin:
                 result["df_ports_total"] = 0
             cycle_results.append({"success": True, "probe": probe, "result": result})
         return cycle_results
-
-    def udp_rtt_burst(self, dst_ip: str, src_ip: str = None) -> dict:
-        """Run an RTT-oriented UDP burst: many small DF packets across src_ports."""
-        try:
-            probe = {"src_ip": src_ip or "", "dst_ip": dst_ip}
-            rtt_sockets, _df_sockets = self._ensure_udp_probe_sockets(
-                src_ip=src_ip or "",
-                include_rtt=True,
-                include_df=False,
-            )
-            stats = self._udp_fanout(
-                probes=[probe],
-                sockets=rtt_sockets,
-                payload_size=_DEFAULT_RTT_PAYLOAD_BYTES,
-                timeout_s=self.burst_timeout_s,
-            )
-        except Exception as exc:
-            logger.warning("UDP RTT burst to %s failed: %s", dst_ip, exc)
-            return _empty_rtt_result(self.n_rtt_ports)
-
-        return self._rtt_result_from_stats(stats[0], self.n_rtt_ports)
-
-    def udp_df_burst(self, dst_ip: str, src_ip: str = None) -> dict:
-        """Run a DF-oriented UDP burst: a few large DF packets across src_ports.
-
-        A failure rate >0 here indicates either path packet loss OR an
-        MTU mismatch on at least one ECMP path between src and dst.
-        """
-        try:
-            probe = {"src_ip": src_ip or "", "dst_ip": dst_ip}
-            _rtt_sockets, df_sockets = self._ensure_udp_probe_sockets(
-                src_ip=src_ip or "",
-                include_rtt=False,
-                include_df=True,
-            )
-            stats = self._udp_fanout(
-                probes=[probe],
-                sockets=df_sockets,
-                payload_size=self.df_payload_size,
-                timeout_s=self.burst_timeout_s,
-            )
-        except Exception as exc:
-            logger.warning("UDP DF burst to %s failed: %s", dst_ip, exc)
-            return _empty_df_result(self.n_df_ports)
-
-        return self._df_result_from_stats(stats[0], self.n_df_ports)

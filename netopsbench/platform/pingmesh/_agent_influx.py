@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
-try:
-    from ._agent_support import logger, queue, requests, time
-except ImportError:
-    from _agent_support import logger, queue, requests, time
+import queue
+import time
+
+import requests
+
+from netopsbench.logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 class PingInfluxMixin:
@@ -48,6 +52,11 @@ class PingInfluxMixin:
                 f"packet_loss={result['loss_pct']}",
                 f"rtt_ports_active={int(result.get('rtt_ports_active', result.get('packets_sent', 0)))}i",
                 f"rtt_ports_total={int(result.get('rtt_ports_total', result.get('packets_sent', 0)))}i",
+                f"probe_cycle={int(result.get('probe_cycle', 0))}i",
+                f"destination_batch_index={int(result.get('destination_batch_index', 0))}i",
+                f"port_batch_index={int(result.get('port_batch_index', 0))}i",
+                f"coverage_epoch={int(result.get('coverage_epoch', 0))}i",
+                f"coverage_epoch_cycles={int(result.get('coverage_epoch_cycles', 1))}i",
                 f"df_success={int(result.get('df_success', 0))}i",
                 f"df_loss_pct={result.get('df_loss_pct', 0.0)}",
                 f"df_rtt_avg={result.get('df_rtt_avg', 0.0)}",
