@@ -7,28 +7,35 @@ These tests verify the complete benchmark flow works correctly.
 
 import json
 import os
+import stat
 import sys
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import yaml
 
 # Add parent directory to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from netopsbench.evaluator.scorer import AgentOutput, EvaluationResult, Evaluator
+from netopsbench.models.profiles import supported_scales
+from netopsbench.models.topology import TopologyManifest
 from netopsbench.platform.faults.injector import FaultInjector
-from netopsbench.platform.faults.specs import get_builtin_fault_specs
-from netopsbench.platform.pingmesh.generator import PinglistGenerator
+from netopsbench.platform.faults.services.topology_runtime import TopologyRuntime
+from netopsbench.platform.faults.specs import create_fault_registry
+from netopsbench.platform.pingmesh.generator import PinglistGenerator, generate_pinglist_from_topology
+from netopsbench.platform.scenario.generator import parse_bgp_config, parse_network_interfaces
 from netopsbench.platform.scenario.parser import parse_scenario_file
 from netopsbench.platform.scenario.validator import validate_scenario, validate_scenario_topology
-from netopsbench.platform.session.scoring import resolve_scenario_files, score_scenario_fault_episodes
+from netopsbench.platform.session.scoring import score_scenario_fault_episodes
 from netopsbench.platform.toolkit import fastmcp_server
 from netopsbench.platform.toolkit.mcp.registry import load_tool_specs
 
 # Internal test path: direct toolkit import keeps implementation-level e2e checks fast.
 from netopsbench.platform.toolkit.toolkit import AgentToolkit, ToolResult
-from netopsbench.platform.topology.generator import TOPOLOGY_SCALES, generate_topology
+from netopsbench.platform.topology.generator import generate_topology
 from netopsbench.platform.utils.interface_names import are_interfaces_equivalent
 
 
@@ -42,56 +49,169 @@ def _generated_scenario_path(filename: str) -> str:
     return str(matches[0])
 
 
-class TestTopologyGenerator:
+def _write_config_db(topology_dir: str | Path, device: str, interfaces: dict[str, list[str]]) -> Path:
+    interface_table: dict[str, dict] = {}
+    for interface_name, cidrs in interfaces.items():
+        interface_table[interface_name] = {}
+        for cidr in cidrs:
+            interface_table[f"{interface_name}|{cidr}"] = {}
+
+    path = Path(topology_dir) / "configs" / "sonic" / device / "config_db.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"INTERFACE": interface_table}), encoding="utf-8")
+    return path
+
+
+def _generated_metadata(scale: str = "xs") -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        return generate_topology(scale, tmpdir)["metadata"]
+
+
+class TestTopologyGeneration:
     """Tests for topology generation."""
 
-    def test_topology_scales_defined(self):
-        """Test that all expected topology scales are defined."""
-        expected_scales = ["xs", "small", "medium", "large"]
-        for scale in expected_scales:
-            assert scale in TOPOLOGY_SCALES, f"Scale {scale} not defined"
-
-    def test_generate_xs_topology(self):
-        """Test generating an xs topology."""
+    @pytest.mark.parametrize("scale", supported_scales())
+    def test_all_scales_use_bind_based_preseed_artifacts(self, scale):
+        """Every scale should use the same bind-mounted SONiC startup artifact path."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = generate_topology("xs", tmpdir)
+            result = generate_topology(scale, tmpdir)
+            rendered = yaml.safe_load(Path(result["yaml_file"]).read_text(encoding="utf-8"))
 
-            assert os.path.exists(result["yaml_file"]), "YAML file not created"
-            assert os.path.exists(result["metadata_file"]), "Metadata file not created"
-            assert len(result["config_files"]) == 4, "Expected 4 config files (2 spines + 2 leafs)"
+            binds = rendered["topology"]["kinds"]["sonic-vs"]["binds"]
+            linux_binds = rendered["topology"]["kinds"]["linux"]["binds"]
+            assert "configs/sonic/__clabNodeName__/config_db.json:/etc/sonic/config_db.json:rw" in binds
+            assert (
+                "configs/sonic/__clabNodeName__/port_config.ini:"
+                "/usr/share/sonic/device/x86_64-kvm_x86_64-r0/Force10-S6000/port_config.ini:rw"
+            ) in binds
+            assert (
+                "configs/sonic/__clabNodeName__/lanemap.ini:"
+                "/usr/share/sonic/device/x86_64-kvm_x86_64-r0/Force10-S6000/lanemap.ini:rw"
+            ) in binds
+            assert "configs/sonic/start.sh:/usr/bin/start.sh:ro" in binds
+            assert "configs/frr/__clabNodeName__.conf:/etc/frr/frr.conf:rw" in binds
+            assert "configs/pingmesh:/tmp/pingmesh:ro" in linux_binds
 
-            # Verify metadata
-            metadata = result["metadata"]
-            assert metadata["scale"]["num_spines"] == 2
-            assert metadata["scale"]["num_leafs"] == 2
-            assert metadata["scale"]["clients_per_leaf"] == 1
-            assert metadata["scale"]["total_clients"] == 2
+            assert not list(Path(tmpdir, "configs").glob("*.sh"))
+            assert not list(Path(tmpdir, "configs").glob("*.configdb.json"))
+            assert Path(tmpdir, "configs", "pingmesh").is_dir()
 
-            rendered_yaml = Path(result["yaml_file"]).read_text(encoding="utf-8")
-            assert "yyyyyt123/netopsbench-sonic-vs-202505-telemetry:202505-telemetry" in rendered_yaml
+            manifest = TopologyManifest.model_validate(result["metadata"])
+            first_routing = manifest.routing_devices()[0].name
+            first_attached = manifest.client_attached_devices()[0].name
+            first_routing_config = Path(tmpdir, "configs", "sonic", first_routing, "config_db.json")
+            first_attached_config = Path(tmpdir, "configs", "sonic", first_attached, "config_db.json")
+            assert first_routing_config.exists()
+            assert first_attached_config.exists()
+            assert Path(tmpdir, "configs", "sonic", first_routing, "port_config.ini").exists()
+            assert Path(tmpdir, "configs", "sonic", first_routing, "lanemap.ini").exists()
+            start_wrapper = Path(tmpdir, "configs", "sonic", "start.sh")
+            assert start_wrapper.exists()
+            assert start_wrapper.stat().st_mode & stat.S_IXUSR
+            wrapper_text = start_wrapper.read_text(encoding="utf-8")
+            assert (
+                "NETOPSBENCH_ORIGINAL_SONIC_START_SHA256="
+                "8c5aa959f0a3ed0bf1a57f7ecfd004485d5600b9ab71b388c2b15e109b77ee12"
+            ) in wrapper_text
+            assert "wait_for_front_panel_links" in wrapper_text
+            assert "/sys/class/net/eth[0-9]*" in wrapper_text
+            assert "ip link show" not in wrapper_text
+            assert "local timeout=600" in wrapper_text
+            assert "local interval=1" in wrapper_text
+            assert "install_generated_config_db" in wrapper_text
+            assert 'cat "$src" > "$dst"' in wrapper_text
+            assert Path(tmpdir, "configs", "frr", f"{first_routing}.conf").exists()
+
+            routing_config = json.loads(first_routing_config.read_text(encoding="utf-8"))
+            assert routing_config["DEVICE_METADATA"]["localhost"]["platform"] == "x86_64-kvm_x86_64-r0"
+            assert routing_config["DEVICE_METADATA"]["localhost"]["mac"].startswith("02:")
+            assert routing_config["PORT"]
+            assert routing_config["INTERFACE"]
+            assert str(first_routing_config) in result["config_files"]
+
+            attached_config = json.loads(first_attached_config.read_text(encoding="utf-8"))
+            assert (
+                attached_config["DEVICE_METADATA"]["localhost"]["mac"]
+                != routing_config["DEVICE_METADATA"]["localhost"]["mac"]
+            )
+            assert attached_config["PORT"]
+            assert str(first_attached_config) in result["config_files"]
 
     def test_generated_switch_configs_seed_gnmi_defaults(self):
-        """Generated SONiC configs should seed the GNMI config expected by 202505 images."""
+        """Generated SONiC startup configs should seed telemetry tables expected by 202505 images."""
         with tempfile.TemporaryDirectory() as tmpdir:
             result = generate_topology("xs", tmpdir)
 
             for config_path in result["config_files"]:
-                text = Path(config_path).read_text(encoding="utf-8")
-                assert "sonic-db-cli CONFIG_DB hmset 'GNMI|gnmi' port 50051" in text
-                assert "sonic-db-cli CONFIG_DB hmset 'GNMI|certs'" in text
-                assert "pgrep -x telemetry" in text
-                assert "/usr/sbin/telemetry -port 50051 -noTLS -client_auth none" in text
+                payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+                assert payload["GNMI"]["gnmi"]["port"] == "50051"
+                assert payload["GNMI"]["gnmi"]["client_auth"] == "false"
+                assert payload["GNMI"]["certs"]["server_key"].endswith("streamingtelemetryserver.key")
+                assert payload["FLEX_COUNTER_TABLE"]["PORT"]["FLEX_COUNTER_STATUS"] == "enable"
+                assert payload["FLEX_COUNTER_TABLE"]["PORT"]["POLL_INTERVAL"] == "10000"
+                assert "telegraf" in payload["SYSLOG_SERVER"]
 
-    def test_generate_small_topology(self):
-        """Test generating a small topology."""
+    def test_generate_xlarge_topology_metadata_and_addressing(self):
+        """xlarge should fit the Clos address plans and avoid collector collisions."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            result = generate_topology("small", tmpdir)
+            result = generate_topology("xlarge", tmpdir)
 
-            metadata = result["metadata"]
-            assert metadata["scale"]["num_spines"] == 2
-            assert metadata["scale"]["num_leafs"] == 4
-            assert metadata["scale"]["clients_per_leaf"] == 2
-            assert metadata["scale"]["total_clients"] == 8
+            metadata = result["agent_topology"]
+            devices = metadata["devices"]
+            assert metadata["topology_scale"] == "xlarge"
+            assert metadata["management"]["ipv4_subnet"] == "172.20.20.0/23"
+            assert metadata["scale"]["num_spines"] == 16
+            assert metadata["scale"]["num_leafs"] == 128
+            assert metadata["scale"]["clients_per_leaf"] == 1
+            assert metadata["scale"]["total_clients"] == 128
+            assert metadata["pingmesh"]["destination_batch_size"] == 16
+
+            mgmt_ips = {item["mgmt_ip"] for role in ("spines", "leafs", "clients") for item in devices[role]}
+            assert len(mgmt_ips) == 16 + 128 + 128
+            assert metadata["collector"]["ipv4"] not in mgmt_ips
+
+            spine16_config = json.loads(
+                Path(tmpdir, "configs", "sonic", "spine16", "config_db.json").read_text(encoding="utf-8")
+            )
+            leaf128_config = json.loads(
+                Path(tmpdir, "configs", "sonic", "leaf128", "config_db.json").read_text(encoding="utf-8")
+            )
+            spine16_ports = Path(tmpdir, "configs", "sonic", "spine16", "port_config.ini").read_text(encoding="utf-8")
+            spine16_lanemap = Path(tmpdir, "configs", "sonic", "spine16", "lanemap.ini").read_text(encoding="utf-8")
+            leaf128_frr = Path(tmpdir, "configs", "frr", "leaf128.conf").read_text(encoding="utf-8")
+            spine16_frr = Path(tmpdir, "configs", "frr", "spine16.conf").read_text(encoding="utf-8")
+
+            assert not Path(tmpdir, "configs", "spine16.sh").exists()
+            assert not Path(tmpdir, "configs", "spine16.configdb.json").exists()
+            assert "neighbor 10.16.128.2 remote-as 65138" in spine16_frr
+            assert "bgp bestpath as-path multipath-relax" in spine16_frr
+            assert "maximum-paths 64" in leaf128_frr
+            assert len([key for key in spine16_config["INTERFACE"] if "|" not in key]) == 128
+            assert spine16_config["INTERFACE"]["Ethernet508"] == {}
+            assert spine16_config["INTERFACE"]["Ethernet508|10.16.128.1/30"] == {}
+            assert spine16_config["PORT"]["Ethernet508"]["lanes"] == "509,510,511,512"
+            assert "Ethernet508" in spine16_ports
+            assert "eth1:1,2,3,4" in spine16_lanemap
+            assert "eth128:509,510,511,512" in spine16_lanemap
+            assert len([line for line in spine16_lanemap.splitlines() if line.startswith("eth")]) == 128
+            assert len([key for key in leaf128_config["INTERFACE"] if "|" not in key]) == 17
+            assert leaf128_config["INTERFACE"]["Ethernet60|10.16.128.2/30"] == {}
+            assert leaf128_config["INTERFACE"]["Ethernet64|192.168.228.1/30"] == {}
+            assert "network 192.168.228.0/30 route-map RM-ALLOW" in leaf128_frr
+            leaf128_lanemap = Path(tmpdir, "configs", "sonic", "leaf128", "lanemap.ini").read_text(encoding="utf-8")
+            assert len([line for line in leaf128_lanemap.splitlines() if line.startswith("eth")]) == 17
+
+    def test_structured_startup_artifacts_drive_scenario_parsers(self):
+        """Scenario parsers should use generated ConfigDB and FRR artifacts as the normal path."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_topology("xs", tmpdir)
+            spine_cfg = Path(tmpdir, "configs", "sonic", "spine1", "config_db.json")
+            spine_frr = Path(tmpdir, "configs", "frr", "spine1.conf")
+
+            assert parse_network_interfaces(spine_cfg) == ["Ethernet0", "Ethernet4"]
+            bgp_info = parse_bgp_config(spine_frr)
+            assert bgp_info["local_as"] == 65001
+            assert [neighbor["remote_as"] for neighbor in bgp_info["neighbors"]] == [65011, 65012]
 
 
 class TestAgentToolkit:
@@ -103,7 +223,6 @@ class TestAgentToolkit:
             topo = generate_topology("xs", tmpdir)
             toolkit = AgentToolkit(topology_metadata=topo["metadata"])
             assert toolkit is not None
-            assert toolkit.grafana_url is not None
             assert toolkit.influxdb_url is not None
 
     def test_tool_registry_specs_complete(self):
@@ -143,23 +262,11 @@ class TestAgentToolkit:
             assert "leaf1" in toolkit.container_names
             assert "client1" in toolkit.container_names
 
-    def test_reload_topology(self):
-        """Test toolkit can reload topology at runtime."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Generate topology
-            result = generate_topology("xs", tmpdir)
-
-            toolkit = AgentToolkit(topology_metadata=result["metadata"])
-            reload_result = toolkit.reload_topology(metadata_file=result["metadata_file"])
-
-            assert reload_result.success is True
-            assert reload_result.data["topology_name"] == "dcn"
-
 
 class TestPingmeshGenerator:
     """Tests for Pingmesh pinglist generation across topology scales."""
 
-    @pytest.mark.parametrize("scale", list(TOPOLOGY_SCALES.keys()))
+    @pytest.mark.parametrize("scale", supported_scales())
     def test_pinglist_scales_with_topology(self, scale):
         """Pinglist should be N*(N-1) for N clients across all scales."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -169,10 +276,36 @@ class TestPingmeshGenerator:
             generator = PinglistGenerator()
             tasks = generator.generate(metadata)
 
-            total_clients = metadata["scale"]["total_clients"]
+            total_clients = TopologyManifest.model_validate(metadata).facts.total_clients
             assert len(tasks) == total_clients * (total_clients - 1)
             assert all(t.src_name != t.dst_name for t in tasks)
             assert {t.path_type for t in tasks}.issubset({"same_rack", "cross_rack"})
+
+    def test_xlarge_pinglist_uses_full_universe_with_bounded_runtime_policy(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            result = generate_topology("xlarge", tmpdir)
+            output_file = Path(tmpdir) / "pinglist.json"
+
+            first = generate_pinglist_from_topology(result["metadata_file"], str(output_file))
+            second = generate_pinglist_from_topology(result["metadata_file"], str(output_file))
+
+            assert [(task.src_name, task.dst_name) for task in first] == [
+                (task.src_name, task.dst_name) for task in second
+            ]
+            assert len(first) == 128 * 127
+            per_src: dict[str, int] = {}
+            per_dst: dict[str, int] = {}
+            for task in first:
+                per_src[task.src_name] = per_src.get(task.src_name, 0) + 1
+                per_dst[task.dst_name] = per_dst.get(task.dst_name, 0) + 1
+                assert task.src_name != task.dst_name
+            assert set(per_src.values()) == {127}
+            assert set(per_dst.values()) == {127}
+
+            payload = json.loads(output_file.read_text(encoding="utf-8"))
+            assert payload["total_probes"] == 128 * 127
+            assert payload["pingmesh_policy"]["destination_batch_size"] == 16
+            assert payload["pingmesh_policy"]["coverage_epoch_cycles"] == 32
 
 
 class TestFastMCPServer:
@@ -188,6 +321,7 @@ class TestFastMCPServer:
             "get_topology",
             "get_device_interfaces",
             "get_bgp_neighbors",
+            "get_bgp_neighbor",
             "get_route_table",
             "get_device_config",
             "get_bgp_rib",
@@ -196,7 +330,7 @@ class TestFastMCPServer:
             "traceroute",
             "ping_test",
             "get_interface_metrics",
-            "get_all_bgp_status",
+            "query_bgp_events",
             "get_pingmesh_summary",
             "get_pingmesh_hotspots",
         ]
@@ -219,12 +353,10 @@ class TestFaultInjector:
 
     def test_injector_initialization(self):
         """Test fault injector initializes correctly."""
-        injector = FaultInjector(
-            topology_metadata={"name": "dcn", "devices": {"spines": [], "leafs": [], "clients": []}}
-        )
+        injector = FaultInjector(topology_metadata=_generated_metadata())
         assert injector is not None
         assert injector.topology_name == "dcn"
-        assert injector.container_names == {}
+        assert injector.container_names["spine1"] == "clab-dcn-spine1"
         assert injector.active_faults == []
 
     def test_injector_loads_dynamic_topology(self):
@@ -237,18 +369,6 @@ class TestFaultInjector:
 
             assert "spine1" in injector.container_names
             assert "leaf1" in injector.container_names
-
-    def test_reload_topology(self):
-        """Test injector can reload topology at runtime."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            result = generate_topology("xs", tmpdir)
-
-            injector = FaultInjector(
-                topology_metadata={"name": "dcn", "devices": {"spines": [], "leafs": [], "clients": []}}
-            )
-            reload_result = injector.reload_topology(metadata_file=result["metadata_file"])
-
-            assert reload_result["success"] is True
 
     def test_fault_types_defined(self):
         """Test all expected fault types are defined."""
@@ -266,12 +386,12 @@ class TestFaultInjector:
             "static_route_misconfig",
         ]
 
-        defined_faults = [spec.name for spec in get_builtin_fault_specs()]
+        defined_faults = [spec.name for spec in create_fault_registry().get_builtin_specs()]
         for fault in expected_faults:
             assert fault in defined_faults, f"Fault type {fault} not defined"
 
     def test_inject_high_latency_uses_latency_ms_contract(self):
-        injector = FaultInjector(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+        injector = FaultInjector(topology_metadata=_generated_metadata())
 
         class FakeImpairment:
             def __init__(self):
@@ -290,7 +410,7 @@ class TestFaultInjector:
         assert fake.calls == [("leaf1", "Ethernet0", 120)]
 
     def test_inject_mtu_mismatch_uses_mtu_contract(self):
-        injector = FaultInjector(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+        injector = FaultInjector(topology_metadata=_generated_metadata())
 
         class FakeImpairment:
             def __init__(self):
@@ -309,7 +429,7 @@ class TestFaultInjector:
         assert fake.calls == [("leaf1", "Ethernet0", 1450)]
 
     def test_inject_packet_corruption_uses_corruption_pct_contract(self):
-        injector = FaultInjector(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+        injector = FaultInjector(topology_metadata=_generated_metadata())
 
         class FakeImpairment:
             def __init__(self):
@@ -328,7 +448,7 @@ class TestFaultInjector:
         assert fake.calls == [("leaf1", "Ethernet0", 17)]
 
     def test_inject_packet_loss_uses_loss_pct_contract(self):
-        injector = FaultInjector(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+        injector = FaultInjector(topology_metadata=_generated_metadata())
 
         class FakeImpairment:
             def __init__(self):
@@ -347,7 +467,7 @@ class TestFaultInjector:
         assert fake.calls == [("leaf1", "Ethernet0", 11)]
 
     def test_injector_interface_alias_resolution_supports_vendor_style(self):
-        injector = FaultInjector(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+        injector = FaultInjector(topology_metadata=_generated_metadata())
         assert injector._iface.resolve_linux("ethernet-1/2") == "eth2"
         assert injector._iface.resolve_sonic("ethernet-1/2") == "Ethernet4"
 
@@ -657,40 +777,12 @@ episodes:
         assert scored[0].testcase_id == f"{scenario.scenario_id}:ep002_link_down"
         assert scored[0].score == 1.0
 
-    def test_resolve_scenario_files_from_directory(self):
-        """Scenario file resolver should return sorted YAML files by pattern."""
-        with tempfile.TemporaryDirectory() as tmpdir:
-            p1 = os.path.join(tmpdir, "scenario_02.yaml")
-            p2 = os.path.join(tmpdir, "scenario_01.yaml")
-            p3 = os.path.join(tmpdir, "note.txt")
-            for path in [p1, p2, p3]:
-                with open(path, "w") as f:
-                    f.write("test")
-
-            files = resolve_scenario_files(tmpdir)
-            assert files == sorted([p1, p2])
-
     def test_topology_guard_rejects_scale_mismatch_by_default(self):
         """Strict topology guard should fail on declared/actual scale mismatch."""
         scenario = parse_scenario_file(_generated_scenario_path("generated_link_down_xs_001.yaml"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            metadata = {
-                "name": "dcn",
-                "scale": {"total_clients": 8},
-                "devices": {
-                    "spines": [{"name": "spine1"}, {"name": "spine2"}],
-                    "leafs": [{"name": "leaf1"}, {"name": "leaf2"}],
-                    "clients": [{"name": "client1"}, {"name": "client2"}],
-                },
-            }
-
-            with open(os.path.join(tmpdir, "topology.json"), "w") as f:
-                json.dump(metadata, f)
-
-            os.makedirs(os.path.join(tmpdir, "configs"), exist_ok=True)
-            with open(os.path.join(tmpdir, "configs", "spine1.sh"), "w") as f:
-                f.write("config interface startup Ethernet0\n")
+            generate_topology("small", tmpdir)
 
             result = validate_scenario_topology(
                 scenario=scenario,
@@ -702,26 +794,13 @@ episodes:
             assert result["actual_scale"] == "small"
 
     def test_topology_guard_accepts_e_style_interface_aliases(self):
-        """Legacy e1-1 style interface labels should map to SONiC Ethernet ports."""
+        """e1-1 style interface labels should map to SONiC Ethernet ports."""
         scenario = parse_scenario_file(_generated_scenario_path("generated_link_down_medium_001.yaml"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            metadata = {
-                "name": "dcn",
-                "scale": {"total_clients": 16},
-                "devices": {
-                    "spines": [{"name": f"spine{i}"} for i in range(1, 5)],
-                    "leafs": [{"name": f"leaf{i}"} for i in range(1, 9)],
-                    "clients": [{"name": f"client{i}"} for i in range(1, 17)],
-                },
-            }
+            generate_topology("medium", tmpdir)
 
-            with open(os.path.join(tmpdir, "topology.json"), "w") as f:
-                json.dump(metadata, f)
-
-            os.makedirs(os.path.join(tmpdir, "configs"), exist_ok=True)
-            with open(os.path.join(tmpdir, "configs", "spine1.sh"), "w") as f:
-                f.write("config interface startup Ethernet0\n")
+            _write_config_db(tmpdir, "spine1", {"Ethernet0": []})
 
             result = validate_scenario_topology(
                 scenario=scenario,
@@ -735,24 +814,10 @@ episodes:
         scenario = parse_scenario_file(_generated_scenario_path("generated_link_down_small_001.yaml"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            metadata = {
-                "name": "dcn",
-                "scale": {"total_clients": 8},
-                "devices": {
-                    "spines": [{"name": "spine1"}, {"name": "spine2"}],
-                    "leafs": [{"name": f"leaf{i}"} for i in range(1, 5)],
-                    "clients": [{"name": f"client{i}"} for i in range(1, 9)],
-                },
-            }
+            generate_topology("small", tmpdir)
 
-            with open(os.path.join(tmpdir, "topology.json"), "w") as f:
-                json.dump(metadata, f)
-
-            os.makedirs(os.path.join(tmpdir, "configs"), exist_ok=True)
-            with open(os.path.join(tmpdir, "configs", "spine1.sh"), "w") as f:
-                f.write("config interface startup Ethernet0\n")
-            with open(os.path.join(tmpdir, "configs", "spine2.sh"), "w") as f:
-                f.write("config interface startup Ethernet4\n")
+            _write_config_db(tmpdir, "spine1", {"Ethernet0": []})
+            _write_config_db(tmpdir, "spine2", {"Ethernet4": []})
 
             result = validate_scenario_topology(
                 scenario=scenario,
@@ -760,6 +825,44 @@ episodes:
             )
 
             assert result["status"] == "pass"
+
+    def test_configdb_payload_interfaces_are_used_by_runtime_helpers(self):
+        """Runtime helpers read interface metadata from generated ConfigDB artifacts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            generate_topology("small", tmpdir)
+            spine_config = _write_config_db(tmpdir, "spine1", {"Ethernet4": ["10.0.0.2/30"]})
+            _write_config_db(tmpdir, "leaf1", {"Ethernet4": ["10.0.0.1/30"]})
+
+            scenario = SimpleNamespace(
+                scenario_id="configdb_interface_case",
+                topology_scale="small",
+                episodes=[
+                    SimpleNamespace(
+                        episode_id="ep001",
+                        fault_type="link_down",
+                        target_device="spine1",
+                        target_interface="e1-2",
+                    )
+                ],
+            )
+            result = validate_scenario_topology(scenario=scenario, topology_dir=tmpdir)
+            assert result["status"] == "pass"
+            assert parse_network_interfaces(spine_config) == ["Ethernet4"]
+
+            topo_runtime = TopologyRuntime(
+                sonic=SimpleNamespace(),
+                iface=SimpleNamespace(resolve_sonic=lambda interface: interface),
+                ctx=SimpleNamespace(clab_dir=Path(tmpdir), clients=[]),
+            )
+            assert topo_runtime.configured_device_interfaces("spine1") == ["Ethernet4"]
+
+            from netopsbench.platform.session.scoring import build_episode_ground_truth
+
+            ground_truth = build_episode_ground_truth(
+                {"fault_type": "link_down", "target_device": "leaf1", "target_interface": "Ethernet4"},
+                topology_dir=tmpdir,
+            )
+            assert ground_truth["equivalent_locations"] == [{"device": "spine1", "interface": "Ethernet4"}]
 
     def test_interface_alias_helper_keeps_scale_agnostic_equivalence(self):
         assert are_interfaces_equivalent("e1-1", "Ethernet0") is True
@@ -791,11 +894,8 @@ episodes:
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.makedirs(os.path.join(tmpdir, "configs"), exist_ok=True)
-            with open(os.path.join(tmpdir, "configs", "spine1.sh"), "w") as f:
-                f.write("config interface ip add Ethernet0 192.168.11.1/30\n")
-            with open(os.path.join(tmpdir, "configs", "leaf1.sh"), "w") as f:
-                f.write("config interface ip add Ethernet0 192.168.11.2/30\n")
+            _write_config_db(tmpdir, "spine1", {"Ethernet0": ["192.168.11.1/30"]})
+            _write_config_db(tmpdir, "leaf1", {"Ethernet0": ["192.168.11.2/30"]})
 
             scored = score_scenario_fault_episodes(
                 scenario,
@@ -822,12 +922,9 @@ episodes:
         }
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            os.makedirs(os.path.join(tmpdir, "configs"), exist_ok=True)
             # leaf1 Ethernet0 and spine1 Ethernet0 share the same /30 subnet
-            with open(os.path.join(tmpdir, "configs", "leaf1.sh"), "w") as f:
-                f.write("config interface ip add Ethernet0 10.0.0.1/30\n")
-            with open(os.path.join(tmpdir, "configs", "spine1.sh"), "w") as f:
-                f.write("config interface ip add Ethernet0 10.0.0.2/30\n")
+            _write_config_db(tmpdir, "leaf1", {"Ethernet0": ["10.0.0.1/30"]})
+            _write_config_db(tmpdir, "spine1", {"Ethernet0": ["10.0.0.2/30"]})
 
             gt = build_episode_ground_truth(episode_info, topology_dir=tmpdir)
 

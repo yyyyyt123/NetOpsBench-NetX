@@ -1,0 +1,57 @@
+"""CLI boundary for Python-owned worker deployment."""
+
+from __future__ import annotations
+
+import argparse
+from collections.abc import Sequence
+
+from netopsbench.platform.runtime.deployment import (
+    deploy_worker_lab,
+    teardown_worker_lab,
+    worker_from_cli,
+    worker_from_topology,
+)
+from netopsbench.platform.runtime.lifecycle import (
+    ensure_worker_observability,
+    ensure_worker_pingmesh,
+    validate_worker_health,
+)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="Deploy or teardown one NetOpsBench worker")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    deploy = subparsers.add_parser("deploy")
+    deploy.add_argument("scale")
+    deploy.add_argument("topology_dir")
+    deploy.add_argument("lab_name")
+    deploy.add_argument("mgmt_subnet")
+    deploy.add_argument("bucket", nargs="?", default="netopsbench")
+    deploy.add_argument("--mgmt-network")
+    teardown = subparsers.add_parser("teardown")
+    teardown.add_argument("topology_dir")
+    args = parser.parse_args(argv)
+    if args.command == "teardown":
+        teardown_worker_lab(worker_from_topology(args.topology_dir))
+        return 0
+
+    worker = worker_from_cli(
+        scale=args.scale,
+        topology_dir=args.topology_dir,
+        lab_name=args.lab_name,
+        mgmt_subnet=args.mgmt_subnet,
+        bucket=args.bucket,
+        mgmt_network=args.mgmt_network,
+    )
+    deploy_worker_lab(worker, args.scale)
+    ensure_worker_observability(worker)
+    ensure_worker_pingmesh(worker)
+    validate_worker_health(worker)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+
+
+__all__ = ["main"]

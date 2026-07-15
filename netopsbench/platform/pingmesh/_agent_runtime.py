@@ -2,10 +2,17 @@
 
 from __future__ import annotations
 
-try:
-    from ._agent_support import logger, time
-except ImportError:
-    from _agent_support import logger, time
+import time
+
+from netopsbench.logging_utils import get_logger
+
+logger = get_logger(__name__)
+
+
+def _next_cycle_deadline(previous_deadline: float, target_interval: float, now: float) -> float:
+    """Advance a fixed-rate cadence while avoiding unbounded catch-up bursts."""
+    deadline = previous_deadline + target_interval
+    return now if deadline < now - target_interval else deadline
 
 
 class PingRuntimeMixin:
@@ -25,12 +32,17 @@ class PingRuntimeMixin:
         if startup_jitter > 0:
             logger.info("  Startup jitter sleep: %.3fs", startup_jitter)
             time.sleep(startup_jitter)
+        next_cycle_at = time.monotonic()
         while True:
-            start = time.time()
+            start = time.monotonic()
             completed = 0
             failed = 0
             try:
-                cycle_results = self.udp_probe_cycle(self.tasks)
+                tasks, cycle_metadata = self.next_probe_batch()
+                cycle_results = self.udp_probe_cycle(tasks, cycle_metadata["port_batch_index"])
+                for item in cycle_results:
+                    if item.get("success") and isinstance(item.get("result"), dict):
+                        item["result"].update(cycle_metadata)
             except Exception as exc:
                 logger.warning("Unexpected probe cycle error: %s", exc)
                 cycle_results = []
@@ -57,9 +69,11 @@ class PingRuntimeMixin:
                         item.get("error", "unknown error"),
                     )
                     failed += 1
-            elapsed = time.time() - start
+            elapsed = time.monotonic() - start
             target_interval = min(max(self.min_interval, elapsed * 1.5), self.max_interval)
-            sleep_time = max(0, target_interval - elapsed)
+            now = time.monotonic()
+            next_cycle_at = _next_cycle_deadline(next_cycle_at, target_interval, now)
+            sleep_time = max(0, next_cycle_at - now)
             logger.info(
                 "Cycle complete: %s succeeded, %s failed, %.1fs elapsed, sleeping %.1fs",
                 completed,

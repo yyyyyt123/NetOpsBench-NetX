@@ -60,7 +60,13 @@ class _FakeEvaluator:
 
 
 def _install_real_runtime_mocks(monkeypatch):
+    import netopsbench.platform.session.diagnosis as diagnosis_mod
+    import netopsbench.platform.session.dispatch as dispatch_mod
     import netopsbench.platform.session.orchestrator as sessions_mod
+
+    class FakeToolkit:
+        def set_pingmesh_time_window(self, start_time, end_time):
+            self.pingmesh_window = (start_time, end_time)
 
     class FakeScenarioExecutor:
         def __init__(
@@ -75,6 +81,8 @@ def _install_real_runtime_mocks(monkeypatch):
             influxdb_org=None,
             influxdb_bucket=None,
             topology_id=None,
+            persist_results=True,
+            fault_registry=None,
         ):
             self.topology_dir = topology_dir
             self.topology_metadata = topology_metadata
@@ -111,19 +119,28 @@ def _install_real_runtime_mocks(monkeypatch):
                 ],
             }
 
-    monkeypatch.setattr(sessions_mod, "ScenarioExecutor", FakeScenarioExecutor)
-    monkeypatch.setattr(sessions_mod, "Evaluator", _FakeEvaluator)
-    monkeypatch.setattr(sessions_mod, "score_scenario_fault_episodes", lambda *args, **kwargs: [_FakeEvalResult(1.0)])
-    monkeypatch.setattr(sessions_mod, "_build_toolkit_for_topology", lambda topology_dir: object())
+    monkeypatch.setattr(dispatch_mod, "ScenarioExecutor", FakeScenarioExecutor)
+    monkeypatch.setattr(dispatch_mod, "load_topology_metadata", lambda _topology_dir: None)
+    monkeypatch.setattr(dispatch_mod, "_create_evaluator", _FakeEvaluator)
     monkeypatch.setattr(
-        sessions_mod,
+        dispatch_mod,
+        "score_scenario_fault_episodes",
+        lambda *args, **kwargs: [_FakeEvalResult(1.0)],
+    )
+    monkeypatch.setattr(sessions_mod, "Evaluator", _FakeEvaluator)
+    monkeypatch.setattr(diagnosis_mod, "_build_toolkit_for_topology", lambda topology_dir: FakeToolkit())
+    monkeypatch.setattr(
+        diagnosis_mod,
         "build_topology_snapshot",
         lambda toolkit: {"devices": {"spines": [], "leafs": [], "clients": []}, "links": []},
     )
 
 
 def _install_platform_runtime_mocks(monkeypatch):
+    import shutil
+
     import netopsbench.platform.runtime.manager as runtimes_mod
+    from netopsbench.platform.topology.generator import generate_topology
 
     def fake_provision(self, *, scale, workers=1, name=None, root_dir=None):
         runtime = self._build_runtime(scale=scale, workers=workers, name=name, root_dir=root_dir)
@@ -132,13 +149,23 @@ def _install_platform_runtime_mocks(monkeypatch):
         for worker in runtime.workers:
             worker_dir = Path(worker.topology_dir or worker.root_dir)
             worker_dir.mkdir(parents=True, exist_ok=True)
-            (worker_dir / "topology.json").write_text(
-                '{"name":"%s"}' % (worker.lab_name or worker.name), encoding="utf-8"
+            generate_topology(
+                scale,
+                str(worker_dir),
+                name=worker.lab_name,
+                mgmt_subnet=worker.mgmt_subnet,
+                mgmt_network=worker.mgmt_network,
             )
         runtime._write_metadata()
         return runtime
 
+    def fake_teardown(self):
+        self.state = "torn_down"
+        shutil.rmtree(self.root_dir, ignore_errors=True)
+        return self
+
     monkeypatch.setattr(runtimes_mod.RuntimeManager, "provision", fake_provision)
+    monkeypatch.setattr(runtimes_mod.RuntimePool, "teardown", fake_teardown)
 
 
 def _make_scenario(*, scenario_id: str, scale: str = "xs"):
@@ -361,7 +388,7 @@ def test_runtime_trace_metadata_is_persisted_only_as_sidecar(tmp_path, monkeypat
 def test_runtime_agent_failure_trace_is_linked_from_results_sidecar(tmp_path, monkeypatch):
     _install_real_runtime_mocks(monkeypatch)
 
-    import netopsbench.platform.session.orchestrator as sessions_mod
+    import netopsbench.platform.session.dispatch as dispatch_mod
 
     class LinkedEvalResult:
         score = 0.0
@@ -373,7 +400,7 @@ def test_runtime_agent_failure_trace_is_linked_from_results_sidecar(tmp_path, mo
                 "details": {"scenario_id": "failure-scenario", "episode_id": "ep1"},
             }
 
-    monkeypatch.setattr(sessions_mod, "score_scenario_fault_episodes", lambda *args, **kwargs: [LinkedEvalResult()])
+    monkeypatch.setattr(dispatch_mod, "score_scenario_fault_episodes", lambda *args, **kwargs: [LinkedEvalResult()])
 
     bench = NetOpsBench(workspace=str(tmp_path))
     runtime = bench.runtimes.create(scale="xs", workers=1, name="trace-failure-runtime")
@@ -624,6 +651,7 @@ def test_run_handle_exposes_report_wait_refresh_and_cancel_contract(tmp_path):
     assert pending.cancel() is None
     assert pending.status == "cancelled"
     assert isinstance(pending.completed_at, datetime)
+    assert pending.completed_at.tzinfo is not None
 
 
 def test_keep_runtime_false_tears_down_runtime_and_true_preserves_it(tmp_path, monkeypatch):

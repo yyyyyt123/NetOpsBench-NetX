@@ -11,7 +11,7 @@ A benchmark run is a closed loop: resolve a scenario, provision a topology, inje
 
 | Stage | What happens |
 |---|---|
-| Scenario and topology | A generated scenario selects topology scale, traffic profile, fault type, target device, and target interface when applicable. |
+| Scenario and topology | A generated scenario selects topology scale, fault type, target device, and target interface. All scenarios use the canonical standard background traffic model. |
 | Runtime provisioning | The SDK provisions a Linux / Containerlab runtime and starts observability services. |
 | Fault episode | The scenario executor applies traffic generation, injects the selected fault, waits through the observation window, and records symptoms. |
 | Diagnosis context | The platform assembles topology, symptoms, Pingmesh summaries, runtime metadata, and optional tools into `DiagnosticContext`. |

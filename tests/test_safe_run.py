@@ -7,8 +7,10 @@ import subprocess
 
 import pytest
 
+from netopsbench.platform.utils import proc
 from netopsbench.platform.utils.proc import (
     DEFAULT_SUBPROCESS_TIMEOUT_SECONDS,
+    docker_prefix,
     safe_run,
     sudo_prefix,
 )
@@ -60,3 +62,21 @@ def test_sudo_prefix_default(monkeypatch):
 def test_sudo_prefix_disabled_via_env(monkeypatch):
     monkeypatch.setenv("NETOPSBENCH_NO_SUDO", "1")
     assert sudo_prefix() == []
+
+
+def test_docker_prefix_uses_accessible_local_socket_without_sudo(monkeypatch):
+    monkeypatch.delenv("NETOPSBENCH_NO_SUDO", raising=False)
+    monkeypatch.setattr(proc.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(proc.Path, "exists", lambda self: True)
+    monkeypatch.setattr(proc.os, "access", lambda path, mode: True)
+
+    assert docker_prefix() == []
+
+
+def test_docker_prefix_uses_sudo_when_socket_is_not_accessible(monkeypatch):
+    monkeypatch.delenv("NETOPSBENCH_NO_SUDO", raising=False)
+    monkeypatch.setattr(proc.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(proc.Path, "exists", lambda self: True)
+    monkeypatch.setattr(proc.os, "access", lambda path, mode: False)
+
+    assert docker_prefix() == ["sudo", "-n"]

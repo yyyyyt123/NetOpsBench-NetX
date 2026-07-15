@@ -5,6 +5,8 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from netopsbench.platform.utils.interface_names import resolve_interface_metric_identities
+
 from .text_parsers import coerce_value, extract_interface_name, normalize_key
 
 
@@ -78,7 +80,7 @@ def get_live_interface_snapshot(toolkit, device: str, interface: str) -> dict[st
     interfaces = data.get("interfaces", [])
     if not isinstance(interfaces, list):
         return None
-    candidate_names = set(toolkit._resolve_interface_metric_identities(interface)["names"])
+    candidate_names = set(resolve_interface_metric_identities(interface)["names"])
     for entry in interfaces:
         if not isinstance(entry, dict):
             continue

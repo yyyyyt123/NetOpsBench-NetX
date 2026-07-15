@@ -43,7 +43,3 @@ class FaultTracker:
     def remove_faults(self, predicate: Callable[[ActiveFault], bool]) -> None:
         with self._lock:
             self.active_faults = [fault for fault in self.active_faults if not predicate(fault)]
-
-    def active_fault_dicts(self) -> list[dict]:
-        with self._lock:
-            return [fault.to_dict() if isinstance(fault, ActiveFault) else dict(fault) for fault in self.active_faults]

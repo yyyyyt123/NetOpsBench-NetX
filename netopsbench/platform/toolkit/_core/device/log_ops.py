@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-import requests
+from netopsbench.platform.observability.influxdb import query_flux
 
 from ..common import ToolResult
+from .log_parsers import get_device_logs_fallback, parse_influx_syslog_rows
 
 
 class LogOpsMixin:
@@ -23,21 +24,10 @@ class LogOpsMixin:
             else:
                 safe_severity = None
             query = f"""\nfrom(bucket: "{self.influxdb_bucket}")\n  |> range(start: -{safe_minutes}m)\n  |> filter(fn: (r) => r._measurement == "syslog")\n  |> filter(fn: (r) => r.source == "{safe_device}")\n  |> filter(fn: (r) => r._field == "message")\n  {severity_filter}\n  |> sort(columns: ["_time"], desc: true)\n  |> limit(n: 100)\n"""
-            headers = {
-                "Authorization": f"Token {self.influxdb_token}",
-                "Content-Type": "application/vnd.flux",
-                "Accept": "application/csv",
-            }
-            response = requests.post(
-                f"{self.influxdb_url}/api/v2/query?org={self.influxdb_org}",
-                headers=headers,
-                data=query,
-                timeout=30,
-                proxies={"http": "", "https": ""},
-            )
-            if response.status_code != 200:
-                return ToolResult(success=False, data=None, error=f"InfluxDB query failed: {response.text}")
-            structured_logs = self._parse_influx_syslog_rows(response.text)
+            result = query_flux(self.influxdb_url, self.influxdb_token, self.influxdb_org, query)
+            if result.status != "ok":
+                return ToolResult(success=False, data=None, error=f"InfluxDB query failed: {result.error}")
+            structured_logs = parse_influx_syslog_rows(result.text)
             if structured_logs:
                 data = {
                     "device": safe_device,
@@ -47,10 +37,10 @@ class LogOpsMixin:
                     "logs": structured_logs,
                 }
                 if include_raw:
-                    data["raw_csv"] = response.text
+                    data["raw_csv"] = result.text
                 return ToolResult(success=True, data=data)
-            fallback_logs = self._get_device_logs_fallback(
-                safe_device, time_range_minutes=safe_minutes, severity=safe_severity
+            fallback_logs = get_device_logs_fallback(
+                self, safe_device, time_range_minutes=safe_minutes, severity=safe_severity
             )
             warning = None
             source = "influxdb"
@@ -66,9 +56,7 @@ class LogOpsMixin:
                 "warning": warning,
             }
             if include_raw:
-                data["raw_csv"] = response.text
+                data["raw_csv"] = result.text
             return ToolResult(success=True, data=data)
-        except requests.exceptions.RequestException as e:
-            return ToolResult(success=False, data=None, error=f"Request failed: {str(e)}")
         except Exception as e:
             return ToolResult(success=False, data=None, error=str(e))

@@ -106,3 +106,11 @@ def are_interfaces_equivalent(left: str | None, right: str | None) -> bool:
     if normalize_interface_name(left) == normalize_interface_name(right):
         return True
     return bool(interface_aliases(left) & interface_aliases(right))
+
+
+def resolve_interface_metric_identities(interface_name: str | None) -> dict[str, list[str]]:
+    """Return equivalent interface tags and gNMI counter paths."""
+    names = sorted(interface_aliases(interface_name))
+    sonic_names = sorted(name for name in names if _SONIC_INTERFACE_RE.fullmatch(name))
+    paths = [path for name in sonic_names for path in (f"COUNTERS/{name}", f"/COUNTERS/{name}")]
+    return {"names": names, "paths": paths}

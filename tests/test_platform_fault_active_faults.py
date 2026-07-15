@@ -1,7 +1,15 @@
 """Regression tests for structured active fault tracking."""
 
+import tempfile
+
 from netopsbench.platform.faults.injector import FaultInjector
 from netopsbench.platform.faults.models import ActiveFault
+from netopsbench.platform.topology.generator import generate_topology
+
+
+def _metadata() -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        return generate_topology("xs", tmpdir)["metadata"]
 
 
 def test_active_fault_dataclass_roundtrips_metadata_to_dict():
@@ -21,8 +29,8 @@ def test_active_fault_dataclass_roundtrips_metadata_to_dict():
     assert payload["linux_interface"] == "eth1"
 
 
-def test_get_active_faults_preserves_public_dict_shape():
-    injector = FaultInjector(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+def test_active_fault_tracker_preserves_domain_objects():
+    injector = FaultInjector(topology_metadata=_metadata())
     injector.active_faults = [
         ActiveFault(
             type="static_route_misconfig",
@@ -31,25 +39,13 @@ def test_get_active_faults_preserves_public_dict_shape():
         )
     ]
 
-    active = injector.get_active_faults()
-
-    assert active == [
-        {
-            "type": "static_route_misconfig",
-            "device": "leaf1",
-            "target_ip": "192.168.1.2/32",
-            "wrong_nexthop": "192.168.1.1",
-            "success": True,
-            "error": None,
-        }
-    ]
+    assert len(injector.active_faults) == 1
+    assert isinstance(injector.active_faults[0], ActiveFault)
+    assert injector.active_faults[0].metadata["target_ip"] == "192.168.1.2/32"
 
 
 def test_link_flapping_uses_python_background_control_metadata():
-    injector = FaultInjector(
-        topology_metadata={"name": "dcn", "devices": {"spines": [{"name": "spine1"}], "leafs": [], "clients": []}}
-    )
-    injector.container_names = {"spine1": "clab-dcn-spine1"}
+    injector = FaultInjector(topology_metadata=_metadata())
 
     stub = type("R", (), {"returncode": 0, "stderr": "", "stdout": ""})()
     injector._sonic.config_cmd = lambda *args, **kwargs: stub
@@ -61,17 +57,3 @@ def test_link_flapping_uses_python_background_control_metadata():
     assert fault["orchestration"] == "python"
     assert "task_id" in fault
     assert "pid" not in fault
-
-
-def test_fault_injector_normalizes_handler_result_to_legacy_dict():
-    normalized = FaultInjector._legacy_fault_result(
-        {"recovered": True, "type": "link_down", "device": "leaf1", "error": None}
-    )
-
-    assert normalized == {
-        "success": True,
-        "error": None,
-        "recovered": True,
-        "type": "link_down",
-        "device": "leaf1",
-    }

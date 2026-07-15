@@ -3,8 +3,10 @@
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import pytest
+
 import netopsbench.sdk.faults as faults_api
-from netopsbench.platform.faults.specs import FaultSpec, unregister_fault_spec
+from netopsbench.platform.faults.specs import FaultSpec
 
 
 @dataclass
@@ -37,15 +39,12 @@ def test_fault_manager_registers_custom_fault_spec_and_executor():
     manager = faults_api.FaultManager()
     spec = FaultSpec(name="custom_fault")
 
-    try:
-        manager.register(spec=spec, executor=_FakeExecutor())
+    manager.register(spec=spec, executor=_FakeExecutor())
 
-        loaded = manager.get("custom_fault")
-        assert loaded.name == "custom_fault"
-        assert "custom_fault" in {item.name for item in manager.list()}
-        assert manager.validate_parameters("custom_fault", {}) == []
-    finally:
-        unregister_fault_spec("custom_fault")
+    loaded = manager.get("custom_fault")
+    assert loaded.name == "custom_fault"
+    assert "custom_fault" in {item.name for item in manager.list()}
+    assert manager.validate_parameters("custom_fault", {}) == []
 
 
 def test_fault_manager_load_builtin_exposes_builtin_faults():
@@ -61,13 +60,10 @@ def test_fault_manager_load_builtin_exposes_builtin_faults():
 def test_fault_manager_register_pack_adds_pack_faults():
     manager = faults_api.FaultManager()
 
-    try:
-        manager.register_pack(_FakeFaultPack())
+    manager.register_pack(_FakeFaultPack())
 
-        names = {item.name for item in manager.list()}
-        assert "pack_fault" in names
-    finally:
-        unregister_fault_spec("pack_fault")
+    names = {item.name for item in manager.list()}
+    assert "pack_fault" in names
 
 
 def test_fault_manager_validate_parameters_uses_minimal_adapter():
@@ -84,19 +80,16 @@ def test_fault_manager_validate_parameters_uses_minimal_adapter():
     manager = faults_api.FaultManager()
     spec = FaultSpec(name="shape_fault", episode_validator=_validator)
 
-    try:
-        manager.register(spec=spec, executor=_FakeExecutor())
+    manager.register(spec=spec, executor=_FakeExecutor())
 
-        assert manager.validate_parameters("shape_fault", {}) == []
-        assert seen == {
-            "has_target_device": False,
-            "has_target_interface": True,
-            "has_target_prefix": True,
-            "has_parameters": True,
-            "has_metadata": True,
-        }
-    finally:
-        unregister_fault_spec("shape_fault")
+    assert manager.validate_parameters("shape_fault", {}) == []
+    assert seen == {
+        "has_target_device": False,
+        "has_target_interface": True,
+        "has_target_prefix": True,
+        "has_parameters": True,
+        "has_metadata": True,
+    }
 
 
 def test_fault_manager_rejects_invalid_plugin_style_registration(monkeypatch):
@@ -107,14 +100,8 @@ def test_fault_manager_rejects_invalid_plugin_style_registration(monkeypatch):
         lambda module_path: SimpleNamespace(BrokenPlugin=object()),
     )
 
-    try:
-        try:
-            manager.load_plugin("fake.module:BrokenPlugin")
-            raise AssertionError("expected TypeError")
-        except TypeError as exc:
-            assert "register()" in str(exc)
-    finally:
-        unregister_fault_spec("BrokenPlugin")
+    with pytest.raises(TypeError, match=r"register\(\)"):
+        manager.load_plugin("fake.module:BrokenPlugin")
 
 
 def test_custom_fault_example_registers_and_executes(tmp_path, monkeypatch):
@@ -147,7 +134,6 @@ def test_custom_fault_example_registers_and_executes(tmp_path, monkeypatch):
 
 
 def test_simple_fault_creates_dispatchable_pack(tmp_path):
-    from netopsbench.platform.faults.specs import unregister_fault_spec
     from netopsbench.sdk import FaultContext, NetOpsBench, simple_fault
 
     calls = []
@@ -168,34 +154,30 @@ def test_simple_fault_creates_dispatchable_pack(tmp_path):
         required_parameters=("delay_ms",),
     )
     bench = NetOpsBench(workspace=str(tmp_path))
-    try:
-        bench.faults.register_pack(pack)
+    bench.faults.register_pack(pack)
 
-        spec = bench.faults.get("test_simple_latency")
-        assert spec.name == "test_simple_latency"
-        assert spec.requires_interface is True
+    spec = bench.faults.get("test_simple_latency")
+    assert spec.name == "test_simple_latency"
+    assert spec.requires_interface is True
 
-        executor = bench.faults.get_executor("test_simple_latency")
-        ctx = FaultContext(
-            fault_type="test_simple_latency",
-            target_device="leaf2",
-            target_interface="eth0",
-            parameters={"delay_ms": 10},
-        )
-        inject_result = executor.inject(ctx)
-        assert inject_result.success is True
-        recover_result = executor.recover(ctx)
-        assert recover_result.success is True
-        assert calls == [
-            ("inject", "test_simple_latency", "leaf2"),
-            ("recover", "test_simple_latency"),
-        ]
-    finally:
-        unregister_fault_spec("test_simple_latency")
+    executor = bench.faults.get_executor("test_simple_latency")
+    ctx = FaultContext(
+        fault_type="test_simple_latency",
+        target_device="leaf2",
+        target_interface="eth0",
+        parameters={"delay_ms": 10},
+    )
+    inject_result = executor.inject(ctx)
+    assert inject_result.success is True
+    recover_result = executor.recover(ctx)
+    assert recover_result.success is True
+    assert calls == [
+        ("inject", "test_simple_latency", "leaf2"),
+        ("recover", "test_simple_latency"),
+    ]
 
 
 def test_register_fault_shortcut(tmp_path):
-    from netopsbench.platform.faults.specs import unregister_fault_spec
     from netopsbench.sdk import FaultContext, NetOpsBench
 
     def _inject(ctx: FaultContext) -> dict:
@@ -205,20 +187,51 @@ def test_register_fault_shortcut(tmp_path):
         return {"success": True}
 
     bench = NetOpsBench(workspace=str(tmp_path))
-    try:
-        bench.faults.register_fault(
-            "test_shortcut_fault",
-            _inject,
-            _recover,
-            requires_interface=False,
-        )
+    bench.faults.register_fault(
+        "test_shortcut_fault",
+        _inject,
+        _recover,
+        requires_interface=False,
+    )
 
-        spec = bench.faults.get("test_shortcut_fault")
-        assert spec.name == "test_shortcut_fault"
+    spec = bench.faults.get("test_shortcut_fault")
+    assert spec.name == "test_shortcut_fault"
 
-        executor = bench.faults.get_executor("test_shortcut_fault")
-        ctx = FaultContext(fault_type="test_shortcut_fault", target_device="spine1")
-        assert executor.inject(ctx).success is True
-        assert executor.recover(ctx).success is True
-    finally:
-        unregister_fault_spec("test_shortcut_fault")
+    executor = bench.faults.get_executor("test_shortcut_fault")
+    ctx = FaultContext(fault_type="test_shortcut_fault", target_device="spine1")
+    assert executor.inject(ctx).success is True
+    assert executor.recover(ctx).success is True
+
+
+def test_custom_fault_registry_is_isolated_per_netopsbench_instance(tmp_path):
+    from netopsbench.sdk import NetOpsBench
+    from netopsbench.sdk.exceptions import FaultNotFoundError
+
+    first = NetOpsBench(workspace=str(tmp_path / "first"))
+    second = NetOpsBench(workspace=str(tmp_path / "second"))
+    first.faults.register_fault(
+        "isolated_fault",
+        lambda context: {"success": True},
+        lambda context: {"success": True},
+    )
+
+    assert first.faults.get("isolated_fault").name == "isolated_fault"
+    with pytest.raises(FaultNotFoundError):
+        second.faults.get("isolated_fault")
+
+    scenario = first.scenarios.create(
+        id="isolated",
+        name="isolated",
+        scale="xs",
+        metadata={"difficulty": "easy", "expected_diagnosis": "isolated_fault"},
+        episodes=[
+            {
+                "episode_id": "ep1",
+                "description": "custom",
+                "fault_type": "isolated_fault",
+                "target_device": "leaf1",
+            }
+        ],
+    )
+    assert first.scenarios.validate(scenario) == []
+    assert any("Unsupported fault_type" in error for error in second.scenarios.validate(scenario))

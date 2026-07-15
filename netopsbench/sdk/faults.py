@@ -13,10 +13,7 @@ from netopsbench.platform.faults.specs import (
     FaultExecutor,
     FaultPack,
     FaultSpec,
-    canonicalize_fault_name,
-    get_fault_spec,
-    load_builtin_fault_specs,
-    register_fault_spec,
+    create_fault_registry,
 )
 from netopsbench.sdk.exceptions import (
     FaultNotFoundError,
@@ -166,6 +163,7 @@ class FaultManager:
 
     def __init__(self, workspace: str = "."):
         self.workspace = Path(workspace)
+        self.spec_registry = create_fault_registry()
         self._entries: dict[str, _FaultRecord] = {}
         self._builtin_loaded = False
 
@@ -225,9 +223,8 @@ class FaultManager:
             aliases=list(spec.aliases),
             scenario_supported=spec.scenario_supported,
         )
-        register_fault_spec(patched_spec)
-        canonical_name = canonicalize_fault_name(spec.name) or spec.name
-        registered_spec = get_fault_spec(canonical_name) or patched_spec
+        registered_spec = self.spec_registry.register(patched_spec)
+        canonical_name = self.spec_registry.canonicalize(spec.name) or spec.name
         self._entries[canonical_name] = _FaultRecord(spec=registered_spec, executor=executor)
 
     def register_fault(
@@ -274,8 +271,8 @@ class FaultManager:
     def load_builtin(self) -> None:
         if self._builtin_loaded:
             return
-        for spec in load_builtin_fault_specs():
-            canonical_name = canonicalize_fault_name(spec.name) or spec.name
+        for spec in self.spec_registry.get_builtin_specs():
+            canonical_name = self.spec_registry.canonicalize(spec.name) or spec.name
             if canonical_name in self._entries:
                 continue
             self._entries[canonical_name] = _FaultRecord(spec=spec, executor=_StaticFaultExecutor(spec))
@@ -297,7 +294,7 @@ class FaultManager:
         return [record.spec for _, record in sorted(self._entries.items(), key=lambda item: item[0])]
 
     def get(self, name: str) -> FaultSpec:
-        canonical_name = canonicalize_fault_name(name)
+        canonical_name = self.spec_registry.canonicalize(name)
         if not canonical_name:
             raise FaultNotFoundError("fault name must be a non-empty string")
         record = self._entries.get(canonical_name)
@@ -306,7 +303,7 @@ class FaultManager:
         return record.spec
 
     def get_executor(self, name: str) -> FaultExecutor:
-        canonical_name = canonicalize_fault_name(name)
+        canonical_name = self.spec_registry.canonicalize(name)
         if not canonical_name:
             raise FaultNotFoundError("fault name must be a non-empty string")
         record = self._entries.get(canonical_name)
@@ -315,7 +312,7 @@ class FaultManager:
         return record.executor
 
     def validate_parameters(self, fault_type: str, parameters: dict[str, object]) -> builtins.list[str]:
-        canonical_name = canonicalize_fault_name(fault_type)
+        canonical_name = self.spec_registry.canonicalize(fault_type)
         if not canonical_name:
             return ["Unsupported fault type: "]
         record = self._entries.get(canonical_name)

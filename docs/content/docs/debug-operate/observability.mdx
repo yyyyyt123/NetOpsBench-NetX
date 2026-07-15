@@ -97,14 +97,9 @@ Common overrides:
 
 ```bash
 export NETOPSBENCH_MGMT_SUBNET=172.31.250.0/24
-export SONIC_GNMI_PORT=50051
-export SONIC_GNMI_USERNAME=admin
-export SONIC_GNMI_PASSWORD=<your-password>
-export NETOPSBENCH_SYSLOG_COLLECTOR=172.20.20.200
-export NETOPSBENCH_SFLOW_COLLECTOR=172.20.20.200
 ```
 
-The default SONiC image is `yyyyyt123/netopsbench-sonic-vs-202505-telemetry:202505-telemetry`.
+The default SONiC image is `yyyyyt123/netopsbench-sonic-vs-202505-telemetry:202505-telemetry`. Its gNMI contract is fixed by the benchmark image and generated Telegraf configuration (`50051`, `admin`, `json_ietf`, `COUNTERS_DB`, `on_change`) so benchmark telemetry does not vary with process environment.
 
 ## Cleanup
 

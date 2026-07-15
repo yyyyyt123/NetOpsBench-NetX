@@ -10,6 +10,7 @@ from typing import Any
 
 from netopsbench.logging_utils import get_logger
 from netopsbench.platform.session.types import ScenarioExecutionRef
+from netopsbench.platform.topology.topology_utils import load_topology_manifest
 
 logger = get_logger(__name__)
 
@@ -27,15 +28,8 @@ class LocalArtifactStore:
         metadata_path.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
 
 
-def load_topology_metadata(topology_dir: Path) -> dict[str, Any] | None:
-    topology_json = topology_dir / "topology.json"
-    if not topology_json.exists():
-        return None
-    try:
-        return json.loads(topology_json.read_text(encoding="utf-8"))
-    except Exception:
-        logger.debug("failed to parse topology.json at %s", topology_json, exc_info=True)
-        return None
+def load_topology_metadata(topology_dir: Path) -> dict[str, Any]:
+    return load_topology_manifest(topology_dir).model_dump(mode="json")
 
 
 def artifacts_root(artifact_manager: Any, artifacts_dir: str | Path | None) -> Path:
@@ -53,12 +47,9 @@ def next_run_id(artifact_root: Path, *, started_at: datetime | None = None) -> s
     return f"{base}-{suffix:02d}"
 
 
-def resolve_scale(platform: Any, scenarios: Iterable[ScenarioExecutionRef]) -> str:
+def resolve_scale(scenarios: Iterable[ScenarioExecutionRef]) -> str:
     scenario_list = list(scenarios)
-    if scenario_list:
-        return scenario_list[0].scale
-    defaults = getattr(platform, "defaults", {}) or {}
-    return str(defaults.get("scale") or "xs")
+    return scenario_list[0].scale if scenario_list else "xs"
 
 
 def create_run_report(

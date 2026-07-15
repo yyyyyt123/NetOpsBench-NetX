@@ -3,69 +3,18 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
-from typing import Any, Protocol
+from dataclasses import replace
+from functools import cache
+from types import MappingProxyType
+from typing import Any
+
+from .models import FaultExecutor as FaultExecutor
+from .models import FaultPack as FaultPack
+from .models import FaultSpec as FaultSpec
 
 _CANONICAL_FAULT_ALIASES: dict[str, str] = {
     "static_route_misconfiguration": "static_route_misconfig",
 }
-
-
-@dataclass
-class FaultSpec:
-    name: str
-    inject_episode: Callable[[Any, Any], dict[str, Any]] | None = None
-    recover_active_fault: Callable[[Any, dict[str, Any]], dict[str, Any]] | None = None
-    requires_interface: bool = False
-    requires_prefix: bool = False
-    required_parameters: tuple[str, ...] = ()
-    episode_validator: Callable[[Any], list[str]] | None = None
-    aliases: list[str] = field(default_factory=list)
-    scenario_supported: bool = True
-
-    def validate_episode(self, episode: Any, episode_index: int | None = None) -> list[str]:
-        """Validate an episode against this fault spec."""
-        errors: list[str] = []
-        prefix = f"Episode {episode_index}: " if episode_index is not None else ""
-
-        if self.requires_interface and not getattr(episode, "target_interface", None):
-            errors.append(f"{prefix}{self.name} requires target_interface")
-
-        if self.requires_prefix and not getattr(episode, "target_prefix", None):
-            errors.append(f"{prefix}{self.name} requires target_prefix")
-
-        if self.required_parameters:
-            parameters = getattr(episode, "parameters", {}) or {}
-            metadata = getattr(episode, "metadata", {}) or {}
-            for key in self.required_parameters:
-                value = parameters.get(key, metadata.get(key))
-                if value in (None, "", [], {}, ()):
-                    errors.append(f"{prefix}{self.name} requires parameter '{key}'")
-
-        if self.episode_validator is not None:
-            errors.extend(self.episode_validator(episode))
-
-        return errors
-
-
-class FaultExecutor(Protocol):
-    """Public protocol for fault injection/recovery executors."""
-
-    def inject(self, context: Any) -> Any:
-        """Inject a fault for the provided context."""
-
-    def recover(self, context: Any) -> Any:
-        """Recover a fault for the provided context."""
-
-
-class FaultPack(Protocol):
-    """Public protocol for grouping related fault registrations."""
-
-    name: str
-    version: str | None
-
-    def register(self, registry: Any) -> None:
-        """Register faults into the provided registry."""
 
 
 # ---------------------------------------------------------------------------
@@ -76,8 +25,7 @@ class FaultPack(Protocol):
 class FaultSpecRegistry:
     """Registry holding fault specs, aliases, and schema defaults.
 
-    A default module-level instance powers the convenience functions below.
-    Tests can create isolated instances to avoid cross-test pollution.
+    Each runtime owns an instance so custom faults cannot leak across sessions.
     """
 
     def __init__(
@@ -104,9 +52,7 @@ class FaultSpecRegistry:
     def register(self, spec: FaultSpec) -> FaultSpec:
         canonical_name = self.canonicalize(spec.name) or spec.name
         defaults = self._schema_defaults.get(canonical_name, {})
-        for key, value in defaults.items():
-            if getattr(spec, key) in (False, None, (), []):
-                setattr(spec, key, value)
+        values = {key: value for key, value in defaults.items() if getattr(spec, key) in (False, None, (), [])}
         normalized_aliases = sorted(
             {
                 alias
@@ -114,25 +60,17 @@ class FaultSpecRegistry:
                 if alias and alias != canonical_name
             }
         )
-        spec.name = canonical_name
-        spec.aliases = normalized_aliases
-        self._specs[canonical_name] = spec
+        normalized = replace(
+            spec,
+            name=canonical_name,
+            aliases=normalized_aliases,
+            **values,
+        )
+        self._specs[canonical_name] = normalized
         self._aliases[canonical_name] = canonical_name
         for alias in normalized_aliases:
             self._aliases[alias] = canonical_name
-        return spec
-
-    def unregister(self, name: str) -> None:
-        canonical_name = self.canonicalize(name)
-        spec = self._specs.pop(canonical_name, None)
-        if spec is None:
-            return
-        self._aliases.pop(canonical_name, None)
-        for alias in spec.aliases:
-            self._aliases.pop(alias, None)
-        for alias, target in list(_CANONICAL_FAULT_ALIASES.items()):
-            if target == canonical_name:
-                self._aliases[alias] = target
+        return normalized
 
     def get(self, name: str) -> FaultSpec | None:
         self.load_builtins()
@@ -162,47 +100,6 @@ class FaultSpecRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Default module-level instance + backward-compatible convenience functions
-# ---------------------------------------------------------------------------
-
-_default_registry = FaultSpecRegistry()
-
-
-def canonicalize_fault_name(name: str | None) -> str:
-    return _default_registry.canonicalize(name)
-
-
-def register_fault_spec(spec: FaultSpec) -> FaultSpec:
-    return _default_registry.register(spec)
-
-
-def unregister_fault_spec(name: str) -> None:
-    _default_registry.unregister(name)
-
-
-def get_fault_spec(name: str) -> FaultSpec | None:
-    return _default_registry.get(name)
-
-
-def list_fault_specs() -> list[FaultSpec]:
-    return _default_registry.list_all()
-
-
-def get_supported_scenario_faults() -> list[str]:
-    return _default_registry.supported_scenario_faults()
-
-
-def get_builtin_fault_specs() -> list[FaultSpec]:
-    """Return the builtin fault specs that ship with NetOpsBench."""
-    return _default_registry.get_builtin_specs()
-
-
-def load_builtin_fault_specs() -> list[Any]:
-    """Ensure builtin fault specs are registered and return a snapshot."""
-    return list(get_builtin_fault_specs())
-
-
-# ---------------------------------------------------------------------------
 # Builtin spec aggregation (formerly netopsbench.platform.faults.builtin_specs)
 # ---------------------------------------------------------------------------
 
@@ -213,13 +110,11 @@ def _build_builtin_fault_specs() -> list[FaultSpec]:
     Imported lazily inside the function to avoid an import cycle:
     ``builtin/__init__`` may transitively import ``specs`` for shared types.
     """
-    from .builtin import (
-        build_acl_fault_specs,
-        build_impairment_fault_specs,
-        build_link_fault_specs,
-        build_routing_fault_specs,
-        build_system_fault_specs,
-    )
+    from .builtin.acl_specs import build_acl_fault_specs
+    from .builtin.impairment_specs import build_impairment_fault_specs
+    from .builtin.link_specs import build_link_fault_specs
+    from .builtin.routing_specs import build_routing_fault_specs
+    from .builtin.system_specs import build_system_fault_specs
 
     builders: tuple[Callable[[], list[FaultSpec]], ...] = (
         build_link_fault_specs,
@@ -234,12 +129,30 @@ def _build_builtin_fault_specs() -> list[FaultSpec]:
     return aggregated
 
 
-def register_builtin_fault_specs() -> None:
-    """Register every builtin fault spec into the default registry.
+def create_fault_registry() -> FaultSpecRegistry:
+    """Return an isolated registry populated with builtin fault specs."""
+    registry = FaultSpecRegistry()
+    registry.load_builtins()
+    return registry
 
-    Equivalent to :func:`load_builtin_fault_specs` but does not return the
-    snapshot. Kept for backward compatibility with external callers that
-    imported the previous ``builtin_specs`` module.
-    """
+
+@cache
+def _builtin_alias_index() -> MappingProxyType:
+    aliases = dict(_CANONICAL_FAULT_ALIASES)
     for spec in _build_builtin_fault_specs():
-        register_fault_spec(spec)
+        canonical = aliases.get(spec.name, spec.name)
+        aliases[canonical] = canonical
+        aliases[spec.name] = canonical
+        aliases.update({alias: canonical for alias in spec.aliases})
+    return MappingProxyType(aliases)
+
+
+def canonicalize_fault_name(name: str | None) -> str:
+    """Canonicalize one builtin fault name without exposing mutable registry state."""
+    raw_name = str(name or "").strip()
+    return _builtin_alias_index().get(raw_name, raw_name)
+
+
+def get_supported_scenario_faults() -> list[str]:
+    """Return builtin scenario fault names from an isolated registry."""
+    return create_fault_registry().supported_scenario_faults()

@@ -1,48 +1,35 @@
-#!/usr/bin/env python3
 """Validate the worker observability path through InfluxDB."""
 
 from __future__ import annotations
 
-import argparse
 import csv
 import re
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from collections.abc import Callable, Sequence
 
-from netopsbench.logging_utils import get_logger
-
-logger = get_logger(__name__)
-
-
 QueryRunner = Callable[[str], str]
+_INTERFACE_COUNTER_FIELDS = {
+    "in_octets",
+    "out_octets",
+    "in_unicast_pkts",
+    "out_unicast_pkts",
+    "in_discarded_packets",
+    "out_discarded_packets",
+    "in_errors",
+    "out_errors",
+    "SAI_PORT_STAT_IF_IN_OCTETS",
+    "SAI_PORT_STAT_IF_OUT_OCTETS",
+    "SAI_PORT_STAT_IF_IN_UCAST_PKTS",
+    "SAI_PORT_STAT_IF_OUT_UCAST_PKTS",
+    "SAI_PORT_STAT_IF_IN_DISCARDS",
+    "SAI_PORT_STAT_IF_OUT_DISCARDS",
+    "SAI_PORT_STAT_IF_IN_ERRORS",
+    "SAI_PORT_STAT_IF_OUT_ERRORS",
+}
 
 
-def _make_url_opener(base_url: str):
-    hostname = (urllib.parse.urlparse(base_url).hostname or "").strip().lower()
-    if hostname in {"localhost", "127.0.0.1", "::1"}:
-        return urllib.request.build_opener(urllib.request.ProxyHandler({}))
-    return urllib.request.build_opener()
-
-
-def run_query(base_url: str, token: str, org: str, query: str) -> str:
-    """Execute one Flux query against InfluxDB and return CSV output."""
-    headers = {
-        "Authorization": f"Token {token}",
-        "Accept": "application/csv",
-        "Content-Type": "application/vnd.flux",
-    }
-    org_q = urllib.parse.quote(org, safe="")
-    req = urllib.request.Request(
-        f"{base_url.rstrip('/')}/api/v2/query?org={org_q}",
-        data=query.encode("utf-8"),
-        headers=headers,
-        method="POST",
-    )
-    with _make_url_opener(base_url).open(req, timeout=20) as resp:
-        return resp.read().decode("utf-8")
+def _interface_counter_field_filter() -> str:
+    predicates = " or ".join(f'r._field == "{field}"' for field in sorted(_INTERFACE_COUNTER_FIELDS))
+    return f"  |> filter(fn: (r) => {predicates})\n"
 
 
 def count_data_rows(csv_text: str) -> int:
@@ -70,6 +57,11 @@ def extract_interface_names(csv_text: str) -> list[str]:
     reader = csv.DictReader(lines)
     for row in reader:
         if row.get("result") == "result":
+            continue
+        if (row.get("_value") or "").strip() == "":
+            continue
+        field = (row.get("_field") or "").strip()
+        if field and field not in _INTERFACE_COUNTER_FIELDS:
             continue
         name = (row.get("name") or "").strip()
         path = (row.get("path") or "").strip()
@@ -116,7 +108,10 @@ def check_observability(
         f"  |> range(start: -10m)\n"
         f'  |> filter(fn: (r) => r._measurement == "pingmesh")\n'
         f"{topology_filter}"
-        f"  |> limit(n: 5)\n"
+        f'  |> filter(fn: (r) => r._field == "rtt_p99")\n'
+        f"  |> last()\n"
+        f"  |> group()\n"
+        f"  |> limit(n: 1)\n"
     )
     if count_data_rows(query_runner(pingmesh_query)) <= 0:
         errors.append("no recent pingmesh samples found in InfluxDB")
@@ -130,29 +125,28 @@ def check_observability(
             f'  |> filter(fn: (r) => r.source == "{bgp_device}")\n'
             f'  |> filter(fn: (r) => r._field == "session_state")\n'
             f"  |> last()\n"
+            f"  |> group()\n"
+            f"  |> limit(n: 1)\n"
         )
         if count_data_rows(query_runner(bgp_query)) <= 0:
             errors.append(f"no recent bgp neighbor samples found for {bgp_device} in InfluxDB")
 
-    interface_query = (
+    interface_identity_query = (
         f'from(bucket: "{bucket}")\n'
         f"  |> range(start: -10m)\n"
         f'  |> filter(fn: (r) => r._measurement == "interfaces")\n'
+        f"{topology_filter}"
         f'  |> filter(fn: (r) => r.source == "{obs_device}")\n'
-        f"  |> limit(n: 5)\n"
+        f"{_interface_counter_field_filter()}"
+        f'  |> group(columns: ["name", "path", "_field"])\n'
+        f"  |> last()\n"
+        f'  |> keep(columns: ["_time", "_field", "_value", "name", "path"])\n'
     )
-    if count_data_rows(query_runner(interface_query)) <= 0:
+    interface_rows = query_runner(interface_identity_query)
+    if count_data_rows(interface_rows) <= 0:
         errors.append(f"no recent interface samples found for {obs_device} in InfluxDB")
     else:
-        interface_identity_query = (
-            f'from(bucket: "{bucket}")\n'
-            f"  |> range(start: -10m)\n"
-            f'  |> filter(fn: (r) => r._measurement == "interfaces")\n'
-            f'  |> filter(fn: (r) => r.source == "{obs_device}")\n'
-            f'  |> keep(columns: ["name", "path"])\n'
-            f"  |> limit(n: 2000)\n"
-        )
-        observed_interfaces = extract_interface_names(query_runner(interface_identity_query))
+        observed_interfaces = extract_interface_names(interface_rows)
         if active:
             observed_active = [name for name in active if name in observed_interfaces]
             coverage = len(observed_active) / len(active)
@@ -175,76 +169,13 @@ def check_observability(
             f'from(bucket: "{bucket}")\n'
             f"  |> range(start: -5m)\n"
             f'  |> filter(fn: (r) => r._measurement == "syslog")\n'
+            f"{topology_filter}"
             f'  |> filter(fn: (r) => r._field == "message")\n'
             f'  |> filter(fn: (r) => strings.containsStr(v: r._value, substr: "{syslog_marker}"))\n'
-            f"  |> limit(n: 5)\n"
+            f"  |> group()\n"
+            f"  |> limit(n: 1)\n"
         )
-        found = False
-        for attempt in range(6):
-            if count_data_rows(query_runner(syslog_query)) > 0:
-                found = True
-                break
-            if attempt < 5:
-                time.sleep(2)
-        if not found:
+        if count_data_rows(query_runner(syslog_query)) <= 0:
             errors.append("syslog collector path check failed: marker not found in InfluxDB")
 
     return errors
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Validate worker observability data in InfluxDB")
-    parser.add_argument("--url", required=True, help="InfluxDB base URL")
-    parser.add_argument("--token", required=True, help="InfluxDB token")
-    parser.add_argument("--org", required=True, help="InfluxDB organization")
-    parser.add_argument("--bucket", required=True, help="InfluxDB bucket")
-    parser.add_argument("--obs-device", required=True, help="Device expected to emit interface metrics")
-    parser.add_argument("--bgp-device", default="", help="Device expected to emit BGP neighbor metrics")
-    parser.add_argument("--topology-id", default="", help="Optional topology identifier for Pingmesh filtering")
-    parser.add_argument("--syslog-marker", default="", help="Optional syslog marker to verify")
-    parser.add_argument(
-        "--active-interfaces",
-        default="",
-        help="Comma-separated active interfaces expected in the interface metrics",
-    )
-    parser.add_argument(
-        "--min-active-coverage-ratio",
-        type=float,
-        default=0.5,
-        help="Minimum acceptable coverage ratio for active interface observability",
-    )
-    return parser.parse_args()
-
-
-def main() -> int:
-    args = parse_args()
-    active_interfaces = [item for item in args.active_interfaces.split(",") if item]
-    try:
-        errors = check_observability(
-            lambda query: run_query(args.url, args.token, args.org, query),
-            bucket=args.bucket,
-            obs_device=args.obs_device,
-            bgp_device=args.bgp_device,
-            topology_id=args.topology_id,
-            syslog_marker=args.syslog_marker,
-            active_interfaces=active_interfaces,
-            min_active_coverage_ratio=args.min_active_coverage_ratio,
-        )
-    except urllib.error.HTTPError as exc:
-        logger.error("InfluxDB query failed: HTTP %s", exc.code)
-        return 1
-    except urllib.error.URLError as exc:
-        logger.error("InfluxDB query failed: %s", exc)
-        return 1
-    except Exception as exc:
-        logger.error("observability query failed: %s", exc)
-        return 1
-
-    if errors:
-        logger.error("%s", "; ".join(errors))
-        return 1
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

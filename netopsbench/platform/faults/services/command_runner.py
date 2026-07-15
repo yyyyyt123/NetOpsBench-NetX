@@ -6,7 +6,7 @@ import os
 import signal
 import subprocess
 
-from netopsbench.platform.utils.proc import safe_run, sudo_prefix
+from netopsbench.platform.utils.proc import docker_prefix, safe_run
 
 
 class CommandRunner:
@@ -38,13 +38,15 @@ class CommandRunner:
             return False
 
     def docker_exec(self, container: str, cmd_args: list[str], timeout: int = 30) -> subprocess.CompletedProcess:
-        return self.run_cmd([*sudo_prefix(), "docker", "exec", container] + cmd_args, timeout)
+        return self.run_cmd([*docker_prefix(), "docker", "exec", container] + cmd_args, timeout)
 
     def docker_exec_detached(
         self, container: str, cmd_args: list[str], timeout: int = 10
     ) -> subprocess.CompletedProcess:
-        return self.run_cmd([*sudo_prefix(), "docker", "exec", "-d", container] + cmd_args, timeout)
+        return self.run_cmd([*docker_prefix(), "docker", "exec", "-d", container] + cmd_args, timeout)
 
     def container_is_running(self, container: str) -> bool:
-        result = self.run_cmd([*sudo_prefix(), "docker", "inspect", "-f", "{{.State.Running}}", container], timeout=10)
+        result = self.run_cmd(
+            [*docker_prefix(), "docker", "inspect", "-f", "{{.State.Running}}", container], timeout=10
+        )
         return result.returncode == 0 and (result.stdout or "").strip() == "true"

@@ -8,7 +8,8 @@ from harbor.viewer.scanner import JobScanner
 
 from netopsbench.agents.base import DiagnosticContext
 from netopsbench.agents.tracing import AgentTraceRecorder
-from netopsbench.platform.session.tracing import TraceWriter, export_traces, load_trace_index
+from netopsbench.platform.session.harbor_export import export_traces, load_trace_index
+from netopsbench.platform.session.trace_store import TraceWriter
 
 
 def test_disabled_trace_recorder_preserves_api_without_collecting():

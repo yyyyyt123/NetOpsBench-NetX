@@ -47,7 +47,7 @@ Each scale combines fault cases with healthy negative samples:
 | Medium | 24 | 4 | 28 |
 | Large | 48 | 4 | 52 |
 
-Scenarios are generated from `scenarios/specs/fault_campaign.yaml`. Running `netopsbench benchmark prepare --scales <scale>` materializes YAML files under `scenarios/generated/<scale>/`.
+Scenarios are generated from the packaged canonical campaign spec. Running `netopsbench benchmark prepare --scales <scale>` materializes YAML files under `scenarios/generated/<scale>/`; `--spec` can select a custom campaign.
 
 ## Scoring dimensions
 

@@ -1,10 +1,10 @@
 """Scenario scoring helpers."""
 
-import ipaddress
 from pathlib import Path
 from typing import Any
 
 from netopsbench.evaluator.scorer import AgentOutput, EvaluationResult, Evaluator
+from netopsbench.platform.topology.configdb_payload import interface_networks_for_config
 from netopsbench.platform.utils.interface_names import are_interfaces_equivalent
 
 # Fault types where the injected interface and its link-peer are both valid answers.
@@ -24,23 +24,7 @@ _INTERFACE_SYMMETRIC_FAULT_TYPES = {
 
 
 def _parse_device_interface_networks(config_path: Path) -> dict[str, str]:
-    interface_networks: dict[str, str] = {}
-    if not config_path.exists():
-        return interface_networks
-    for raw_line in config_path.read_text(encoding="utf-8").splitlines():
-        line = raw_line.strip()
-        if not line.startswith("config interface ip add "):
-            continue
-        parts = line.split()
-        if len(parts) < 6:
-            continue
-        interface_name = parts[4]
-        cidr = parts[5]
-        try:
-            interface_networks[interface_name] = str(ipaddress.ip_interface(cidr).network)
-        except ValueError:
-            continue
-    return interface_networks
+    return interface_networks_for_config(config_path)
 
 
 def _resolve_config_interface(target_interface: str | None, interface_names: list[str]) -> str | None:
@@ -50,6 +34,23 @@ def _resolve_config_interface(target_interface: str | None, interface_names: lis
         if are_interfaces_equivalent(target_interface, interface_name):
             return interface_name
     return None
+
+
+def _device_config_path(configs_dir: Path, device: str) -> Path:
+    return configs_dir / "sonic" / device / "config_db.json"
+
+
+def _iter_device_config_paths(configs_dir: Path) -> list[Path]:
+    preseed_root = configs_dir / "sonic"
+    if not preseed_root.exists():
+        return []
+    return sorted(preseed_root.glob("*/config_db.json"))
+
+
+def _device_name_for_config_path(config_path: Path) -> str:
+    if config_path.name == "config_db.json":
+        return config_path.parent.name
+    return config_path.stem
 
 
 def _find_link_peer_locations(
@@ -62,7 +63,7 @@ def _find_link_peer_locations(
     configs_dir = Path(topology_dir) / "configs"
     if not configs_dir.exists():
         return []
-    target_config = configs_dir / f"{target_device}.sh"
+    target_config = _device_config_path(configs_dir, target_device)
     target_networks = _parse_device_interface_networks(target_config)
     target_config_interface = _resolve_config_interface(target_interface, list(target_networks.keys()))
     if not target_config_interface:
@@ -72,8 +73,8 @@ def _find_link_peer_locations(
         return []
     peers: list[dict[str, str]] = []
     seen = set()
-    for config_path in sorted(configs_dir.glob("*.sh")):
-        peer_device = config_path.stem
+    for config_path in _iter_device_config_paths(configs_dir):
+        peer_device = _device_name_for_config_path(config_path)
         if peer_device == target_device:
             continue
         for peer_interface, peer_network in _parse_device_interface_networks(config_path).items():
@@ -173,17 +174,3 @@ def score_scenario_fault_episodes(
         eval_result.details["episode_id"] = episode_info.get("episode_id")
         scored_results.append(eval_result)
     return scored_results
-
-
-def resolve_scenario_files(path: str) -> list[str]:
-    target = Path(path)
-    if not target.exists():
-        raise FileNotFoundError(f"Scenario path not found: {path}")
-    if target.is_file():
-        if target.suffix not in {".yaml", ".yml"}:
-            raise ValueError(f"Scenario file must be .yaml/.yml: {path}")
-        return [str(target)]
-    files = sorted([str(p) for p in target.iterdir() if p.is_file() and p.suffix in {".yaml", ".yml"}])
-    if not files:
-        raise ValueError(f"No scenario YAML files found directly under {path}")
-    return files

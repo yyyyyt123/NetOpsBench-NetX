@@ -1,6 +1,8 @@
 """Tests for the public scenario authoring API."""
 
-from netopsbench.platform.faults.specs import FaultSpec, register_fault_spec, unregister_fault_spec
+import pytest
+
+from netopsbench.platform.faults.specs import FaultSpec
 from netopsbench.platform.scenario.models import Episode, Scenario
 from netopsbench.platform.scenario.validator import validate_scenario
 
@@ -43,38 +45,53 @@ def test_scenario_manager_can_create_and_roundtrip_yaml(tmp_path):
     assert loaded.metadata["expected_diagnosis"] == "static_route_misconfig"
 
 
-def test_scenario_validation_uses_fault_registry(tmp_path):
+@pytest.mark.parametrize("profile", ["light", "stress"])
+def test_scenario_manager_rejects_nonstandard_traffic_profile(tmp_path, profile):
     from netopsbench.sdk.scenarios import ScenarioManager
 
-    register_fault_spec(
-        FaultSpec(
-            name="public_registry_fault",
-            required_parameters=("probe",),
-        )
-    )
-    try:
-        manager = ScenarioManager(workspace=tmp_path)
-        scenario = manager.create(
-            id="registry_case",
-            name="Registry Case",
-            description="desc",
-            scale="xs",
-            traffic_profile="standard",
-            episodes=[
-                {
-                    "episode_id": "ep001",
-                    "description": "fault",
-                    "fault_type": "public_registry_fault",
-                    "target_device": "leaf1",
-                    "parameters": {"probe": "icmp"},
-                }
-            ],
-            metadata={"difficulty": "easy", "expected_diagnosis": "public_registry_fault"},
-        )
+    manager = ScenarioManager(workspace=tmp_path)
 
-        assert manager.validate(scenario) == []
-    finally:
-        unregister_fault_spec("public_registry_fault")
+    with pytest.raises(ValueError, match="Only the standard traffic profile is supported"):
+        manager.create(id="legacy_profile", name="Legacy Profile", traffic_profile=profile)
+
+
+def test_supported_scales_are_available_from_public_sdk():
+    from netopsbench.sdk import supported_scales
+
+    assert supported_scales() == ("xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12")
+
+
+def test_scenario_validation_uses_fault_registry(tmp_path):
+    from netopsbench.sdk import NetOpsBench
+
+    bench = NetOpsBench(workspace=str(tmp_path))
+    bench.faults.register(
+        spec=FaultSpec(name="public_registry_fault", required_parameters=("probe",)),
+        executor=type(
+            "Executor",
+            (),
+            {"inject": lambda self, context: {}, "recover": lambda self, context: {}},
+        )(),
+    )
+    scenario = bench.scenarios.create(
+        id="registry_case",
+        name="Registry Case",
+        description="desc",
+        scale="xs",
+        traffic_profile="standard",
+        episodes=[
+            {
+                "episode_id": "ep001",
+                "description": "fault",
+                "fault_type": "public_registry_fault",
+                "target_device": "leaf1",
+                "parameters": {"probe": "icmp"},
+            }
+        ],
+        metadata={"difficulty": "easy", "expected_diagnosis": "public_registry_fault"},
+    )
+
+    assert bench.scenarios.validate(scenario) == []
 
 
 def test_validate_scenario_does_not_mutate_episode_fault_type():

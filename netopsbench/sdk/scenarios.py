@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from netopsbench.models.profiles import supported_scales
 from netopsbench.platform.scenario.executor import Episode, Scenario
 from netopsbench.platform.scenario.parser import (
     episode_from_dict,
@@ -88,6 +89,8 @@ class ScenarioManager:
         metadata: dict[str, Any] | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> ScenarioHandle:
+        if traffic_profile != "standard":
+            raise ValueError(f"Only the standard traffic profile is supported, got: {traffic_profile}")
         payload = {
             "scenario_id": id,
             "name": name,
@@ -110,7 +113,9 @@ class ScenarioManager:
 
     def validate(self, handle: ScenarioHandle | Scenario) -> list[str]:
         scenario = self._coerce_scenario(handle)
-        return validate_scenario(scenario)
+        fault_manager = getattr(getattr(self, "platform", None), "faults", None)
+        registry = getattr(fault_manager, "spec_registry", None)
+        return validate_scenario(scenario, fault_registry=registry)
 
     def _coerce_scenario(self, handle: ScenarioHandle | Scenario) -> Scenario:
         if isinstance(handle, ScenarioHandle):
@@ -125,3 +130,6 @@ class ScenarioManager:
         if isinstance(value, dict):
             return episode_to_dict(episode_from_dict(value))
         raise TypeError(f"Unsupported episode value: {type(value)!r}")
+
+
+__all__ = ["ScenarioHandle", "ScenarioManager", "supported_scales"]

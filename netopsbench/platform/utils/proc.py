@@ -6,6 +6,7 @@ import logging
 import os
 import subprocess
 from collections.abc import Sequence
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -19,14 +20,29 @@ DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120
 def sudo_prefix() -> list[str]:
     """Return the sudo prefix for privileged subprocess calls.
 
-    By default returns ``["sudo", "-n"]`` so that Docker and Containerlab
-    commands work on machines where the user is not in the ``docker`` group.
+    By default returns ``["sudo", "-n"]`` for Containerlab and privileged
+    host operations.
 
     Set the environment variable ``NETOPSBENCH_NO_SUDO=1`` to suppress the
     prefix (e.g. in CI containers where the process already runs as root or
     in a docker-group session).
     """
     if os.environ.get("NETOPSBENCH_NO_SUDO", "").strip() == "1":
+        return []
+    return ["sudo", "-n"]
+
+
+def docker_prefix() -> list[str]:
+    """Return a privilege prefix only when the Docker socket requires it.
+
+    Docker commands dominate the large-topology control path. Users with
+    direct access to the local Docker socket should not pay for a separate
+    sudo/PAM process on every ``docker exec``.
+    """
+    if os.environ.get("NETOPSBENCH_NO_SUDO", "").strip() == "1" or os.geteuid() == 0:
+        return []
+    socket = Path("/var/run/docker.sock")
+    if socket.exists() and os.access(socket, os.R_OK | os.W_OK):
         return []
     return ["sudo", "-n"]
 

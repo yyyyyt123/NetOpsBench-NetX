@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import json
 import textwrap
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+from netopsbench.models.profiles import supported_scales
 from netopsbench.sdk.exceptions import RunFailedError
+
+SUPPORTED_REPORT_SCALES = set(supported_scales())
 
 
 class BenchmarkReport:
@@ -164,7 +167,7 @@ def _short_scenario_id(scenario_id: str) -> str:
         sid = sid[len("generated_") :]
     # Strip trailing scale + numeric suffix like "_xs_001".
     parts = sid.rsplit("_", 2)
-    if len(parts) == 3 and parts[-2] in {"xs", "small", "medium", "large"} and parts[-1].isdigit():
+    if len(parts) == 3 and parts[-2] in SUPPORTED_REPORT_SCALES and parts[-1].isdigit():
         sid = parts[0]
     return sid
 
@@ -486,8 +489,8 @@ class RunHandle:
         self.id = id
         self.mode = mode
         self.status = status
-        self.started_at = started_at
-        self.completed_at = completed_at
+        self.started_at = _coerce_datetime(started_at)
+        self.completed_at = _coerce_datetime(completed_at) if completed_at is not None else None
         self.artifact_dir = str(artifact_dir)
         self.scenario_ids = list(scenario_ids)
         self.runtime_id = runtime_id
@@ -543,13 +546,12 @@ class RunHandle:
     def cancel(self) -> None:
         if self.status not in {"completed", "failed", "cancelled"}:
             self.status = "cancelled"
-            self.completed_at = self.completed_at or datetime.now(self.started_at.tzinfo)
+            self.completed_at = self.completed_at or datetime.now(UTC)
 
 
 def _coerce_datetime(value: Any) -> datetime:
-    if isinstance(value, datetime):
-        return value
-    return datetime.fromisoformat(str(value))
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
 def _report_succeeded(report: BenchmarkReport) -> bool:

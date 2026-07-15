@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from netopsbench.agents.base import DiagnosticContext
 
@@ -43,7 +43,7 @@ class ScenarioSpec:
     name: str
     description: str = ""
     topology_scale: str = "xs"
-    traffic_profile: str = "standard"
+    traffic_profile: Literal["standard"] = "standard"
     episodes: list[EpisodeSpec] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
     parameters: dict[str, Any] = field(default_factory=dict)

@@ -13,11 +13,9 @@ from __future__ import annotations
 import socket
 import threading
 
-try:
-    from ._agent_support import logger
-except ImportError:  # standalone in-container deployment
-    from _agent_support import logger  # type: ignore[no-redef]
+from netopsbench.logging_utils import get_logger
 
+logger = get_logger(__name__)
 
 _RECV_BUF_SIZE = 65535
 _SOCK_RCVBUF_BYTES = 4 * 1024 * 1024  # 4 MB; absorbs bursty traffic

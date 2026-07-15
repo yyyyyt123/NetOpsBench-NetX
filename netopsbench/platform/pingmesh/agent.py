@@ -2,98 +2,34 @@
 """Pingmesh probe agent library.
 
 Defines :class:`PingmeshAgent`. The CLI entrypoint lives in
-:mod:`netopsbench.platform.pingmesh.cli` (also copied into each client
-container by :mod:`netopsbench.platform.pingmesh.deploy`).
+:mod:`netopsbench.platform.pingmesh.cli` (also staged and bind-mounted into
+each client container by :mod:`netopsbench.platform.pingmesh.deploy`).
 """
 
 from __future__ import annotations
 
-try:
-    from netopsbench.platform.pingmesh._agent_influx import PingInfluxMixin
-    from netopsbench.platform.pingmesh._agent_probe import UdpProbeMixin
-    from netopsbench.platform.pingmesh._agent_responder import UdpEchoResponder
-    from netopsbench.platform.pingmesh._agent_runtime import PingRuntimeMixin
-    from netopsbench.platform.pingmesh._agent_support import (
-        config,
-        json,
-        logger,
-        os,
-        queue,
-        requests,
-        threading,
-        time,
-    )
-except ImportError:  # In-container deployment runs from /tmp/pingmesh/ flat files.
-    from _agent_influx import PingInfluxMixin  # type: ignore[no-redef]
-    from _agent_probe import UdpProbeMixin  # type: ignore[no-redef]
-    from _agent_responder import UdpEchoResponder  # type: ignore[no-redef]
-    from _agent_runtime import PingRuntimeMixin  # type: ignore[no-redef]
-    from _agent_support import (  # type: ignore[no-redef]
-        config,
-        json,
-        logger,
-        os,
-        queue,
-        requests,
-        threading,
-        time,
-    )
+import hashlib
+import json
+import os
+import queue
+import threading
+import time
+
+import requests
+
+from netopsbench.config import config
+from netopsbench.logging_utils import get_logger
+from netopsbench.platform.pingmesh._agent_influx import PingInfluxMixin
+from netopsbench.platform.pingmesh._agent_probe import UdpProbeMixin
+from netopsbench.platform.pingmesh._agent_responder import UdpEchoResponder
+from netopsbench.platform.pingmesh._agent_runtime import PingRuntimeMixin
+
+logger = get_logger(__name__)
 
 
-def _pinglist_client_count(data: dict) -> int:
-    clients = set()
-    for probe in data.get("probes", []):
-        src_name = str(probe.get("src_name") or "").strip()
-        dst_name = str(probe.get("dst_name") or "").strip()
-        if src_name:
-            clients.add(src_name)
-        if dst_name:
-            clients.add(dst_name)
-    return len(clients)
-
-
-def _default_ports_per_cycle(client_count: int) -> tuple[int, int]:
-    if client_count <= 8:
-        return 8, 2
-    if client_count <= 16:
-        return 6, 1
-    return 4, 1
-
-
-def _optional_int_env(name: str) -> int | None:
-    raw = str(os.environ.get(name, "") or "").strip()
-    if not raw:
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        logger.warning("Ignoring invalid %s=%r; expected integer", name, raw)
-        return None
-
-
-def _resolve_ports_per_cycle(
-    *,
-    client_count: int,
-    n_rtt_ports: int,
-    n_df_ports: int,
-    enable_df_probe: bool,
-) -> tuple[int, int]:
-    default_rtt, default_df = _default_ports_per_cycle(client_count)
-    rtt_override = _optional_int_env("PINGMESH_RTT_PORTS_PER_CYCLE")
-    df_override = _optional_int_env("PINGMESH_DF_PORTS_PER_CYCLE")
-
-    if n_rtt_ports <= 0:
-        rtt_ports = 0
-    else:
-        rtt_ports = rtt_override if rtt_override is not None else default_rtt
-        rtt_ports = max(1, min(int(rtt_ports), int(n_rtt_ports)))
-
-    if not enable_df_probe or n_df_ports <= 0:
-        df_ports = 0
-    else:
-        df_ports = df_override if df_override is not None else default_df
-        df_ports = max(0, min(int(df_ports), int(n_df_ports)))
-    return rtt_ports, df_ports
+def _stable_host_seed(hostname: str) -> int:
+    digest = hashlib.blake2s(str(hostname or "").encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, "big")
 
 
 def _deterministic_startup_jitter_seconds(hostname: str, interval: float) -> float:
@@ -103,8 +39,44 @@ def _deterministic_startup_jitter_seconds(hostname: str, interval: float) -> flo
         interval_value = 0.0
     if interval_value <= 0:
         return 0.0
-    seed = sum((idx + 1) * ord(ch) for idx, ch in enumerate(str(hostname or "")))
+    seed = _stable_host_seed(hostname)
     return (seed % 10_000) / 10_000.0 * interval_value
+
+
+def _deterministic_phase(hostname: str, modulus: int) -> int:
+    if modulus <= 1:
+        return 0
+    return _stable_host_seed(hostname) % modulus
+
+
+def _rotating_destination_batch(
+    tasks: list[dict],
+    batch_size: int,
+    batch_index: int,
+    phase_offset: int = 0,
+) -> list[dict]:
+    if not tasks:
+        return []
+    size = max(1, min(int(batch_size), len(tasks)))
+    batch_count = max(1, (len(tasks) + size - 1) // size)
+    phase = int(phase_offset) % len(tasks)
+    ordered = tasks[phase:] + tasks[:phase]
+    return ordered[int(batch_index) % batch_count :: batch_count]
+
+
+def _probe_batch_indices(
+    cycle: int,
+    destination_batch_count: int,
+    port_batch_count: int,
+    port_phase: int = 0,
+) -> tuple[int, int]:
+    """Return one deterministic destination/port-batch Cartesian pair."""
+    destination_count = max(1, int(destination_batch_count))
+    port_count = max(1, int(port_batch_count))
+    epoch_cycle = int(cycle) % (destination_count * port_count)
+    destination_batch = epoch_cycle % destination_count
+    port_round = epoch_cycle // destination_count
+    return destination_batch, (port_round + int(port_phase)) % port_count
 
 
 class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
@@ -113,44 +85,27 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
     def __init__(
         self,
         pinglist_file: str,
-        interval: float = 1.0,
-        influxdb_url: str = None,
-        influxdb_token: str = None,
-        influxdb_org: str = None,
-        influxdb_bucket: str = None,
-        # UDP burst probe params (replaces former ICMP ping_count / ping_interval)
-        n_rtt_ports: int = 16,
-        n_df_ports: int = 4,
+        influxdb_url: str | None = None,
+        influxdb_token: str | None = None,
+        influxdb_org: str | None = None,
+        influxdb_bucket: str | None = None,
         udp_dst_port: int = 33434,
         rtt_src_port_base: int = 33000,
-        df_src_port_base: int = 33100,
-        burst_timeout_s: float = 1.0,
         enable_df_probe: bool = True,
-        df_payload_size: int = 1400,
-        min_interval: float = 1.0,
-        max_interval: float = 1.0,
         batch_size: int = 50,
         batch_timeout: float = 2.0,
         max_retries: int = 3,
         retry_backoff_base: float = 0.5,
     ):
-        self.interval = interval
         self.my_name = os.environ.get("HOSTNAME", "unknown")
-        self.n_rtt_ports = n_rtt_ports
-        self.n_df_ports = n_df_ports
         self.udp_dst_port = udp_dst_port
         self.rtt_src_port_base = rtt_src_port_base
-        self.df_src_port_base = df_src_port_base
-        self.burst_timeout_s = burst_timeout_s
-        self.min_interval = min_interval
-        self.max_interval = max_interval
         self.enable_df_probe = enable_df_probe
-        self.df_payload_size = df_payload_size
         self.influxdb_url = influxdb_url or config.influxdb_url
         self.influxdb_token = influxdb_token or config.influxdb_token
         self.influxdb_org = influxdb_org or config.influxdb_org
         self.influxdb_bucket = influxdb_bucket or config.influxdb_bucket
-        self.use_influxdb = requests is not None
+        self.use_influxdb = True
         self.batch_size = batch_size
         self.batch_timeout = batch_timeout
         self.max_retries = max_retries
@@ -158,24 +113,53 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
 
         with open(pinglist_file, encoding="utf-8") as f:
             data = json.load(f)
-        self.topology_id = config.topology_id or data.get("topology_id") or ""
-        self.pinglist_client_count = _pinglist_client_count(data)
-        self.rtt_ports_per_cycle, self.df_ports_per_cycle = _resolve_ports_per_cycle(
-            client_count=self.pinglist_client_count,
-            n_rtt_ports=self.n_rtt_ports,
-            n_df_ports=self.n_df_ports,
-            enable_df_probe=self.enable_df_probe,
-        )
+        policy = dict(data.get("pingmesh_policy") or {})
+        required_policy = {
+            "rtt_port_pool_size",
+            "rtt_ports_per_cycle",
+            "cycle_interval_seconds",
+            "destination_batch_count",
+            "port_batch_count",
+            "coverage_epoch_cycles",
+            "coverage_epoch_seconds",
+            "df_payload_size",
+        }
+        missing_policy = sorted(required_policy - policy.keys())
+        if missing_policy:
+            raise ValueError(
+                "Pingmesh policy is incomplete; regenerate the topology. "
+                f"Missing fields: {', '.join(missing_policy)}"
+            )
+        configured_destination_batch_size = policy.get("destination_batch_size")
+        self.n_rtt_ports = int(policy["rtt_port_pool_size"])
+        self.rtt_ports_per_cycle = max(1, min(int(policy["rtt_ports_per_cycle"]), self.n_rtt_ports))
+        self.interval = float(policy["cycle_interval_seconds"])
+        self.min_interval = self.interval
+        self.max_interval = self.interval
+        self.coverage_epoch_cycles = max(1, int(policy["coverage_epoch_cycles"]))
+        self.coverage_epoch_seconds = max(1, int(policy["coverage_epoch_seconds"]))
+        self.df_payload_size = int(policy["df_payload_size"])
+        self.topology_id = data.get("topology_id") or ""
         self.startup_jitter_s = _deterministic_startup_jitter_seconds(self.my_name, self.interval)
 
-        # Auto-derive DF payload size from topology MTU when using the default value.
-        if self.df_payload_size == 1400:
-            topo_mtu = self._infer_df_payload_from_topology()
-            if topo_mtu is not None:
-                self.df_payload_size = topo_mtu
-                logger.info("  DF payload auto-derived from topology MTU: %s bytes", self.df_payload_size)
-
         self.tasks = [probe for probe in data["probes"] if probe["src_name"] == self.my_name]
+        self.destination_batch_size = int(configured_destination_batch_size or len(self.tasks) or 1)
+        self.destination_batch_count = max(
+            1, (len(self.tasks) + self.destination_batch_size - 1) // self.destination_batch_size
+        )
+        source_names = list(dict.fromkeys(str(probe.get("src_name")) for probe in data["probes"]))
+        self.destination_phase = source_names.index(self.my_name) if self.my_name in source_names else 0
+        self.rtt_port_batch_count = max(
+            1, (self.n_rtt_ports + self.rtt_ports_per_cycle - 1) // self.rtt_ports_per_cycle
+        )
+        if int(policy["destination_batch_count"]) != self.destination_batch_count:
+            raise ValueError("Pingmesh destination batch count is stale; regenerate the topology")
+        if int(policy["port_batch_count"]) != self.rtt_port_batch_count:
+            raise ValueError("Pingmesh port batch count is stale; regenerate the topology")
+        if self.coverage_epoch_cycles != self.destination_batch_count * self.rtt_port_batch_count:
+            raise ValueError("Pingmesh coverage epoch is stale; regenerate the topology")
+        self.rtt_port_phase = _deterministic_phase(self.my_name, self.rtt_port_batch_count)
+        self.probe_cycle = 0
         # Discover this host's data-plane IP from the pinglist so the UDP
         # responder binds to the fabric-facing interface (eth1), not mgmt.
         own_data_ip = next(
@@ -208,30 +192,29 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
 
         logger.info("Pingmesh Agent started: %s", self.my_name)
         logger.info("  Probe tasks: %s", len(self.tasks))
-        active_port_count = self.rtt_ports_per_cycle + (self.df_ports_per_cycle if self.enable_df_probe else 0)
-        logger.info("  Probe worker: 1")
-        logger.info("  Concurrent flows: %s", len(self.tasks) * active_port_count)
         logger.info(
-            "  Port pool: RTT %s ports (src %s-%s), DF %s ports (src %s-%s)",
+            "  Destination rotation: %s active, %s batches, phase=%s",
+            min(self.destination_batch_size, len(self.tasks)),
+            self.destination_batch_count,
+            self.destination_phase,
+        )
+        logger.info("  Coverage epoch: %s cycles (%ss)", self.coverage_epoch_cycles, self.coverage_epoch_seconds)
+        active_port_count = self.rtt_ports_per_cycle
+        logger.info("  Probe worker: 1")
+        active_destinations = min(self.destination_batch_size, len(self.tasks))
+        logger.info("  Concurrent flows: %s", active_destinations * active_port_count)
+        logger.info(
+            "  Shared RTT/DF port pool: %s ports (src %s-%s)",
             self.n_rtt_ports,
             self.rtt_src_port_base,
             self.rtt_src_port_base + self.n_rtt_ports - 1,
-            self.n_df_ports if self.enable_df_probe else 0,
-            self.df_src_port_base,
-            self.df_src_port_base + self.n_df_ports - 1,
         )
         logger.info(
-            "  Active ports/cycle: RTT %s/%s, DF %s/%s",
+            "  Active ports/cycle: RTT %s/%s; DF reuses one matching tuple per destination",
             self.rtt_ports_per_cycle,
             self.n_rtt_ports,
-            self.df_ports_per_cycle if self.enable_df_probe else 0,
-            self.n_df_ports if self.enable_df_probe else 0,
         )
-        logger.info(
-            "  UDP destination: :%s, timeout=%ss",
-            self.udp_dst_port,
-            self.burst_timeout_s,
-        )
+        logger.info("  UDP destination: :%s", self.udp_dst_port)
         if self.enable_df_probe:
             logger.info(
                 "  DF payload: %s bytes",
@@ -247,28 +230,26 @@ class PingmeshAgent(UdpProbeMixin, PingInfluxMixin, PingRuntimeMixin):
         logger.info("  Batch size: %s, timeout: %ss", self.batch_size, self.batch_timeout)
         logger.info("  InfluxDB mode: %s", "enabled" if self.use_influxdb else "disabled")
 
-    def _infer_df_payload_from_topology(self):
-        """Derive DF payload size from topology metadata MTU (minus IP+ICMP headers = 28 bytes)."""
-        topo_dir = config.topology_dir or ""
-        candidates = []
-        if topo_dir:
-            candidates.append(os.path.join(topo_dir, "topology.json"))
-        # Fallback: look relative to project root
-        base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-        import glob as _glob
-
-        for d in sorted(_glob.glob(os.path.join(base_dir, "lab-topology", "generated_topology_*")), reverse=True):
-            candidates.append(os.path.join(d, "topology.json"))
-        for path in candidates:
-            try:
-                with open(path, encoding="utf-8") as f:
-                    meta = json.load(f)
-                defaults = meta.get("defaults", {})
-                # Prefer sonic_port_mtu (actual device MTU) over link_mtu (container MTU)
-                mtu = defaults.get("sonic_port_mtu") or defaults.get("link_mtu")
-                if isinstance(mtu, int) and mtu > 28:
-                    return mtu - 28  # subtract IP + ICMP header overhead
-            except Exception:
-                logger.debug("failed to read MTU metadata from %s", path, exc_info=True)
-                continue
-        return None
+    def next_probe_batch(self) -> tuple[list[dict], dict[str, int]]:
+        cycle = self.probe_cycle
+        destination_batch_index, port_batch_index = _probe_batch_indices(
+            cycle,
+            self.destination_batch_count,
+            self.rtt_port_batch_count,
+            self.rtt_port_phase,
+        )
+        tasks = _rotating_destination_batch(
+            self.tasks,
+            self.destination_batch_size,
+            destination_batch_index,
+            self.destination_phase,
+        )
+        metadata = {
+            "probe_cycle": cycle,
+            "destination_batch_index": destination_batch_index,
+            "port_batch_index": port_batch_index,
+            "coverage_epoch": cycle // self.coverage_epoch_cycles,
+            "coverage_epoch_cycles": self.coverage_epoch_cycles,
+        }
+        self.probe_cycle += 1
+        return tasks, metadata

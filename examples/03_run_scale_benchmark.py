@@ -25,10 +25,10 @@ from examples._common import (
     wait_and_print_run,
 )
 from examples.agents import MinimalDeepAgent
-from netopsbench.sdk import NetOpsBench
+from netopsbench.sdk import NetOpsBench, supported_scales
 
 DEFAULT_SCALE = "xs"
-SCALE_CHOICES = ["xs", "small", "medium", "large"]
+SCALE_CHOICES = list(supported_scales())
 
 
 def main(

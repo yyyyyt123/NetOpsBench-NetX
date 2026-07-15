@@ -5,8 +5,11 @@ from __future__ import annotations
 import subprocess
 
 from netopsbench.logging_utils import get_logger
+from netopsbench.platform.observability.bgp_parser import parse_bgp_summary
+from netopsbench.platform.topology.topology_utils import is_network_device_name
 
 from ..common import ToolResult, truncate_text_lines
+from .route_parsers import parse_route_table
 
 logger = get_logger(__name__)
 
@@ -18,7 +21,7 @@ class RoutingOpsMixin:
             safe_format = (format or "raw").lower()
             if safe_format not in {"raw", "structured", "both"}:
                 return ToolResult(success=False, data=None, error=f"Invalid format: {format}")
-            if not device.startswith(("spine", "leaf")):
+            if not is_network_device_name(device):
                 return ToolResult(success=False, data=None, error=f"Device {device} does not run BGP")
             container = self._resolve_container(device)
             result = self._docker_exec(container, ["vtysh", "-c", "show ip bgp summary"], timeout=30)
@@ -26,7 +29,7 @@ class RoutingOpsMixin:
                 return ToolResult(success=False, data=None, error=result.stderr)
             raw_data = {"device": device, "bgp_neighbors": result.stdout}
             if safe_format in {"structured", "both"}:
-                neighbors = self._parse_bgp_summary(result.stdout)
+                neighbors = parse_bgp_summary(result.stdout)
                 # Enrich non-Established peers with detail (last error, reset reason)
                 for nbr in neighbors:
                     if nbr.get("state") and nbr["state"] != "Established" and nbr.get("neighbor"):
@@ -44,6 +47,59 @@ class RoutingOpsMixin:
             return ToolResult(success=False, data=None, error="Command timed out")
         except Exception as e:
             return ToolResult(success=False, data=None, error=str(e))
+
+    def get_bgp_neighbor(self, device: str, peer: str) -> ToolResult:
+        """Return live detail for one BGP session on one device."""
+        try:
+            self._validate_device_name(device)
+            safe_peer = self._validate_ip_address(peer, "peer")
+            if not is_network_device_name(device):
+                return ToolResult(success=False, data=None, error=f"Device {device} does not run BGP")
+            container = self._resolve_container(device)
+            detail_result = self._docker_exec(
+                container,
+                ["vtysh", "-c", f"show ip bgp neighbors {safe_peer}"],
+                timeout=15,
+            )
+            if detail_result.returncode != 0:
+                return ToolResult(success=False, data=None, error=detail_result.stderr)
+            detail = self._parse_bgp_neighbor_detail(detail_result.stdout)
+            summary_result = self._docker_exec(container, ["vtysh", "-c", "show ip bgp summary"], timeout=15)
+            summary = None
+            if summary_result.returncode == 0:
+                summary = next(
+                    (row for row in parse_bgp_summary(summary_result.stdout) if row.get("neighbor") == safe_peer),
+                    None,
+                )
+            if not detail and summary is None:
+                return ToolResult(success=False, data=None, error=f"BGP neighbor {safe_peer} not found on {device}")
+            summary = summary or {}
+            return ToolResult(
+                success=True,
+                data={
+                    "device": device,
+                    "peer": safe_peer,
+                    "state": summary.get("state") or detail.get("bgp_state"),
+                    "peer_as": summary.get("asn") or detail.get("remote_as"),
+                    "configured_as": detail.get("remote_as"),
+                    "local_address": detail.get("local_address"),
+                    "foreign_address": detail.get("foreign_address"),
+                    "uptime": summary.get("up_down") or detail.get("uptime"),
+                    "last_reset": detail.get("last_reset"),
+                    "last_error": detail.get("last_error"),
+                    "notifications": detail.get("notifications", []),
+                    "update_source": detail.get("update_source"),
+                    "message_counters": {
+                        "received": summary.get("msg_rcvd"),
+                        "sent": summary.get("msg_sent"),
+                    },
+                    "prefixes_received": summary.get("prefixes_received"),
+                },
+            )
+        except subprocess.TimeoutExpired:
+            return ToolResult(success=False, data=None, error="Command timed out")
+        except Exception as exc:
+            return ToolResult(success=False, data=None, error=str(exc))
 
     def _get_bgp_neighbor_detail(self, container: str, neighbor_ip: str) -> dict | None:
         """Fetch per-neighbor detail for a non-Established peer."""
@@ -76,14 +132,14 @@ class RoutingOpsMixin:
                 detail["last_reset"] = line_s
             elif "Notification" in line_s and ("sent" in line_s or "rcvd" in line_s):
                 detail.setdefault("notifications", []).append(line_s)
-            elif "remote AS" in line_s.lower():
-                m = re.search(r"remote AS (\d+)", line_s)
+            elif "remote as" in line_s.lower():
+                m = re.search(r"remote AS (\d+)", line_s, re.IGNORECASE)
                 if m:
                     detail["remote_as"] = int(m.group(1))
             elif "Local host:" in line_s:
-                detail["local_host"] = line_s
+                detail["local_address"] = line_s.split("Local host:", 1)[1].split(",", 1)[0].strip()
             elif "Foreign host:" in line_s:
-                detail["foreign_host"] = line_s
+                detail["foreign_address"] = line_s.split("Foreign host:", 1)[1].split(",", 1)[0].strip()
             elif "update-source" in line_s.lower():
                 detail["update_source"] = line_s
             elif "password" in line_s.lower() and "configured" in line_s.lower():
@@ -105,7 +161,7 @@ class RoutingOpsMixin:
             safe_format = (format or "raw").lower()
             if safe_format not in {"raw", "structured", "both"}:
                 return ToolResult(success=False, data=None, error=f"Invalid format: {format}")
-            if not device.startswith(("spine", "leaf")):
+            if not is_network_device_name(device):
                 return ToolResult(success=False, data=None, error=f"Device {device} is not a router")
             container = self._resolve_container(device)
             if prefix:
@@ -120,7 +176,7 @@ class RoutingOpsMixin:
             route_text, route_meta = truncate_text_lines(result.stdout, max_lines)
             raw_data = {"device": device, "prefix": safe_prefix, "route_table": route_text, **route_meta}
             if safe_format in {"structured", "both"}:
-                routes = self._parse_route_table(result.stdout)
+                routes = parse_route_table(result.stdout)
                 safe_max_routes = max(1, int(max_routes))
                 structured = {
                     "device": device,
@@ -141,26 +197,11 @@ class RoutingOpsMixin:
         except Exception as e:
             return ToolResult(success=False, data=None, error=str(e))
 
-    def get_all_bgp_status(self) -> ToolResult:
-        results = {}
-        devices = []
-        if self.topology_metadata:
-            for spine in self.topology_metadata.get("devices", {}).get("spines", []):
-                devices.append(spine["name"])
-            for leaf in self.topology_metadata.get("devices", {}).get("leafs", []):
-                devices.append(leaf["name"])
-        else:
-            devices = [name for name in self.container_names.keys() if name.startswith(("spine", "leaf"))]
-        for device in devices:
-            result = self.get_bgp_neighbors(device)
-            results[device] = result.data if result.success else {"error": result.error}
-        return ToolResult(success=True, data=results)
-
     def get_device_config(self, device: str, section: str = "", max_lines: int = 500) -> ToolResult:
         """Retrieve running configuration from a SONiC/FRR device via vtysh."""
         try:
             self._validate_device_name(device)
-            if not device.startswith(("spine", "leaf")):
+            if not is_network_device_name(device):
                 return ToolResult(success=False, data=None, error=f"Device {device} does not support running-config")
             container = self._resolve_container(device)
             if section:
@@ -192,7 +233,7 @@ class RoutingOpsMixin:
         """Retrieve BGP RIB entries with AS path, origin, next-hop, local-pref details."""
         try:
             self._validate_device_name(device)
-            if not device.startswith(("spine", "leaf")):
+            if not is_network_device_name(device):
                 return ToolResult(success=False, data=None, error=f"Device {device} does not run BGP")
             container = self._resolve_container(device)
             if prefix:
@@ -230,7 +271,7 @@ class RoutingOpsMixin:
             safe_view = (view or "summary").lower()
             if safe_view not in {"summary", "frr", "iptables", "all"}:
                 return ToolResult(success=False, data=None, error=f"Invalid view: {view}")
-            if not device.startswith(("spine", "leaf")):
+            if not is_network_device_name(device):
                 return ToolResult(success=False, data=None, error=f"Device {device} does not support ACLs")
             container = self._resolve_container(device)
 

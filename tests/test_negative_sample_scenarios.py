@@ -1,16 +1,15 @@
+import tempfile
+
 from netopsbench.evaluator.scorer import AgentOutput, Evaluator
 from netopsbench.platform.scenario.executor import ScenarioExecutor
 from netopsbench.platform.scenario.models import Episode, Scenario
 from netopsbench.platform.session.scoring import score_scenario_fault_episodes
+from netopsbench.platform.topology.generator import generate_topology
 
-_TOPOLOGY_METADATA = {
-    "name": "dcn",
-    "devices": {
-        "spines": [{"name": "spine1"}],
-        "leafs": [{"name": "leaf1"}],
-        "clients": [{"name": "client1"}],
-    },
-}
+
+def _metadata() -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        return generate_topology("xs", tmpdir)["metadata"]
 
 
 def _none_episode(episode_id="ep001"):
@@ -26,7 +25,7 @@ def _none_episode(episode_id="ep001"):
 
 def test_negative_sample_none_episode_observes_and_diagnoses(monkeypatch):
     runner = ScenarioExecutor(
-        topology_metadata=_TOPOLOGY_METADATA,
+        topology_metadata=_metadata(),
         skip_none_episodes=True,
         sleep_fn=lambda seconds: None,
         persist_results=False,
@@ -73,7 +72,7 @@ def test_negative_sample_none_episode_observes_and_diagnoses(monkeypatch):
 
 def test_regular_skipped_none_episode_does_not_observe_or_diagnose(monkeypatch):
     runner = ScenarioExecutor(
-        topology_metadata=_TOPOLOGY_METADATA,
+        topology_metadata=_metadata(),
         skip_none_episodes=True,
         sleep_fn=lambda seconds: None,
         persist_results=False,

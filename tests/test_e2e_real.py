@@ -19,9 +19,8 @@ Cheap script/CLI checks live in ``tests/test_scripts_and_cli_smoke.py`` (default
 from __future__ import annotations
 
 import csv
-import os
 import time
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 
 import pytest
@@ -42,13 +41,21 @@ def _toolkit_or_skip() -> AgentToolkit:
         )
 
 
+def _detector_or_skip() -> AnomalyDetector:
+    toolkit = _toolkit_or_skip()
+    return AnomalyDetector(
+        influxdb_url=toolkit.influxdb_url,
+        token=toolkit.influxdb_token,
+        org=toolkit.influxdb_org,
+        bucket=toolkit.influxdb_bucket,
+        topology_metadata=toolkit.topology_metadata,
+        topology_id=toolkit.topology_id,
+    )
+
+
 @pytest.mark.real
 class TestPingmeshIntegration:
     """Tests for Pingmesh anomaly detection (InfluxDB on localhost)."""
-
-    @staticmethod
-    def _influx_token() -> str:
-        return os.environ.get("NETOPSBENCH_INFLUXDB_TOKEN") or "replace-me"
 
     def test_pingmesh_anomaly_detector(self):
         """
@@ -56,24 +63,20 @@ class TestPingmeshIntegration:
         - InfluxDB running at localhost:8086
         - Pingmesh data in netopsbench bucket
         """
-        detector = AnomalyDetector(
-            influxdb_url="http://localhost:8086",
-            token=self._influx_token(),
-            org="netopsbench",
-            bucket="netopsbench",
-        )
+        detector = _detector_or_skip()
 
-        now = datetime.utcnow().replace(microsecond=0)
+        now = datetime.now(UTC).replace(microsecond=0)
         baseline_start = (now - timedelta(minutes=10)).isoformat() + "Z"
         baseline_end = (now - timedelta(minutes=5)).isoformat() + "Z"
         current_start = baseline_end
         current_end = now.isoformat() + "Z"
 
-        report = detector.generate_anomaly_report(
+        report = detector.generate_windowed_anomaly_report(
             baseline_start=baseline_start,
             baseline_end=baseline_end,
             current_start=current_start,
             current_end=current_end,
+            windows=[{"name": "full", "start_time": current_start, "end_time": current_end}],
         )
 
         assert "timestamp" in report
@@ -89,64 +92,56 @@ class TestPingmeshIntegration:
         assert "by_dst_leaf" in report["aggregated_anomalies"]
 
     def test_latency_anomaly_detection(self):
-        detector = AnomalyDetector(
-            influxdb_url="http://localhost:8086",
-            token=self._influx_token(),
-            org="netopsbench",
-            bucket="netopsbench",
-        )
+        detector = _detector_or_skip()
 
-        now = datetime.utcnow().replace(microsecond=0)
+        now = datetime.now(UTC).replace(microsecond=0)
         baseline_start = (now - timedelta(minutes=10)).isoformat() + "Z"
         baseline_end = (now - timedelta(minutes=5)).isoformat() + "Z"
         current_start = baseline_end
         current_end = now.isoformat() + "Z"
 
-        anomalies = detector.detect_latency_anomalies(
+        report = detector.generate_windowed_anomaly_report(
             baseline_start=baseline_start,
             baseline_end=baseline_end,
             current_start=current_start,
             current_end=current_end,
+            windows=[{"name": "full", "start_time": current_start, "end_time": current_end}],
         )
+        anomalies = [item for item in report["anomalies"] if item["type"] == "latency_spike"]
 
         assert isinstance(anomalies, list)
 
         for anomaly in anomalies:
-            assert anomaly.type == "latency_spike"
-            assert anomaly.src_ip
-            assert anomaly.dst_ip
-            assert anomaly.value >= 0
-            assert anomaly.baseline >= 0
-            assert anomaly.severity in ["low", "medium", "high"]
+            assert anomaly["src_ip"]
+            assert anomaly["dst_ip"]
+            assert anomaly["value"] >= 0
+            assert anomaly["baseline"] >= 0
+            assert anomaly["severity"] in ["low", "medium", "high"]
 
     def test_packet_loss_detection(self):
-        detector = AnomalyDetector(
-            influxdb_url="http://localhost:8086",
-            token=self._influx_token(),
-            org="netopsbench",
-            bucket="netopsbench",
-        )
+        detector = _detector_or_skip()
 
-        now = datetime.utcnow().replace(microsecond=0)
+        now = datetime.now(UTC).replace(microsecond=0)
         baseline_start = (now - timedelta(minutes=10)).isoformat() + "Z"
         baseline_end = (now - timedelta(minutes=5)).isoformat() + "Z"
         current_start = baseline_end
         current_end = now.isoformat() + "Z"
 
-        anomalies = detector.detect_packet_loss(
+        report = detector.generate_windowed_anomaly_report(
             baseline_start=baseline_start,
             baseline_end=baseline_end,
             current_start=current_start,
             current_end=current_end,
+            windows=[{"name": "full", "start_time": current_start, "end_time": current_end}],
         )
+        anomalies = [item for item in report["anomalies"] if item["type"] == "packet_loss"]
 
         assert isinstance(anomalies, list)
 
         for anomaly in anomalies:
-            assert anomaly.type == "packet_loss"
-            assert anomaly.src_ip
-            assert anomaly.dst_ip
-            assert anomaly.value > 0
+            assert anomaly["src_ip"]
+            assert anomaly["dst_ip"]
+            assert anomaly["value"] > 0
 
 
 @pytest.mark.real
@@ -169,19 +164,19 @@ class TestTrafficGenerationLive:
             duration=5,
         )
 
-        flow_id = controller.start_flow(flow)
+        [flow_id] = controller.start_matrix([flow])
         assert flow_id == flow.flow_id
         assert flow_id in controller.active_flows
 
         time.sleep(6)
 
-        controller.stop_flow(flow_id)
+        controller.stop_all()
         assert flow_id not in controller.active_flows
 
 
 @pytest.mark.real
 class TestObservabilityNormal:
-    """Pingmesh summary, Grafana panel proxy, and datasource checks."""
+    """Pingmesh summary and packaged Grafana datasource checks."""
 
     @pytest.fixture(scope="class")
     def toolkit(self):
@@ -209,16 +204,16 @@ class TestObservabilityNormal:
 
     def test_grafana_datasource_configured(self, toolkit):
         health = requests.get(
-            f"{toolkit.grafana_url}/api/health",
-            auth=toolkit.grafana_auth,
+            "http://localhost:3000/api/health",
+            auth=("admin", "admin"),
             timeout=10,
             proxies={"http": "", "https": ""},
         )
         assert health.status_code == 200
 
         datasource = requests.get(
-            f"{toolkit.grafana_url}/api/datasources/uid/InfluxDB_v2",
-            auth=toolkit.grafana_auth,
+            "http://localhost:3000/api/datasources/uid/InfluxDB_v2",
+            auth=("admin", "admin"),
             timeout=10,
             proxies={"http": "", "https": ""},
         )

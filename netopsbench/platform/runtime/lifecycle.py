@@ -1,0 +1,235 @@
+"""Structured, idempotent runtime lifecycle orchestration."""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from pathlib import Path
+from time import monotonic
+from typing import Any, Literal, Protocol
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from netopsbench.config import config
+from netopsbench.models.profiles import get_scale_profile
+from netopsbench.models.runtime import RuntimeIdentity
+from netopsbench.platform.observability.lifecycle import ensure_worker_observability
+from netopsbench.platform.pingmesh.deploy import deploy_pingmesh
+from netopsbench.platform.runtime.deployment import (
+    allocate_management_subnets,
+    deploy_worker_lab,
+    runtime_deploy_lock,
+    teardown_worker_lab,
+)
+from netopsbench.platform.runtime.health import check_worker_health
+
+logger = logging.getLogger(__name__)
+
+
+class RuntimePoolLike(Protocol):
+    scale: str
+    root_dir: Path
+    workers: list[RuntimeIdentity]
+
+    @property
+    def size(self) -> int: ...
+
+
+class LifecycleStageResult(BaseModel):
+    """Persisted result for one runtime lifecycle stage."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    stage: str
+    status: Literal["completed", "failed"]
+    started_at: datetime
+    ended_at: datetime
+    duration_seconds: float = Field(ge=0)
+    details: dict[str, Any] = Field(default_factory=dict)
+    error: str | None = None
+
+
+class RuntimeLifecycleError(RuntimeError):
+    """Raised when a runtime lifecycle stage fails."""
+
+    def __init__(self, result: LifecycleStageResult):
+        self.result = result
+        super().__init__(f"Runtime lifecycle stage {result.stage!r} failed: {result.error}")
+
+
+def _parallel_job_count(scale: str, total: int) -> int:
+    configured = get_scale_profile(scale).worker_deploy_parallelism
+    return max(1, min(total, configured))
+
+
+def _append_worker_log_header(path: Path, label: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"\n=== {label} ===\n")
+
+
+def _worker_deploy_log_path(worker: RuntimeIdentity, runtime_root: Path | None = None) -> Path:
+    if runtime_root is None:
+        return worker.topology_dir / "deploy.log"
+    return runtime_root / "logs" / f"worker_{worker.worker_index:02d}.deploy.log"
+
+
+def deploy_workers(workers: Sequence[RuntimeIdentity], scale: str, runtime_root: Path | None = None) -> None:
+    if not workers:
+        return
+    job_count = _parallel_job_count(scale, len(workers))
+
+    def deploy(worker: RuntimeIdentity) -> None:
+        logger.info(
+            "[Worker Deploy %s/%s] %s subnet=%s",
+            worker.worker_index,
+            len(workers),
+            worker.lab_name,
+            worker.mgmt_subnet,
+        )
+        _append_worker_log_header(_worker_deploy_log_path(worker, runtime_root), f"worker deploy {worker.lab_name}")
+        deploy_worker_lab(worker, scale)
+
+    if job_count == 1:
+        for worker in workers:
+            deploy(worker)
+        return
+
+    failures: list[tuple[RuntimeIdentity, Exception]] = []
+    with ThreadPoolExecutor(max_workers=job_count) as executor:
+        future_map = {executor.submit(deploy, worker): worker for worker in workers}
+        for future in as_completed(future_map):
+            try:
+                future.result()
+            except Exception as exc:
+                failures.append((future_map[future], exc))
+    if failures:
+        worker, error = failures[0]
+        logger.error(
+            "Worker deployment failed for %s; see %s",
+            worker.lab_name,
+            _worker_deploy_log_path(worker, runtime_root),
+        )
+        raise error
+
+
+def ensure_worker_pingmesh(worker: RuntimeIdentity) -> None:
+    deploy_pingmesh(
+        topology_dir=str(worker.topology_dir),
+        pinglist_file=str(Path(worker.topology_dir) / "configs" / "pingmesh" / "pinglist.json"),
+        influxdb_token=config.influxdb_token,
+        influxdb_org=config.influxdb_org,
+        influxdb_bucket=worker.bucket,
+        topology_id=worker.topology_id,
+    )
+
+
+def validate_worker_health(worker: RuntimeIdentity, runtime_root: Path | None = None) -> None:
+    log_path = _worker_deploy_log_path(worker, runtime_root)
+    _append_worker_log_header(log_path, "worker health validation")
+    errors = check_worker_health(
+        worker,
+    )
+    if errors:
+        message = "; ".join(errors)
+        with open(log_path, "a", encoding="utf-8") as log_file:
+            log_file.write(f"Health check errors: {message}\n")
+        raise RuntimeError(f"Worker health check failed: {message}")
+
+
+def teardown_workers(workers: Sequence[RuntimeIdentity]) -> None:
+    for worker in workers:
+        try:
+            teardown_worker_lab(worker)
+        except Exception:
+            logger.warning("worker teardown failed for %s", worker.lab_name, exc_info=True)
+
+
+class RuntimeLifecycle:
+    """Execute the fixed runtime lifecycle stages."""
+
+    def run(self, stage: str, runtime: RuntimePoolLike) -> LifecycleStageResult:
+        operations = {
+            "deploy": self._deploy,
+            "observability": self._ensure_observability,
+            "pingmesh": self._ensure_pingmesh,
+            "warm": self._warm,
+            "teardown": self._teardown,
+        }
+        try:
+            operation = operations[stage]
+        except KeyError as exc:
+            raise ValueError(f"Unknown runtime lifecycle stage: {stage}") from exc
+
+        started_at = datetime.now(UTC)
+        started_tick = monotonic()
+        try:
+            details = operation(runtime) or {}
+        except Exception as exc:
+            ended_at = datetime.now(UTC)
+            result = LifecycleStageResult(
+                stage=stage,
+                status="failed",
+                started_at=started_at,
+                ended_at=ended_at,
+                duration_seconds=monotonic() - started_tick,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            raise RuntimeLifecycleError(result) from exc
+
+        return LifecycleStageResult(
+            stage=stage,
+            status="completed",
+            started_at=started_at,
+            ended_at=datetime.now(UTC),
+            duration_seconds=monotonic() - started_tick,
+            details=details,
+        )
+
+    @staticmethod
+    def _deploy(runtime: RuntimePoolLike) -> dict[str, Any]:
+        with runtime_deploy_lock():
+            subnets = allocate_management_subnets(runtime.scale, runtime.size)
+            runtime.workers = [
+                worker.model_copy(update={"mgmt_subnet": subnets[index]})
+                for index, worker in enumerate(runtime.workers)
+            ]
+            deploy_workers(runtime.workers, runtime.scale, runtime.root_dir)
+        return {"workers": runtime.size}
+
+    @staticmethod
+    def _ensure_observability(runtime: RuntimePoolLike) -> dict[str, Any]:
+        for worker in runtime.workers:
+            ensure_worker_observability(worker)
+        return {"workers": runtime.size}
+
+    @staticmethod
+    def _ensure_pingmesh(runtime: RuntimePoolLike) -> dict[str, Any]:
+        for worker in runtime.workers:
+            ensure_worker_pingmesh(worker)
+        return {"workers": runtime.size}
+
+    @staticmethod
+    def _warm(runtime: RuntimePoolLike) -> dict[str, Any]:
+        for worker in runtime.workers:
+            validate_worker_health(worker, runtime.root_dir)
+        return {"workers": runtime.size, "health": "ready"}
+
+    @staticmethod
+    def _teardown(runtime: RuntimePoolLike) -> dict[str, Any]:
+        teardown_workers(runtime.workers)
+        return {"workers": runtime.size}
+
+
+__all__ = [
+    "LifecycleStageResult",
+    "RuntimeLifecycle",
+    "RuntimeLifecycleError",
+    "deploy_workers",
+    "ensure_worker_observability",
+    "ensure_worker_pingmesh",
+    "teardown_workers",
+    "validate_worker_health",
+]

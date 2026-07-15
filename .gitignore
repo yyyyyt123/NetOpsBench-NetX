@@ -30,6 +30,8 @@ lab-topology/
 .worktrees/
 .agents/
 .pytest_cache/
+build/
+dist/
 tmp/
 .netopsbench*/
 
@@ -42,6 +44,7 @@ observability/telegraf.conf
 .coverage
 plot_*
 !scripts/plot_results.py
+examples/agents/minimal_deepagent/conversation_history/
 
 # Fumadocs / Next.js site artifacts
 docs/node_modules/
