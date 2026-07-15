@@ -1,9 +1,5 @@
 """Post-deploy SONiC activation for preseeded startup artifacts.
 
-CLI usage::
-
-    python -m netopsbench.platform.runtime.apply_configs <topology_dir> [max_parallel] [lab_name]
-
 Programmatic usage::
 
     from netopsbench.platform.runtime.apply_configs import apply_configs
@@ -12,23 +8,21 @@ Programmatic usage::
 
 from __future__ import annotations
 
-import glob
 import json
 import os
 import subprocess
-import sys
 import time
-from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from netopsbench.config import config
-from netopsbench.platform.topology.topology_utils import clab_container_name
-from netopsbench.platform.utils.proc import safe_run, sudo_prefix
-
+from netopsbench.models.topology import DeviceRole, TopologyManifest
+from netopsbench.platform.topology.config import SONIC_PORT_COUNTER_INTERVAL_MS
+from netopsbench.platform.topology.topology_utils import clab_container_name, load_topology_manifest
+from netopsbench.platform.utils.proc import docker_prefix, safe_run
 
 _REQUIRED_SONIC_SERVICES = ("redis-server", "orchagent", "zebra")
+SONIC_READINESS_MAX_TRIES = 180
 
 
 @dataclass
@@ -43,35 +37,18 @@ class ApplyResult:
     elapsed_seconds: float = 0.0
 
 
-def _resolve_lab_name(topology_dir: str, lab_name: str | None) -> str:
-    """Resolve the lab name from argument, topology metadata, or clab YAML."""
-    if lab_name:
-        return lab_name
-
-    metadata_file = os.path.join(topology_dir, "topology.json")
-    if os.path.isfile(metadata_file):
-        with open(metadata_file, encoding="utf-8") as fh:
-            data = json.load(fh)
-        name = (data.get("name") or "").strip()
-        if name:
-            return name
-
-    # Fall back to parsing the clab YAML header
-    clab_files = sorted(glob.glob(os.path.join(topology_dir, "*.clab.y*ml")))
-    for clab_file in clab_files:
-        with open(clab_file, encoding="utf-8") as fh:
-            for line in fh:
-                if line.startswith("name:"):
-                    name = line.split(":", 1)[1].strip()
-                    if name:
-                        return name
-                    break
-
-    return "dcn"
-
-
 def _preseed_config_file(topology_dir: str, device: str) -> str:
     return os.path.join(topology_dir, "configs", "sonic", device, "config_db.json")
+
+
+def _expected_port_count(config_file: str) -> int:
+    try:
+        with open(config_file, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return 0
+    ports = payload.get("PORT")
+    return len(ports) if isinstance(ports, dict) else 0
 
 
 def _startup_wrapper_file(topology_dir: str) -> str:
@@ -79,11 +56,11 @@ def _startup_wrapper_file(topology_dir: str) -> str:
 
 
 def _device_sort_key(device: str) -> tuple[int, int | str]:
-    for rank, prefix in enumerate(("spine", "leaf")):
+    for rank, prefix in enumerate(("core", "agg", "edge", "spine", "leaf")):
         if device.startswith(prefix):
             suffix = device[len(prefix) :]
             return (rank, int(suffix) if suffix.isdigit() else suffix)
-    return (2, device)
+    return (5, device)
 
 
 def _discover_devices(topology_dir: str) -> list[str]:
@@ -96,6 +73,16 @@ def _discover_devices(topology_dir: str) -> list[str]:
         if device_dir.is_dir() and (device_dir / "config_db.json").is_file()
     ]
     return sorted(devices, key=_device_sort_key)
+
+
+def _ecmp_hash_policies(manifest: TopologyManifest, devices: list[str]) -> dict[str, int]:
+    policies: dict[str, int] = {}
+    for device in devices:
+        manifest_device = manifest.device(device)
+        if manifest_device is None or manifest_device.role is DeviceRole.CLIENT:
+            raise RuntimeError(f"Preseeded SONiC device {device!r} is missing from topology manifest switches")
+        policies[device] = manifest.routing.ecmp_hash_policy_by_role[manifest_device.role]
+    return policies
 
 
 def _configdb_ready(prefix: list[str], container: str) -> bool:
@@ -156,10 +143,46 @@ def _required_services_ready(prefix: list[str], container: str) -> bool:
     return all(states.get(service) == "RUNNING" for service in _REQUIRED_SONIC_SERVICES)
 
 
-def _wait_for_sonic(device: str, container: str, max_tries: int | None = None, delay: int = 5) -> bool:
+def _countersdb_ready(prefix: list[str], container: str, expected_port_count: int) -> bool:
+    try:
+        ret = safe_run(
+            [
+                *prefix,
+                "docker",
+                "exec",
+                container,
+                "redis-cli",
+                "-n",
+                "2",
+                "--raw",
+                "HLEN",
+                "COUNTERS_PORT_NAME_MAP",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return False
+    if ret.returncode != 0:
+        return False
+    try:
+        return int(str(ret.stdout).strip()) >= expected_port_count
+    except ValueError:
+        return False
+
+
+def _wait_for_sonic(
+    device: str,
+    container: str,
+    max_tries: int | None = None,
+    delay: int = 5,
+    expected_port_count: int | None = None,
+) -> bool:
     """Block until SONiC control-plane and ConfigDB commands are responsive."""
-    max_tries = max_tries or config.sonic_wait_tries
-    prefix = sudo_prefix()
+    max_tries = max_tries or SONIC_READINESS_MAX_TRIES
+    prefix = docker_prefix()
     for _ in range(max_tries):
         _startup_status(prefix, container)
         configdb_ready = _configdb_ready(prefix, container)
@@ -187,25 +210,35 @@ def _wait_for_sonic(device: str, container: str, max_tries: int | None = None, d
             time.sleep(delay)
             continue
 
-        if _configdb_ready(prefix, container):
+        if _configdb_ready(prefix, container) and (
+            expected_port_count is None or _countersdb_ready(prefix, container, expected_port_count)
+        ):
             return True
         time.sleep(delay)
     return False
 
 
-def _activate_preseed_device(prefix: list[str], container: str) -> bool:
+def _activate_preseed_device(prefix: list[str], container: str, ecmp_hash_policy: int) -> bool:
     command = (
         "set -e; "
-        "sysctl -w net.ipv4.fib_multipath_hash_policy=1 >/dev/null || true; "
+        f"sysctl -w net.ipv4.fib_multipath_hash_policy={ecmp_hash_policy} >/dev/null; "
+        f'test "$(sysctl -n net.ipv4.fib_multipath_hash_policy)" = "{ecmp_hash_policy}"; '
         "supervisorctl start bgpd >/dev/null 2>&1 || true; "
         "if [ -s /etc/frr/frr.conf ]; then "
         "vtysh -b >/tmp/netopsbench-vtysh-batch.log 2>&1; "
         "fi; "
+        f"counterpoll port interval {SONIC_PORT_COUNTER_INTERVAL_MS} >/dev/null; "
         "mkdir -p /var/run/telemetry /var/log/telemetry || true; "
-        "if ! pgrep -x telemetry >/dev/null 2>&1; then "
+        "pkill -x telemetry >/dev/null 2>&1 || true; "
+        "for _ in $(seq 1 50); do "
+        "pgrep -x telemetry >/dev/null 2>&1 || break; sleep 0.1; "
+        "done; "
+        "if pgrep -x telemetry >/dev/null 2>&1; then exit 1; fi; "
         "nohup /usr/sbin/telemetry -port 50051 -noTLS -client_auth none "
         ">/var/log/telemetry/telemetry.log 2>&1 </dev/null & "
-        "fi"
+        "for _ in $(seq 1 50); do "
+        "pgrep -x telemetry >/dev/null 2>&1 && exit 0; sleep 0.1; "
+        "done; exit 1"
     )
     ret = safe_run(
         [*prefix, "docker", "exec", container, "bash", "-lc", command],
@@ -221,11 +254,12 @@ def _apply_single_device(
     device: str,
     topology_dir: str,
     lab_name: str,
+    ecmp_hash_policy: int,
 ) -> tuple[str, bool, str, float, float, float]:
     """Activate one preseeded device after Containerlab has started it."""
     started_at = time.monotonic()
     container = clab_container_name(lab_name, device)
-    prefix = sudo_prefix()
+    prefix = docker_prefix()
     preseed_config = _preseed_config_file(topology_dir, device)
     startup_wrapper = _startup_wrapper_file(topology_dir)
 
@@ -242,8 +276,19 @@ def _apply_single_device(
             0.0,
         )
 
+    expected_port_count = _expected_port_count(preseed_config)
+    if expected_port_count <= 0:
+        return (
+            device,
+            False,
+            f"preseed config has no PORT entries: {preseed_config}",
+            time.monotonic() - started_at,
+            0.0,
+            0.0,
+        )
+
     readiness_started = time.monotonic()
-    if not _wait_for_sonic(device, container):
+    if not _wait_for_sonic(device, container, expected_port_count=expected_port_count):
         readiness_elapsed = time.monotonic() - readiness_started
         return (
             device,
@@ -256,7 +301,7 @@ def _apply_single_device(
     readiness_elapsed = time.monotonic() - readiness_started
 
     activation_started = time.monotonic()
-    if _activate_preseed_device(prefix, container):
+    if _activate_preseed_device(prefix, container, ecmp_hash_policy):
         activation_elapsed = time.monotonic() - activation_started
         return (
             device,
@@ -283,13 +328,16 @@ def apply_configs(
     lab_name: str | None = None,
 ) -> ApplyResult:
     """Activate all preseeded SONiC devices in *topology_dir*."""
-    lab_name = _resolve_lab_name(topology_dir, lab_name)
+    manifest = load_topology_manifest(topology_dir)
+    lab_name = lab_name or manifest.name
 
     # Discover devices
     devices = _discover_devices(topology_dir)
 
     if not devices:
         raise RuntimeError(f"No preseed config_db.json files found in {topology_dir}/configs/sonic/")
+
+    ecmp_hash_policies = _ecmp_hash_policies(manifest, devices)
 
     print("=== SONiC Post-Deploy Activation ===")
     print(f"Topology directory: {topology_dir}")
@@ -304,7 +352,16 @@ def apply_configs(
     result = ApplyResult()
 
     with ThreadPoolExecutor(max_workers=max_parallel) as executor:
-        futures = {executor.submit(_apply_single_device, device, topology_dir, lab_name): device for device in devices}
+        futures = {
+            executor.submit(
+                _apply_single_device,
+                device,
+                topology_dir,
+                lab_name,
+                ecmp_hash_policies[device],
+            ): device
+            for device in devices
+        }
         for future in as_completed(futures):
             device, success, msg, elapsed, readiness_elapsed, activation_elapsed = future.result()
             result.durations[device] = elapsed
@@ -340,8 +397,8 @@ def apply_configs(
 
     # [2/2] Quick control-plane verification
     print("[2/2] Quick control-plane verification...")
-    prefix = sudo_prefix()
-    for role in ("spine", "leaf"):
+    prefix = docker_prefix()
+    for role in ("core", "agg", "edge", "spine", "leaf"):
         candidates = [d for d in devices if d.startswith(role)]
         if candidates:
             container = clab_container_name(lab_name, candidates[0])
@@ -358,25 +415,3 @@ def apply_configs(
     if result.failed:
         print(f"WARNING: {len(result.failed)} device(s) failed: {', '.join(result.failed)}")
     return result
-
-
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entry point (backward-compatible with shell script args)."""
-    args = list(argv if argv is not None else sys.argv[1:])
-
-    topology_dir = args[0] if len(args) > 0 else "generated_topology"
-    max_parallel_str = args[1] if len(args) > 1 else "32"
-    max_parallel = int(max_parallel_str) if max_parallel_str else 32
-    lab_name = args[2] if len(args) > 2 else None
-
-    try:
-        result = apply_configs(topology_dir, max_parallel, lab_name)
-    except (FileNotFoundError, RuntimeError) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
-        return 1
-
-    return 1 if result.failed else 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

@@ -162,11 +162,6 @@ def apply(metric):
     field = "SAI_PORT_STAT_IF_OUT_ERRORS"
     dest = "out_errors"
 
-# 5. sFlow - Flow Samples - DYNAMIC
-[[inputs.sflow]]
-  service_address = "{{SFLOW_SERVICE_ADDRESS}}"
-
-
 # --- PINGMESH INPUTS ---
 # Pingmesh metrics collection
 [[inputs.tail]]

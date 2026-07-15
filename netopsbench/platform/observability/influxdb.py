@@ -1,17 +1,54 @@
-#!/usr/bin/env python3
-"""Create an InfluxDB bucket if it does not already exist."""
+"""Shared InfluxDB lifecycle and Flux query client."""
 
-import argparse
 import json
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+from typing import Literal
 
-from netopsbench.config import config
+import requests
+
 from netopsbench.logging_utils import get_logger
 
 logger = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class FluxQueryResult:
+    status: Literal["ok", "error"]
+    text: str = ""
+    error: str | None = None
+
+
+def query_flux(
+    base_url: str,
+    token: str,
+    org: str,
+    query: str,
+    *,
+    timeout: int = 30,
+) -> FluxQueryResult:
+    """Execute one Flux query without interpreting its domain-specific CSV."""
+    headers = {
+        "Authorization": f"Token {token}",
+        "Content-Type": "application/vnd.flux",
+        "Accept": "application/csv",
+    }
+    try:
+        response = requests.post(
+            f"{base_url.rstrip('/')}/api/v2/query",
+            params={"org": org},
+            headers=headers,
+            data=query,
+            timeout=timeout,
+            proxies={"http": "", "https": ""},
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        return FluxQueryResult(status="error", error=f"{type(exc).__name__}: {exc}")
+    return FluxQueryResult(status="ok", text=response.text)
 
 
 def _make_url_opener(url: str):
@@ -74,23 +111,4 @@ def ensure_bucket(base_url: str, token: str, org: str, bucket: str, retries: int
     raise RuntimeError(f"Failed to ensure InfluxDB bucket '{bucket}': {last_error}")
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Create an InfluxDB bucket if needed")
-    parser.add_argument("--url", default="http://localhost:8086", help="InfluxDB base URL")
-    parser.add_argument("--token", default=config.influxdb_token, help="InfluxDB token")
-    parser.add_argument("--org", default=config.influxdb_org, help="InfluxDB organization")
-    parser.add_argument("--bucket", required=True, help="Bucket name")
-    parser.add_argument("--retries", type=int, default=20, help="Retry count while waiting for InfluxDB")
-    parser.add_argument("--delay", type=float, default=2.0, help="Delay between retries in seconds")
-    args = parser.parse_args()
-
-    ensure_bucket(args.url, args.token, args.org, args.bucket, retries=args.retries, delay=args.delay)
-    return 0
-
-
-if __name__ == "__main__":
-    try:
-        raise SystemExit(main())
-    except Exception as exc:  # pragma: no cover - CLI error path
-        logger.error("%s", exc)
-        raise SystemExit(1) from None
+__all__ = ["FluxQueryResult", "ensure_bucket", "query_flux"]

@@ -7,8 +7,8 @@ NETOPSBENCH_ORIGINAL_SONIC_START_SHA256=8c5aa959f0a3ed0bf1a57f7ecfd004485d5600b9
 wait_for_front_panel_links() {
     local hwsku_dir="/usr/share/sonic/device/$PLATFORM/$HWSKU"
     local lanemap_file="$hwsku_dir/lanemap.ini"
-    local timeout="${NETOPSBENCH_SONIC_LINK_WAIT_TIMEOUT:-600}"
-    local interval="${NETOPSBENCH_SONIC_LINK_WAIT_INTERVAL:-1}"
+    local timeout=600
+    local interval=1
     local expected actual started now
 
     if [ ! -r "$lanemap_file" ]; then
@@ -24,7 +24,7 @@ wait_for_front_panel_links() {
 
     started=$(date +%s)
     while true; do
-        actual=$(ip -o link show | awk -F': ' '{print $2}' | sed 's/@.*//' | grep -E '^eth[0-9]+$' | grep -v '^eth0$' | sort -u | wc -l)
+        actual=$(front_panel_links | wc -l)
         if [ "$actual" -ge "$expected" ]; then
             echo "NetOpsBench SONiC startup: detected $actual/$expected front-panel links"
             return 0
@@ -36,6 +36,16 @@ wait_for_front_panel_links() {
             return 1
         fi
         sleep "$interval"
+    done
+}
+
+front_panel_links() {
+    local path name
+
+    for path in /sys/class/net/eth[0-9]*; do
+        [ -e "$path" ] || continue
+        name=${path##*/}
+        [ "$name" = "eth0" ] || printf '%s\n' "$name"
     done
 }
 
@@ -75,7 +85,7 @@ pushd /usr/share/sonic/hwsku
 
 # filter available front panel ports in lanemap.ini
 [ -f lanemap.ini.orig ] || cp lanemap.ini lanemap.ini.orig
-for p in $(ip link show | grep -oE "eth[0-9]+" | grep -v eth0); do
+for p in $(front_panel_links); do
     grep ^$p: lanemap.ini.orig
 done > lanemap.ini
 
@@ -95,7 +105,7 @@ popd
 mkdir -p /var/run/redis/sonic-db
 cp /etc/default/sonic-db/database_config.json /var/run/redis/sonic-db/
 
-SYSTEM_MAC_ADDRESS=$(ip link show eth0 | grep ether | awk '{print $2}')
+SYSTEM_MAC_ADDRESS=$(cat /sys/class/net/eth0/address)
 sonic-cfggen -t /usr/share/sonic/templates/init_cfg.json.j2 -a "{\"system_mac\": \"$SYSTEM_MAC_ADDRESS\", \"switch_type\": \"$SWITCH_TYPE\"}" > /etc/sonic/init_cfg.json
 
 if [[ -f /usr/share/sonic/virtual_chassis/default_config.json ]]; then
@@ -173,7 +183,7 @@ if [ "$conn_chassis_db" == "1" ]; then
 
       # filter available front panel ports in coreportindexmap.ini
       [ -f coreportindexmap.ini.orig ] || cp coreportindexmap.ini coreportindexmap.ini.orig
-      for p in $(ip link show | grep -oE "eth[0-9]+" | grep -v eth0); do
+      for p in $(front_panel_links); do
           grep ^$p: coreportindexmap.ini.orig
       done > coreportindexmap.ini
 
@@ -225,8 +235,6 @@ supervisorctl start buffermgrd
 supervisorctl start nbrmgrd
 
 supervisorctl start vxlanmgrd
-
-supervisorctl start sflowmgrd
 
 supervisorctl start natmgrd
 

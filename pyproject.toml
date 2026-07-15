@@ -24,10 +24,6 @@ dependencies = [
     "requests>=2.25.0",
     "pyyaml>=5.4.0",
     "pydantic>=2.0.0",
-    "influxdb-client>=1.30.0",
-    "pygnmi>=0.8.0",
-    "scapy>=2.5.0",
-    "pandas>=1.5.0",
     "harbor>=0.13.1,<0.14",
 ]
 
@@ -38,6 +34,9 @@ Issues = "https://github.com/NetX-lab/NetOpsBench/issues"
 [project.scripts]
 netopsbench = "netopsbench.cli.main:main"
 netopsbench-pingmesh-agent = "netopsbench.platform.pingmesh.cli:main"
+netopsbench-bgp-collector = "netopsbench.platform.observability.bgp_collector:main"
+netopsbench-mcp-server = "netopsbench.platform.toolkit.fastmcp_server:main"
+netopsbench-runtime = "netopsbench.platform.runtime.cli:main"
 
 [project.optional-dependencies]
 agent = [
@@ -49,6 +48,9 @@ agent = [
     "langsmith>=0.3.0",
     "fastmcp>=2.0.0",
     "json-repair>=0.54.0",
+]
+plots = [
+    "matplotlib>=3.8.0",
 ]
 dev = [
     "pytest>=6.0.0",
@@ -62,6 +64,17 @@ dev = [
 ]
 [tool.setuptools.packages.find]
 include = ["netopsbench*"]
+
+[tool.setuptools.package-data]
+netopsbench = [
+    "platform/topology/*.json",
+    "platform/topology/*.sh",
+    "platform/observability/assets/**/*",
+    "platform/scenario/specs/*.yaml",
+]
+
+[tool.setuptools.exclude-package-data]
+"*" = ["**/__pycache__", "**/__pycache__/*", "**/*.pyc"]
 
 [tool.pytest.ini_options]
 markers = [
@@ -82,7 +95,7 @@ known_first_party = ["netopsbench"]
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-extend-exclude = ["lab-topology", "scenario_results", "scenarios/generated"]
+extend-exclude = ["build", "lab-topology", "scenario_results", "scenarios/generated"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]

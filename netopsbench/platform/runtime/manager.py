@@ -3,57 +3,30 @@
 from __future__ import annotations
 
 import builtins
-import ipaddress
 import json
-import re
 import shutil
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from netopsbench.config import repo_root
+from pydantic import ValidationError
+
 from netopsbench.logging_utils import get_logger
-from netopsbench.platform.utils.proc import safe_run, sudo_prefix
-from netopsbench.platform.worker.lifecycle import deploy_workers, teardown_workers
-from netopsbench.platform.worker.pool import (
-    WorkerSpec,
-    _worker_bucket,
-    _worker_mgmt_subnet,
-    _worker_mgmt_subnet_prefix,
-    _worker_mgmt_subnet_stride,
+from netopsbench.models.runtime import RuntimeIdentity
+from netopsbench.platform.runtime.deployment import management_subnet
+from netopsbench.platform.runtime.lifecycle import (
+    LifecycleStageResult,
+    RuntimeLifecycle,
+    RuntimeLifecycleError,
+    teardown_workers,
 )
+from netopsbench.platform.utils.proc import safe_run
 
 logger = get_logger(__name__)
 
 
-def _subnet_third_octet(subnet: str) -> int:
-    return int(subnet.split(".")[2])
-
-
-def _runtime_subnet_base(scale: str, runtime_name: str, worker_count: int = 1) -> int:
-    base = _worker_mgmt_subnet(scale, 1).split(".")[2]
-    try:
-        base_value = int(base)
-    except ValueError:
-        base_value = 100
-    prefix = _worker_mgmt_subnet_prefix(scale)
-    stride = _worker_mgmt_subnet_stride(scale)
-    if prefix == 24:
-        base_value -= 1
-        range_blocks = 80
-    else:
-        range_blocks = max(1, 20 // stride)
-    match = re.search(r"(\d+)(?!.*\d)", runtime_name or "")
-    if match:
-        offset_seed = int(match.group(1))
-    else:
-        offset_seed = sum(ord(ch) for ch in (runtime_name or scale))
-    usable_blocks = max(1, range_blocks - max(1, worker_count) + 1)
-    offset = offset_seed % usable_blocks
-    return min(254, base_value + (offset * stride))
-
-
-def _format_mgmt_subnet(scale: str, third_octet: int) -> str:
-    return f"172.31.{third_octet}.0/{_worker_mgmt_subnet_prefix(scale)}"
+class RuntimeMetadataError(ValueError):
+    """Raised when persisted runtime identity metadata is missing or invalid."""
 
 
 @dataclass
@@ -62,9 +35,10 @@ class RuntimePool:
     name: str
     scale: str
     root_dir: Path
-    workers: list[WorkerSpec]
+    workers: list[RuntimeIdentity]
     state: str = "created"
     metadata: dict[str, object] = field(default_factory=dict)
+    stage_results: dict[str, LifecycleStageResult] = field(default_factory=dict)
 
     @property
     def size(self) -> int:
@@ -72,61 +46,59 @@ class RuntimePool:
 
     def _payload(self) -> dict[str, object]:
         return {
+            "schema_version": "3",
             "id": self.id,
             "name": self.name,
             "scale": self.scale,
             "state": self.state,
             "metadata": dict(self.metadata),
-            "workers": [
-                {
-                    "id": worker.id,
-                    "index": worker.index,
-                    "name": worker.name,
-                    "root_dir": str(worker.root_dir) if worker.root_dir is not None else None,
-                    "lab_name": worker.lab_name,
-                    "topology_dir": worker.topology_dir,
-                    "mgmt_subnet": worker.mgmt_subnet,
-                    "bucket": worker.bucket,
-                    "shard_dir": worker.shard_dir,
-                    "report_path": worker.report_path,
-                    "log_path": worker.log_path,
-                    "deploy_log_path": worker.deploy_log_path,
-                    "metadata": dict(worker.metadata),
-                }
-                for worker in self.workers
-            ],
+            "stage_results": {stage: result.model_dump(mode="json") for stage, result in self.stage_results.items()},
+            "workers": [worker.model_dump(mode="json") for worker in self.workers],
         }
 
     def _write_metadata(self) -> None:
         self.root_dir.mkdir(parents=True, exist_ok=True)
         (self.root_dir / "runtime.json").write_text(json.dumps(self._payload(), indent=2), encoding="utf-8")
 
-    def deploy(self) -> RuntimePool:
-        self.state = "deployed"
+    def _run_stage(self, stage: str, next_state: str) -> RuntimePool:
+        previous = self.stage_results.get(stage)
+        if previous is not None and previous.status == "completed":
+            return self
+        try:
+            result = RuntimeLifecycle().run(stage, self)
+        except RuntimeLifecycleError as exc:
+            self.stage_results[stage] = exc.result
+            self._write_metadata()
+            raise
+        self.stage_results[stage] = result
+        self.state = next_state
         self._write_metadata()
         return self
+
+    def deploy(self) -> RuntimePool:
+        return self._run_stage("deploy", "deployed")
 
     def ensure_observability(self) -> RuntimePool:
-        self.state = "observability_ready"
-        self._write_metadata()
-        return self
+        return self._run_stage("observability", "observability_ready")
 
     def ensure_pingmesh(self) -> RuntimePool:
-        self.state = "pingmesh_ready"
-        self._write_metadata()
-        return self
+        return self._run_stage("pingmesh", "pingmesh_ready")
 
     def warm(self) -> RuntimePool:
-        self.state = "warm"
-        self._write_metadata()
-        return self
+        return self._run_stage("warm", "warm")
 
     def status(self) -> dict[str, object]:
         return {"id": self.id, "name": self.name, "scale": self.scale, "state": self.state}
 
     def teardown(self) -> RuntimePool:
-        if self.workers:
-            teardown_workers(self.workers, str(repo_root()))
+        if self.state == "torn_down":
+            return self
+        try:
+            RuntimeLifecycle().run("teardown", self)
+        except RuntimeLifecycleError as exc:
+            self.stage_results["teardown"] = exc.result
+            self._write_metadata()
+            raise
         self.state = "torn_down"
         metadata_path = self.root_dir / "runtime.json"
         if metadata_path.exists():
@@ -138,7 +110,7 @@ class RuntimePool:
 
 class RuntimeManager:
     def __init__(self, workspace: str = "."):
-        self.workspace = Path(workspace)
+        self.workspace = Path(workspace).expanduser().resolve()
         self.runtime_root_dir = self.workspace / ".netopsbench" / "runtimes"
         self.runtime_root_dir.mkdir(parents=True, exist_ok=True)
 
@@ -146,132 +118,51 @@ class RuntimeManager:
         self, *, scale: str, workers: int = 1, name: str | None = None, root_dir: Path | None = None
     ) -> RuntimePool:
         worker_count = max(1, int(workers))
-        runtime_name = str(name or f"{scale}-{worker_count}").strip()
+        runtime_name = str(name or f"{scale}-{worker_count}-{uuid.uuid4().hex[:8]}").strip()
         runtime_root = Path(root_dir) if root_dir is not None else (self.runtime_root_dir / runtime_name)
-        subnet_base = _runtime_subnet_base(scale, runtime_name, worker_count)
-        subnet_stride = _worker_mgmt_subnet_stride(scale)
         runtime_root.mkdir(parents=True, exist_ok=True)
         logs_dir = runtime_root / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
-        worker_items: list[WorkerSpec] = []
+        worker_items: list[RuntimeIdentity] = []
         for idx in range(1, worker_count + 1):
             worker_name = f"worker-{idx}"
             worker_dir = runtime_root / worker_name
             worker_dir.mkdir(exist_ok=True)
-            worker_items.append(
-                WorkerSpec(
-                    id=worker_name,
-                    name=worker_name,
-                    root_dir=worker_dir,
-                    index=idx,
-                    lab_name=(runtime_name if worker_count == 1 else f"{runtime_name}-w{idx:02d}"),
-                    topology_dir=str(worker_dir),
-                    mgmt_subnet=_format_mgmt_subnet(
-                        scale,
-                        min(254, subnet_base + ((idx - 1) * subnet_stride if subnet_stride > 1 else idx)),
-                    ),
-                    bucket=_worker_bucket(scale, idx),
-                    shard_dir=str(worker_dir / "scenarios"),
-                    report_path=str(logs_dir / f"worker_{idx:02d}.report.json"),
-                    log_path=str(logs_dir / f"worker_{idx:02d}.log"),
-                    deploy_log_path=str(logs_dir / f"worker_{idx:02d}.deploy.log"),
-                )
+            lab_name = runtime_name if worker_count == 1 else f"{runtime_name}-w{idx:02d}"
+            mgmt_subnet = management_subnet(scale, idx)
+            identity = RuntimeIdentity.create(
+                runtime_id=runtime_name,
+                worker_id=worker_name,
+                worker_index=idx,
+                lab_name=lab_name,
+                topology_dir=worker_dir,
+                mgmt_subnet=mgmt_subnet,
+                mgmt_network=f"clab-mgmt-{lab_name}",
             )
+            worker_items.append(identity)
         runtime = RuntimePool(
-            id=runtime_name, name=runtime_name, scale=scale, root_dir=runtime_root, workers=worker_items
+            id=runtime_name,
+            name=runtime_name,
+            scale=scale,
+            root_dir=runtime_root,
+            workers=worker_items,
         )
         runtime._write_metadata()
         return runtime
-
-    def _used_management_subnets(self) -> set[str]:
-        try:
-            result = safe_run(
-                [*sudo_prefix(), "docker", "network", "ls", "--format", "{{.ID}}"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-        except Exception:
-            logger.warning("docker network ls failed; assuming no networks in use", exc_info=True)
-            return set()
-        used: set[str] = set()
-        for network_id in [line.strip() for line in result.stdout.splitlines() if line.strip()]:
-            inspect = safe_run(
-                [
-                    *sudo_prefix(),
-                    "docker",
-                    "network",
-                    "inspect",
-                    network_id,
-                    "--format",
-                    "{{range .IPAM.Config}}{{println .Subnet}}{{end}}",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=30,
-            )
-            for subnet in inspect.stdout.splitlines():
-                subnet = subnet.strip()
-                if subnet:
-                    used.add(subnet)
-        return used
-
-    def _allocate_management_subnets(self, scale: str, worker_count: int) -> builtins.list[str]:
-        used = self._used_management_subnets()
-        used_networks = []
-        for subnet in used:
-            try:
-                used_networks.append(ipaddress.ip_network(subnet, strict=False))
-            except ValueError:
-                logger.debug("ignoring unparsable docker subnet: %s", subnet)
-        start = _subnet_third_octet(_worker_mgmt_subnet(scale, 1))
-        stride = _worker_mgmt_subnet_stride(scale)
-        selected: list[str] = []
-        for octet in range(start, 255, stride):
-            subnet = _format_mgmt_subnet(scale, octet)
-            candidate_network = ipaddress.ip_network(subnet, strict=False)
-            selected_networks = [ipaddress.ip_network(item, strict=False) for item in selected]
-            if any(candidate_network.overlaps(network) for network in used_networks + selected_networks):
-                continue
-            selected.append(subnet)
-            if len(selected) == worker_count:
-                return selected
-        raise RuntimeError(f"unable to allocate {worker_count} unique management subnets for scale {scale}")
 
     def provision(
         self, *, scale: str, workers: int = 1, name: str | None = None, root_dir: Path | None = None
     ) -> RuntimePool:
         runtime = self._build_runtime(scale=scale, workers=workers, name=name, root_dir=root_dir)
         try:
-            allocated_subnets = self._allocate_management_subnets(scale, runtime.size)
-            runtime.workers = [
-                WorkerSpec(
-                    id=worker.id,
-                    name=worker.name,
-                    root_dir=worker.root_dir,
-                    index=worker.index,
-                    lab_name=worker.lab_name,
-                    topology_dir=worker.topology_dir,
-                    mgmt_subnet=allocated_subnets[idx],
-                    bucket=worker.bucket,
-                    shard_dir=worker.shard_dir,
-                    report_path=worker.report_path,
-                    log_path=worker.log_path,
-                    deploy_log_path=worker.deploy_log_path,
-                    metadata=dict(worker.metadata),
-                )
-                for idx, worker in enumerate(runtime.workers)
-            ]
-            deploy_workers(runtime.workers, scale, str(repo_root()))
+            runtime.deploy().ensure_observability().ensure_pingmesh().warm()
         except Exception:
             logger.warning("Worker deployment failed; tearing down partial state", exc_info=True)
             # Best-effort teardown of partially-deployed workers (Docker
             # networks, containers, telegraf instances, etc.) before
             # cleaning up metadata on disk.
             try:
-                teardown_workers(runtime.workers, str(repo_root()))
+                teardown_workers(runtime.workers)
             except Exception:
                 logger.warning("Best-effort teardown_workers failed during cleanup", exc_info=True)
             # Use sudo rm to handle root-owned files left by containerlab.
@@ -288,7 +179,7 @@ class RuntimeManager:
                 shutil.rmtree(runtime.root_dir, ignore_errors=True)
             raise
         runtime.metadata["provisioning_mode"] = "worker_pool"
-        runtime.state = "deployed"
+        runtime.state = "warm"
         runtime._write_metadata()
         return runtime
 
@@ -297,31 +188,31 @@ class RuntimeManager:
 
     def attach(self, root_dir: Path) -> RuntimePool:
         runtime_path = Path(root_dir)
-        payload = json.loads((runtime_path / "runtime.json").read_text(encoding="utf-8"))
-        required_keys = {"id", "name", "scale", "workers"}
+        metadata_path = runtime_path / "runtime.json"
+        try:
+            payload = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            raise
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeMetadataError(f"Unable to read runtime metadata {metadata_path}: {exc}") from exc
+        if payload.get("schema_version") != "3":
+            raise RuntimeMetadataError(
+                "Unsupported runtime.json schema; recreate the runtime with the current RuntimeManager"
+            )
+        required_keys = {"schema_version", "id", "name", "scale", "workers", "stage_results"}
         missing = sorted(required_keys - set(payload))
         if missing:
-            raise ValueError(f"missing required runtime metadata: {', '.join(missing)}")
-        worker_items = [
-            WorkerSpec(
-                id=str(item.get("id") or item.get("name") or f"worker-{index+1}"),
-                name=str(item.get("name") or item.get("id") or f"worker-{index+1}"),
-                root_dir=Path(item["root_dir"]) if item.get("root_dir") else None,
-                index=int(item.get("index", index + 1)),
-                lab_name=item.get("lab_name") or str(item.get("name") or item.get("id") or f"worker-{index+1}"),
-                topology_dir=item.get("topology_dir")
-                or str(item.get("root_dir") or runtime_path / f"worker-{index+1}"),
-                mgmt_subnet=item.get("mgmt_subnet") or _worker_mgmt_subnet(str(payload["scale"]), index + 1),
-                bucket=item.get("bucket") or _worker_bucket(str(payload["scale"]), index + 1),
-                shard_dir=item.get("shard_dir") or str(runtime_path / f"worker-{index+1}" / "scenarios"),
-                report_path=item.get("report_path") or str(runtime_path / "logs" / f"worker_{index+1:02d}.report.json"),
-                log_path=item.get("log_path") or str(runtime_path / "logs" / f"worker_{index+1:02d}.log"),
-                deploy_log_path=item.get("deploy_log_path")
-                or str(runtime_path / "logs" / f"worker_{index+1:02d}.deploy.log"),
-                metadata=dict(item.get("metadata", {})),
-            )
-            for index, item in enumerate(payload["workers"])
-        ]
+            raise RuntimeMetadataError(f"missing required runtime metadata: {', '.join(missing)}")
+        try:
+            worker_items = [RuntimeIdentity.model_validate(item) for item in payload["workers"]]
+            stage_results = {
+                stage: LifecycleStageResult.model_validate(result)
+                for stage, result in dict(payload.get("stage_results", {})).items()
+            }
+        except (KeyError, TypeError, ValidationError, ValueError) as exc:
+            raise RuntimeMetadataError(
+                f"Invalid schema-v3 runtime metadata in {metadata_path}; recreate the runtime: {exc}"
+            ) from exc
         return RuntimePool(
             id=str(payload["id"]),
             name=str(payload["name"]),
@@ -330,6 +221,7 @@ class RuntimeManager:
             workers=worker_items,
             state=str(payload.get("state", "created")),
             metadata=dict(payload.get("metadata", {})),
+            stage_results=stage_results,
         )
 
     def list(self) -> builtins.list[RuntimePool]:
@@ -350,4 +242,4 @@ class RuntimeManager:
         return None
 
 
-__all__ = ["RuntimeManager", "RuntimePool"]
+__all__ = ["RuntimeManager", "RuntimeMetadataError", "RuntimePool"]

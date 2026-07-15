@@ -36,7 +36,7 @@
   "FLEX_COUNTER_TABLE": {
     "PORT": {
       "FLEX_COUNTER_STATUS": "enable",
-      "POLL_INTERVAL": "1000"
+      "POLL_INTERVAL": "10000"
     }
   },
   "GNMI": {

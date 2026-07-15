@@ -9,13 +9,12 @@ datasources:
     uid: InfluxDB_v2
     type: influxdb
     access: proxy
-    url: ${NETOPSBENCH_GRAFANA_INFLUXDB_URL}
+    url: ${NETOPSBENCH_INFLUXDB_URL}
     isDefault: true
     jsonData:
       version: Flux
       organization: ${NETOPSBENCH_INFLUXDB_ORG}
-      defaultBucket: ${NETOPSBENCH_GRAFANA_DEFAULT_BUCKET}
+      defaultBucket: ${NETOPSBENCH_INFLUXDB_BUCKET}
       tlsSkipVerify: true
     secureJsonData:
       token: ${NETOPSBENCH_INFLUXDB_TOKEN}
-
