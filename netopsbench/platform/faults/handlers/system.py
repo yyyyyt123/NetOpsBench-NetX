@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING, Any
 
-from netopsbench.platform.utils.proc import sudo_prefix
+from netopsbench.platform.utils.proc import docker_prefix
 
 if TYPE_CHECKING:
     from ..context import FaultContext
@@ -82,7 +82,7 @@ class SystemHandler:
         restored_runtime_config = False
 
         if not container_started:
-            start_result = self._cmd.run_cmd([*sudo_prefix(), "docker", "start", container], timeout=60)
+            start_result = self._cmd.run_cmd([*docker_prefix(), "docker", "start", container], timeout=60)
             if start_result.returncode != 0:
                 return {
                     "type": "device_down",

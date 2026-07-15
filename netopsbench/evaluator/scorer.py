@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import asdict, dataclass, field
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from netopsbench.evaluator.fault_type_judge import FaultTypeJudge, canonicalize_fault_type, judge_fault_type_match
@@ -410,8 +410,8 @@ class Evaluator:
             detection_macro_f1 = None
 
         report = {
-            "benchmark_id": f"netopsbench-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-            "timestamp": datetime.now().isoformat(),
+            "benchmark_id": f"netopsbench-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}",
+            "timestamp": datetime.now(UTC).isoformat(),
             "agent_name": agent_name,
             "topology_scale": topology_scale,
             "summary": {

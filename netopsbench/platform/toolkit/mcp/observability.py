@@ -40,9 +40,29 @@ def get_interface_metrics(
     )
 
 
-def get_all_bgp_status():
-    """Get BGP status summary across all devices."""
-    return as_payload(get_toolkit().get_all_bgp_status())
+def query_bgp_events(
+    start_time: str = "",
+    end_time: str = "",
+    time_range_minutes: int = 10,
+    device: str = "",
+    peer: str = "",
+    role: str = "",
+    state: str = "non_established",
+    limit: int = 100,
+):
+    """Find BGP session events from centralized historical telemetry."""
+    return as_payload(
+        get_toolkit().query_bgp_events(
+            start_time=start_time or None,
+            end_time=end_time or None,
+            time_range_minutes=time_range_minutes,
+            device=device or None,
+            peer=peer or None,
+            role=role or None,
+            state=state,
+            limit=limit,
+        )
+    )
 
 
 def get_pingmesh_summary(
@@ -80,7 +100,7 @@ def get_pingmesh_hotspots(
 TOOL_SPECS = [
     ToolSpec(name="get_device_logs", group="observability", handler=get_device_logs),
     ToolSpec(name="get_interface_metrics", group="observability", handler=get_interface_metrics),
-    ToolSpec(name="get_all_bgp_status", group="observability", handler=get_all_bgp_status),
+    ToolSpec(name="query_bgp_events", group="observability", handler=query_bgp_events),
     ToolSpec(name="get_pingmesh_summary", group="observability", handler=get_pingmesh_summary),
     ToolSpec(name="get_pingmesh_hotspots", group="observability", handler=get_pingmesh_hotspots),
 ]

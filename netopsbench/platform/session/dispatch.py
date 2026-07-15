@@ -1,4 +1,4 @@
-"""Worker-pool execution helpers for SDK sessions."""
+"""Worker-pool execution for SDK sessions."""
 
 from __future__ import annotations
 
@@ -7,221 +7,165 @@ import logging
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
+from netopsbench.evaluator.fault_type_judge import create_judge_from_env
+from netopsbench.evaluator.scorer import Evaluator
+from netopsbench.models.runtime import RuntimeIdentity
 from netopsbench.platform.runtime.manager import RuntimePool
-from netopsbench.platform.session.tracing import TraceWriter
+from netopsbench.platform.scenario.executor import ScenarioExecutor
+from netopsbench.platform.session.context import build_worker_execution_context
+from netopsbench.platform.session.diagnosis import build_runtime_diagnosis_callback
+from netopsbench.platform.session.reporting import load_topology_metadata
+from netopsbench.platform.session.scoring import score_scenario_fault_episodes
+from netopsbench.platform.session.trace_store import TraceWriter
 from netopsbench.platform.session.types import ScenarioExecutionRef, WorkerExecutionContext
-from netopsbench.platform.worker.pool import WorkerSpec
 
 logger = logging.getLogger(__name__)
 
-
-class AgentLike(Protocol):
-    name: str
-
-    def diagnose(self, context: Any) -> Any: ...
+WorkerRunResult = tuple[list[Any], list[dict[str, Any]], dict[str, Any]]
 
 
-class EvaluatorLike(Protocol):
-    def generate_report(
-        self,
-        results: list[Any],
-        agent_name: str = "unknown",
-        topology_scale: str = "unknown",
-    ) -> dict[str, Any]: ...
-
-
-class ScenarioRunnerLike(Protocol):
-    results_dir: Path
-
-    def run_scenario(
-        self,
-        scenario: Any,
-        diagnosis_callback: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
-    ) -> dict[str, Any]: ...
-
-
-class ScenarioRunnerFactory(Protocol):
-    def __call__(self, *args: Any, **kwargs: Any) -> ScenarioRunnerLike: ...
-
-
-class ReportSaver(Protocol):
-    def __call__(self, report_payload: dict[str, Any], report_path: Path) -> None: ...
-
-
-class RunHandleBuilder(Protocol):
-    def __call__(self, **kwargs: Any) -> dict[str, Any]: ...
-
-
-# ---------------------------------------------------------------------------
-# Configuration object for execute_on_runtime_pool
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class RuntimePoolConfig:
-    """Groups the parameters for :func:`execute_on_runtime_pool`."""
-
-    # -- core execution context ---
-    run_id: str
-    mode: str
-    scenarios: list[ScenarioExecutionRef]
-    runtime: RuntimePool
-    agent: Any
-
-    # -- artifact paths ---
-    artifact_dir: Path
-    raw_dir: Path
-    report_path: Path
-    metadata_path: Path
-
-    # -- lifecycle ---
-    runtime_owner: str
-    teardown: str
-    started_at: Any
-    completed_at_factory: Callable[[], Any]
-
-    # -- factory callbacks ---
-    scenario_runner_cls: Callable[..., ScenarioRunnerLike]
-    evaluator_factory: Callable[[], EvaluatorLike]
-    score_fault_episodes: Callable[..., list[Any]]
-    diagnosis_callback_builder: Callable[
-        [Any, str, str, WorkerExecutionContext, TraceWriter | None, str, str, str, str | None],
-        Callable[[dict[str, Any]], dict[str, Any]],
-    ]
-    worker_context_builder: Callable[[WorkerSpec, Path], WorkerExecutionContext]
-    topology_metadata_loader: Callable[[Path], dict[str, Any] | None]
-
-    # -- reporting callbacks ---
-    create_run_report: Callable[..., dict[str, Any]]
-    save_run_report: Callable[[dict[str, Any], Path], None]
-    save_run_metadata: Callable[..., None]
-    build_run_handle: Callable[..., dict[str, Any]]
-    run_handle_adapter: Callable[[dict[str, Any]], Any]
-    artifact_manager: Any
-    traces_dir: Path | None = None
-    trace_writer: TraceWriter | None = None
-
-    # -- scenario executor knobs (defaults preserve historical behaviour) ---
-    baseline_wait_seconds: float = 60
-    post_recovery_wait_seconds: float = 2
-    skip_none_episodes: bool = True
+@dataclass(frozen=True)
+class PoolDispatchResult:
+    evaluations: list[Any]
+    scenarios: list[dict[str, Any]]
+    workers: list[dict[str, Any]]
 
 
 def assign_scenarios_to_workers(
     scenarios: list[ScenarioExecutionRef],
-    workers: Sequence[WorkerSpec],
+    workers: Sequence[RuntimeIdentity],
 ) -> dict[str, list[ScenarioExecutionRef]]:
     if not workers:
         raise ValueError("runtime pool must contain at least one worker")
-    assignments: dict[str, list[ScenarioExecutionRef]] = {
-        str(worker.id or f"worker-{worker.index}"): [] for worker in workers
-    }
+    assignments: dict[str, list[ScenarioExecutionRef]] = {worker.worker_id: [] for worker in workers}
     for index, scenario in enumerate(scenarios):
-        worker = workers[index % len(workers)]
-        worker_id = str(worker.id or f"worker-{worker.index}")
-        assignments[worker_id].append(scenario)
+        assignments[workers[index % len(workers)].worker_id].append(scenario)
     return assignments
 
 
-def build_scenario_executor(
-    pool_config: RuntimePoolConfig,
+def _dispatch_workers(
+    workers: Sequence[RuntimeIdentity],
+    scenarios: list[ScenarioExecutionRef],
+    run_worker: Callable[[RuntimeIdentity, list[ScenarioExecutionRef]], WorkerRunResult],
+) -> PoolDispatchResult:
+    if not workers:
+        raise ValueError("runtime must contain at least one worker")
+    ordered_workers = sorted(workers, key=lambda item: item.worker_index)
+    assignments = assign_scenarios_to_workers(scenarios, ordered_workers)
+
+    if len(ordered_workers) == 1:
+        worker = ordered_workers[0]
+        results = {worker.worker_index: run_worker(worker, assignments[worker.worker_id])}
+    else:
+        logger.info("Executing %d workers in parallel", len(ordered_workers))
+        results = {}
+        with ThreadPoolExecutor(max_workers=len(ordered_workers)) as pool:
+            futures = {
+                pool.submit(run_worker, worker, assignments[worker.worker_id]): worker for worker in ordered_workers
+            }
+            for future in as_completed(futures):
+                worker = futures[future]
+                results[worker.worker_index] = future.result()
+
+    evaluations: list[Any] = []
+    scenario_summaries: list[dict[str, Any]] = []
+    worker_summaries: list[dict[str, Any]] = []
+    for worker in ordered_workers:
+        worker_evaluations, worker_scenarios, worker_summary = results[worker.worker_index]
+        evaluations.extend(worker_evaluations)
+        scenario_summaries.extend(worker_scenarios)
+        worker_summaries.append(worker_summary)
+    return PoolDispatchResult(evaluations, scenario_summaries, worker_summaries)
+
+
+def _build_scenario_executor(
     worker_context: WorkerExecutionContext,
     worker_raw_dir: Path,
-) -> ScenarioRunnerLike:
-    """Construct a scenario executor for a single worker.
-
-    Centralising the construction lets callers (and tests) override
-    ``pool_config.scenario_runner_cls`` with a stub while keeping the kwargs
-    used by the dispatcher in one place. The ``pool_config`` parameter is
-    named to avoid shadowing the global :data:`netopsbench.config` singleton.
-    """
-    kwargs = {
-        "topology_dir": str(worker_context.topology_dir),
-        "topology_metadata": pool_config.topology_metadata_loader(worker_context.topology_dir),
-        "baseline_wait_seconds": pool_config.baseline_wait_seconds,
-        "post_recovery_wait_seconds": pool_config.post_recovery_wait_seconds,
-        "skip_none_episodes": pool_config.skip_none_episodes,
-        "influxdb_bucket": worker_context.influxdb_bucket,
-        "topology_id": worker_context.topology_id,
-        "persist_results": False,
-    }
-    try:
-        runner = pool_config.scenario_runner_cls(**kwargs)
-    except TypeError:
-        # Compatibility for test doubles or older runner classes that do not
-        # expose the session-owned persistence switch yet.
-        kwargs.pop("persist_results", None)
-        runner = pool_config.scenario_runner_cls(**kwargs)
+    *,
+    fault_registry: Any,
+    baseline_wait_seconds: int,
+    post_recovery_wait_seconds: int,
+    skip_none_episodes: bool,
+) -> ScenarioExecutor:
+    runner = ScenarioExecutor(
+        topology_dir=str(worker_context.topology_dir),
+        topology_metadata=load_topology_metadata(worker_context.topology_dir),
+        baseline_wait_seconds=baseline_wait_seconds,
+        post_recovery_wait_seconds=post_recovery_wait_seconds,
+        skip_none_episodes=skip_none_episodes,
+        influxdb_bucket=worker_context.influxdb_bucket,
+        topology_id=worker_context.topology_id,
+        persist_results=False,
+        fault_registry=fault_registry,
+    )
     runner.results_dir = worker_raw_dir
     return runner
 
 
+def _create_evaluator() -> Evaluator:
+    judge = create_judge_from_env()
+    return Evaluator(fault_type_judge=judge) if judge is not None else Evaluator()
+
+
 def _run_worker(
-    config: RuntimePoolConfig,
-    worker: WorkerSpec,
-    worker_scenarios: list[ScenarioExecutionRef],
-) -> tuple[list[Any], list[dict[str, Any]], dict[str, Any]]:
-    """Execute all scenarios assigned to a single worker.
-
-    Returns ``(eval_results, scenario_summaries, worker_summary)`` without
-    touching any shared mutable state so this function is safe to call from
-    a thread-pool.
-    """
-    worker_id = str(worker.id or f"worker-{worker.index}")
-    worker_name = str(worker.name or worker_id)
-    topology_root = worker.topology_dir or (str(worker.root_dir) if worker.root_dir is not None else None)
-    if topology_root is None:
-        raise ValueError(f"worker '{worker_id}' is missing topology_dir/root_dir")
-
-    topology_dir = Path(topology_root)
-    worker_context = config.worker_context_builder(worker, topology_dir)
-    worker_raw_dir = config.raw_dir / worker_name
+    *,
+    runtime: RuntimePool,
+    agent: Any,
+    raw_dir: Path,
+    trace_writer: TraceWriter | None,
+    fault_registry: Any,
+    baseline_wait_seconds: int,
+    post_recovery_wait_seconds: int,
+    skip_none_episodes: bool,
+    worker: RuntimeIdentity,
+    scenarios: list[ScenarioExecutionRef],
+) -> WorkerRunResult:
+    worker_context = build_worker_execution_context(worker, worker.topology_dir)
+    worker_raw_dir = raw_dir / worker.worker_id
     worker_raw_dir.mkdir(parents=True, exist_ok=True)
+    runner = _build_scenario_executor(
+        worker_context,
+        worker_raw_dir,
+        fault_registry=fault_registry,
+        baseline_wait_seconds=baseline_wait_seconds,
+        post_recovery_wait_seconds=post_recovery_wait_seconds,
+        skip_none_episodes=skip_none_episodes,
+    )
+    evaluator = _create_evaluator()
 
-    runner = build_scenario_executor(config, worker_context, worker_raw_dir)
-    evaluator = config.evaluator_factory()
-
-    eval_results: list[Any] = []
+    evaluations: list[Any] = []
     scenario_summaries: list[dict[str, Any]] = []
     worker_success = True
-    executed_count = 0
 
-    for scenario in worker_scenarios:
-        diagnosis_callback = config.diagnosis_callback_builder(
-            config.agent,
+    for scenario in scenarios:
+        callback = build_runtime_diagnosis_callback(
+            agent,
             str(worker_context.topology_dir),
             scenario.id,
             worker_context,
-            config.trace_writer,
-            worker_name,
-            config.run_id,
-            config.runtime.id,
+            trace_writer,
+            worker.worker_id,
+            runtime.id,
             scenario.scale,
         )
-        scenario_result = runner.run_scenario(
-            scenario.to_scenario(),
-            diagnosis_callback=diagnosis_callback,
-        )
-        raw_result_path = _persist_raw_scenario_result(
-            worker_raw_dir=worker_raw_dir,
-            scenario_id=scenario.id,
-            scenario_result=scenario_result,
-        )
+        parsed_scenario = scenario.to_scenario()
+        scenario_result = runner.run_scenario(parsed_scenario, diagnosis_callback=callback)
+        raw_result_path = _persist_raw_scenario_result(worker_raw_dir, scenario.id, scenario_result)
         try:
-            scored = config.score_fault_episodes(
-                scenario.to_scenario(),
+            scored = score_scenario_fault_episodes(
+                parsed_scenario,
                 scenario_result,
                 evaluator,
                 topology_dir=str(worker_context.topology_dir),
             )
         except Exception as exc:
-            if config.trace_writer is not None:
+            if trace_writer is not None:
                 try:
-                    config.trace_writer.write_failure_result(
+                    trace_writer.write_failure_result(
                         scenario_id=scenario.id,
                         scenario_result=scenario_result,
                         stage="evaluator",
@@ -230,193 +174,80 @@ def _run_worker(
                 except Exception:
                     logger.debug("failed to persist evaluator failure trace result", exc_info=True)
             raise
-        if config.trace_writer is not None:
+        if trace_writer is not None:
             try:
-                config.trace_writer.write_evaluation_results(
+                trace_writer.write_evaluation_results(
                     evaluation_results=scored,
                     scenario_result=scenario_result,
                 )
             except Exception:
                 logger.debug("failed to persist trace evaluation results", exc_info=True)
-        executed_count += 1
-        eval_results.extend(scored)
+        evaluations.extend(scored)
+        success = bool(scenario_result.get("success"))
         scenario_summaries.append(
             {
                 "scenario_id": scenario.id,
-                "status": "completed" if scenario_result.get("success") else "failed",
+                "status": "completed" if success else "failed",
                 "scale": scenario.scale,
-                "worker": worker_name,
+                "worker": worker.worker_id,
                 "raw_result_path": raw_result_path,
             }
         )
-        if not scenario_result.get("success"):
-            worker_success = False
+        worker_success &= success
 
     worker_summary = {
-        "worker_id": worker_id,
-        "worker_name": worker_name,
+        "worker_id": worker.worker_id,
+        "worker_name": worker.worker_id,
         "lab_name": worker.lab_name,
-        "scenario_count": len(worker_scenarios),
-        "executed_count": executed_count,
+        "scenario_count": len(scenarios),
+        "executed_count": len(scenarios),
         "success": worker_success,
     }
-    return eval_results, scenario_summaries, worker_summary
+    return evaluations, scenario_summaries, worker_summary
 
 
 def _persist_raw_scenario_result(
-    *,
     worker_raw_dir: Path,
     scenario_id: str,
     scenario_result: dict[str, Any],
 ) -> str:
-    existing = scenario_result.get("result_file")
-    if existing:
-        result_path = Path(str(existing))
-        if result_path.exists():
-            return str(result_path)
-        result_path.parent.mkdir(parents=True, exist_ok=True)
-    else:
-        safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(scenario_id))
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
-        result_path = worker_raw_dir / f"{safe_id}_{timestamp}.json"
-
+    safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(scenario_id))
+    timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
+    result_path = worker_raw_dir / f"{safe_id}_{timestamp}.json"
     result_path.write_text(json.dumps(scenario_result, indent=2, default=str), encoding="utf-8")
     scenario_result["result_file"] = str(result_path)
     return str(result_path)
 
 
 def execute_on_runtime_pool(
-    config: RuntimePoolConfig | None = None,
-    **kwargs,
-):
-    """Execute scenarios across a runtime worker pool.
-
-    Accepts either a :class:`RuntimePoolConfig` instance or keyword arguments
-    (for backward compatibility).
-
-    When the pool contains more than one worker the workers execute **in
-    parallel** using threads so that each Containerlab topology can run its
-    assigned scenarios concurrently.
-    """
-    if config is None:
-        config = RuntimePoolConfig(**kwargs)
-
-    if not config.runtime.workers:
-        raise ValueError("runtime must contain at least one worker")
-
-    assignments = assign_scenarios_to_workers(config.scenarios, config.runtime.workers)
-    # -- parallel worker execution -----------------------------------------
-    num_workers = len(config.runtime.workers)
-    all_eval_results: list[Any] = []
-    scenario_summaries: list[dict[str, Any]] = []
-    worker_summaries: list[dict[str, Any]] = []
-
-    if num_workers == 1:
-        # Fast path: single worker, skip thread-pool overhead.
-        worker = config.runtime.workers[0]
-        wid = str(worker.id or f"worker-{worker.index}")
-        evals, sc_sums, w_sum = _run_worker(
-            config,
-            worker,
-            assignments.get(wid, []),
-        )
-        all_eval_results.extend(evals)
-        scenario_summaries.extend(sc_sums)
-        worker_summaries.append(w_sum)
-    else:
-        logger.info("Executing %d workers in parallel", num_workers)
-        # Map futures back to workers so results can be merged in
-        # deterministic (worker-index) order after all complete.
-        futures_map: dict[Any, WorkerSpec] = {}
-        with ThreadPoolExecutor(max_workers=num_workers) as pool:
-            for worker in config.runtime.workers:
-                wid = str(worker.id or f"worker-{worker.index}")
-                fut = pool.submit(
-                    _run_worker,
-                    config,
-                    worker,
-                    assignments.get(wid, []),
-                )
-                futures_map[fut] = worker
-
-            # Wait for all to complete; propagate first failure.
-            results_by_worker: dict[int, tuple[list[Any], list[dict[str, Any]], dict[str, Any]]] = {}
-            for fut in as_completed(futures_map):
-                worker = futures_map[fut]
-                results_by_worker[worker.index] = fut.result()  # raises on error
-
-        # Merge in stable worker-index order.
-        for worker in sorted(config.runtime.workers, key=lambda w: w.index):
-            evals, sc_sums, w_sum = results_by_worker[worker.index]
-            all_eval_results.extend(evals)
-            scenario_summaries.extend(sc_sums)
-            worker_summaries.append(w_sum)
-
-    if all_eval_results:
-        report_evaluator = config.evaluator_factory()
-        aggregate_report = report_evaluator.generate_report(
-            all_eval_results,
-            agent_name=getattr(config.agent, "name", config.agent.__class__.__name__),
-            topology_scale=config.runtime.scale,
-        )
-    else:
-        aggregate_report = {"summary": {"total_cases": 0, "average_score": 0.0}, "detailed_results": []}
-
-    completed_at = config.completed_at_factory()
-    report_payload = config.create_run_report(
-        run_id=config.run_id,
-        mode=config.mode,
-        started_at=config.started_at,
-        completed_at=completed_at,
-        runtime=config.runtime,
-        runtime_owner=config.runtime_owner,
-        teardown=config.teardown,
-        scenarios=config.scenarios,
-        agent=config.agent,
-        worker_summaries=worker_summaries,
-        scenario_summaries=scenario_summaries,
-        aggregate_report=aggregate_report,
-        artifact_dir=config.artifact_dir,
-        raw_dir=config.raw_dir,
-        traces_dir=config.traces_dir,
-        trace_index_path=(config.trace_writer.index_path if config.trace_writer is not None else None),
-        trace_results_path=(config.trace_writer.results_path if config.trace_writer is not None else None),
-        report_path=config.report_path,
-        metadata_path=config.metadata_path,
+    *,
+    runtime: RuntimePool,
+    scenarios: list[ScenarioExecutionRef],
+    agent: Any,
+    raw_dir: Path,
+    trace_writer: TraceWriter | None = None,
+    fault_registry: Any = None,
+    baseline_wait_seconds: int = 60,
+    post_recovery_wait_seconds: int = 2,
+    skip_none_episodes: bool = True,
+) -> PoolDispatchResult:
+    """Run scenarios on an existing runtime and return ordered execution data."""
+    return _dispatch_workers(
+        runtime.workers,
+        scenarios,
+        lambda worker, assigned: _run_worker(
+            runtime=runtime,
+            agent=agent,
+            raw_dir=raw_dir,
+            trace_writer=trace_writer,
+            fault_registry=fault_registry,
+            baseline_wait_seconds=baseline_wait_seconds,
+            post_recovery_wait_seconds=post_recovery_wait_seconds,
+            skip_none_episodes=skip_none_episodes,
+            worker=worker,
+            scenarios=assigned,
+        ),
     )
-    config.save_run_report(report_payload, config.report_path)
-    report_status = str(
-        (report_payload.get("raw") or {}).get("status")
-        or (report_payload.get("summary") or {}).get("status")
-        or report_payload.get("status")
-        or "unknown"
-    )
-    config.save_run_metadata(
-        config.artifact_manager,
-        config.artifact_dir,
-        run_id=config.run_id,
-        mode=config.mode,
-        status=report_status,
-        runtime_id=config.runtime.id,
-        runtime_owner=config.runtime_owner,
-        teardown=config.teardown,
-        started_at=config.started_at,
-        completed_at=completed_at,
-        scenarios=config.scenarios,
-        worker_summaries=worker_summaries,
-        traces_dir=config.traces_dir,
-        trace_index_path=(config.trace_writer.index_path if config.trace_writer is not None else None),
-        trace_results_path=(config.trace_writer.results_path if config.trace_writer is not None else None),
-    )
-    handle_payload = config.build_run_handle(
-        run_id=config.run_id,
-        mode=config.mode,
-        status=report_status,
-        started_at=config.started_at,
-        completed_at=completed_at,
-        artifact_dir=config.artifact_dir,
-        scenarios=config.scenarios,
-        runtime_id=config.runtime.id,
-        report_path=config.report_path,
-    )
-    return config.run_handle_adapter(handle_payload)
+
+
+__all__ = ["PoolDispatchResult", "assign_scenarios_to_workers", "execute_on_runtime_pool"]

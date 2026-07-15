@@ -37,16 +37,6 @@ class SonicRuntime:
             raise ValueError(f"Unknown device: {device}")
         return self._cmd.docker_exec(container, ["config"] + args)
 
-    def services_ready(self, device: str) -> bool:
-        result = self.vtysh(device, ["show ip bgp summary"])
-        output = f"{result.stdout or ''}\n{result.stderr or ''}".lower()
-        return (
-            result.returncode == 0
-            and "bgpd is not running" not in output
-            and "failed to connect to any daemons" not in output
-            and "% bgp instance not found" not in output
-        )
-
     def reload_bgp_config(self, device: str) -> subprocess.CompletedProcess:
         container = self._ctx.container_names.get(device)
         if not container:

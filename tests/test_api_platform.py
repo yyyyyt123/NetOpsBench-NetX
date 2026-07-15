@@ -44,47 +44,18 @@ def test_sdk_managers_namespace_is_no_longer_public():
         importlib.import_module("netopsbench.sdk.managers")
 
 
-def test_netopsbench_root_preserves_constructor_state(tmp_path):
+def test_netopsbench_root_only_persists_workspace(tmp_path):
     from netopsbench.sdk import NetOpsBench
 
-    defaults = {"scale": "xs"}
-    env = {"NETOPSBENCH_ENV": "test"}
-
-    bench = NetOpsBench(workspace=str(tmp_path), defaults=defaults, env=env, auto_load_env=False)
+    bench = NetOpsBench(workspace=str(tmp_path))
 
     assert bench.workspace == tmp_path
-    assert bench.defaults == defaults
-    assert bench.defaults is not defaults
-    assert bench.env == env
-    assert bench.env is not env
-    assert bench.auto_load_env is False
+    assert not hasattr(bench, "defaults")
+    assert not hasattr(bench, "env")
+    assert not hasattr(bench, "auto_load_env")
 
-    defaults["scale"] = "large"
-    env["NETOPSBENCH_ENV"] = "mutated"
-
-    assert bench.defaults["scale"] == "xs"
-    assert bench.env["NETOPSBENCH_ENV"] == "test"
-
-
-def test_netopsbench_loads_env_from_process_when_requested(monkeypatch):
-    from netopsbench.sdk import NetOpsBench
-
-    monkeypatch.setenv("NETOPSBENCH_AUTO_ENV", "from-process")
-
-    bench = NetOpsBench(env=None, auto_load_env=True)
-
-    assert bench.env["NETOPSBENCH_AUTO_ENV"] == "from-process"
-    assert isinstance(bench.env, dict)
-
-
-def test_netopsbench_keeps_empty_env_when_auto_load_disabled(monkeypatch):
-    from netopsbench.sdk import NetOpsBench
-
-    monkeypatch.setenv("NETOPSBENCH_AUTO_ENV", "from-process")
-
-    bench = NetOpsBench(env=None, auto_load_env=False)
-
-    assert bench.env == {}
+    with pytest.raises(TypeError):
+        NetOpsBench(env={})
 
 
 def test_public_api_exports_shared_types():
@@ -160,9 +131,9 @@ def test_session_orchestrator_is_available_under_platform_session_package():
 def test_worker_health_check_tracks_the_deployed_pingmesh_agent_path():
     repo = Path(__file__).resolve().parents[1]
     deploy_py = (repo / "netopsbench" / "platform" / "pingmesh" / "deploy.py").read_text(encoding="utf-8")
-    health_py = (repo / "netopsbench" / "platform" / "worker" / "health.py").read_text(encoding="utf-8")
+    health_py = (repo / "netopsbench" / "platform" / "runtime" / "health.py").read_text(encoding="utf-8")
 
-    expected_path = "/tmp/pingmesh/run_pingmesh_agent.py"
+    expected_path = "/tmp/pingmesh/netopsbench/platform/pingmesh/cli.py"
 
     assert expected_path in deploy_py
-    assert "run_pingmesh_agent.py" in health_py
+    assert "netopsbench.platform.pingmesh.cli" in health_py

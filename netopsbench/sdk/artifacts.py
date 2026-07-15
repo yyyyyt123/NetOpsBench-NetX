@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from netopsbench.platform.session.tracing import export_traces, load_trace_index, load_trace_results
+from netopsbench.platform.session.harbor_export import export_traces, load_trace_index, load_trace_results
 
 
 class ArtifactManager:

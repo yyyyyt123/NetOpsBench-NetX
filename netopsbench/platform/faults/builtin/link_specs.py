@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..specs import FaultSpec
+from ..models import FaultSpec
 from .common import episode_param, recover_background_process_fault
 
 

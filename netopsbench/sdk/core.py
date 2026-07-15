@@ -1,8 +1,6 @@
 """Public NetOpsBench SDK root."""
 
 import logging
-import os
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -36,18 +34,9 @@ class NetOpsBench:
     def __init__(
         self,
         workspace: str = ".",
-        defaults: Mapping[str, object] | None = None,
-        env: Mapping[str, str] | None = None,
-        auto_load_env: bool = True,
     ):
         configure_logging()
         self.workspace = Path(workspace)
-        self.defaults = dict(defaults or {})
-        self.auto_load_env = auto_load_env
-        if env is None and auto_load_env:
-            self.env = dict(os.environ)
-        else:
-            self.env = dict(env or {})
         self._closed = False
 
         self.scenarios = self._bind_manager(ScenarioManager(workspace=self.workspace), "scenarios")

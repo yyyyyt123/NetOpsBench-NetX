@@ -89,11 +89,9 @@ class RoutingRuntime:
         }
 
     def get_device_asn(self, device: str) -> int | None:
-        devices = (self._ctx.topology_metadata or {}).get("devices", {})
-        for group in ("spines", "leafs"):
-            for entry in devices.get(group, []):
-                if entry.get("name") == device and entry.get("asn") is not None:
-                    return int(entry["asn"])
+        for entry in self._ctx.manifest.routing_devices():
+            if entry.name == device and entry.asn is not None:
+                return int(entry.asn)
         snapshot = self.get_bgp_config_snapshot(device)
         if snapshot.get("local_as") is not None:
             return int(snapshot["local_as"])

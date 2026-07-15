@@ -747,6 +747,7 @@ class MinimalDeepAgent:
 fake_sdk = types.ModuleType('netopsbench.sdk')
 fake_sdk.NetOpsBench = NetOpsBench
 fake_sdk.RunFailedError = RuntimeError
+fake_sdk.supported_scales = lambda: ('xs', 'small', 'medium', 'large', 'xlarge', 'fat-tree-k8', 'fat-tree-k12')
 sys.modules['netopsbench.sdk'] = fake_sdk
 
 fake_examples_agents = types.ModuleType('examples.agents')
@@ -845,9 +846,9 @@ def test_minimal_deepagent_uses_sdk_default_mcp_server_config(monkeypatch):
             "netopsbench": {
                 "transport": "stdio",
                 "command": "python",
-                "args": ["scripts/toolkit/run_fastmcp_server.py"],
+                "args": ["-m", "netopsbench.platform.toolkit.fastmcp_server"],
                 "cwd": str(workspace),
-                "env": {"PYTHONPATH": str(workspace)},
+                "env": {},
             }
         },
     )
@@ -869,4 +870,4 @@ def test_minimal_deepagent_uses_sdk_default_mcp_server_config(monkeypatch):
     context = DiagnosticContext(scenario_id="scenario-mcp", topology={"devices": {}}, symptoms={})
     asyncio.run(agent.diagnose(context))
 
-    assert captured_config["args"] == ["scripts/toolkit/run_fastmcp_server.py"]
+    assert captured_config["args"] == ["-m", "netopsbench.platform.toolkit.fastmcp_server"]

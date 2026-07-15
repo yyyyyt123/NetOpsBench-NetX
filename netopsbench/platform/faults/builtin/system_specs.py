@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..specs import FaultSpec
+from ..models import FaultSpec
 
 
 def _inject_device_down_episode(injector, episode):

@@ -4,9 +4,17 @@ from __future__ import annotations
 
 from typing import Any
 
-import requests
+from netopsbench.platform.observability.influxdb import query_flux
+from netopsbench.platform.utils.interface_names import resolve_interface_metric_identities
 
 from ..common import ToolResult
+from ..device.interface_parsers import get_active_interface_names, get_live_interface_snapshot
+from ..device.telemetry_parsers import (
+    get_recent_influx_interface_identities,
+    parse_influx_metric_rows,
+    summarize_counter_points,
+)
+from ..device.text_parsers import preview_items
 
 
 class MetricsOpsMixin:
@@ -35,7 +43,7 @@ class MetricsOpsMixin:
             if safe_view not in allowed_views:
                 return ToolResult(success=False, data=None, error=f"Invalid view: {view}")
 
-            identities = self._resolve_interface_metric_identities(safe_interface)
+            identities = resolve_interface_metric_identities(safe_interface)
 
             type_fields = {
                 "throughput": ["in_octets", "out_octets"],
@@ -63,22 +71,9 @@ from(bucket: "{self.influxdb_bucket}")
   |> yield(name: "metrics")
 """
 
-            headers = {
-                "Authorization": f"Token {self.influxdb_token}",
-                "Content-Type": "application/vnd.flux",
-                "Accept": "application/csv",
-            }
-
-            response = requests.post(
-                f"{self.influxdb_url}/api/v2/query?org={self.influxdb_org}",
-                headers=headers,
-                data=query,
-                timeout=30,
-                proxies={"http": "", "https": ""},
-            )
-
-            if response.status_code != 200:
-                return ToolResult(success=False, data=None, error=f"InfluxDB query failed: {response.text}")
+            result = query_flux(self.influxdb_url, self.influxdb_token, self.influxdb_org, query)
+            if result.status != "ok":
+                return ToolResult(success=False, data=None, error=f"InfluxDB query failed: {result.error}")
 
             if safe_view == "raw":
                 return ToolResult(
@@ -89,39 +84,34 @@ from(bucket: "{self.influxdb_bucket}")
                         "time_range_minutes": safe_minutes,
                         "metric_type": safe_metric_type,
                         "view": safe_view,
-                        "metrics": response.text,
+                        "metrics": result.text,
                     },
                 )
 
-            metric_rows = self._parse_influx_metric_rows(response.text)
+            metric_rows = parse_influx_metric_rows(result.text)
             if not metric_rows:
-                observed_identities = self._get_recent_influx_interface_identities(
-                    safe_device,
-                    safe_minutes,
-                    headers=headers,
-                )
+                observed_identities = get_recent_influx_interface_identities(self, safe_device, safe_minutes)
                 observed_interfaces = sorted(
                     {str(item.get("name")).strip() for item in observed_identities if item.get("name")}
                 )
-                active_interfaces = self._get_active_interface_names(safe_device)
+                active_interfaces = get_active_interface_names(self, safe_device)
                 missing_active_interfaces = [name for name in active_interfaces if name not in observed_interfaces]
-                live_snapshot = self._get_live_interface_snapshot(safe_device, safe_interface)
+                live_snapshot = get_live_interface_snapshot(self, safe_device, safe_interface)
                 warning_parts: list[str] = []
                 if observed_interfaces:
                     warning_parts.append(
                         "Interface metrics exist for the device, but per-interface samples are missing for "
                         f"{safe_interface}. Recent Influx interfaces for {safe_device}: "
-                        f"{self._preview_items(observed_interfaces)}."
+                        f"{preview_items(observed_interfaces)}."
                     )
                 else:
                     warning_parts.append(
-                        "No interface time-series samples were available in InfluxDB for this device/interface "
-                        "window."
+                        "No interface time-series samples were available in InfluxDB for this device/interface window."
                     )
                 if missing_active_interfaces:
                     warning_parts.append(
                         "Active interfaces missing from recent Influx data: "
-                        f"{self._preview_items(missing_active_interfaces)}."
+                        f"{preview_items(missing_active_interfaces)}."
                     )
                 if live_snapshot:
                     warning_parts.append("Returning a live CLI snapshot as fallback context.")
@@ -155,7 +145,7 @@ from(bucket: "{self.influxdb_bucket}")
 
             summary: dict[str, dict[str, Any]] = {}
             for field, points in series.items():
-                field_summary = self._summarize_counter_points(field, points)
+                field_summary = summarize_counter_points(field, points)
                 if not field_summary:
                     continue
                 summary[field] = field_summary
@@ -189,7 +179,5 @@ from(bucket: "{self.influxdb_bucket}")
                     "series": series,
                 },
             )
-        except requests.exceptions.RequestException as e:
-            return ToolResult(success=False, data=None, error=f"Request failed: {str(e)}")
         except Exception as e:
             return ToolResult(success=False, data=None, error=str(e))

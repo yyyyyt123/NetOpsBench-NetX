@@ -6,6 +6,8 @@ import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
+from netopsbench.platform.topology.topology_utils import is_network_device_name
+
 
 def parse_influx_syslog_rows(csv_text: str) -> list[dict[str, Any]]:
     import csv
@@ -100,7 +102,7 @@ def get_device_logs_fallback(
     safe_minutes = max(1, min(int(time_range_minutes), 24 * 60))
     cutoff = datetime.now(UTC) - timedelta(minutes=safe_minutes)
     candidate_files = ["/var/log/syslog"]
-    if str(device).startswith(("leaf", "spine")):
+    if is_network_device_name(str(device)):
         candidate_files.append("/var/log/frr/frr.log")
     quoted_files = " ".join(candidate_files)
     command = (

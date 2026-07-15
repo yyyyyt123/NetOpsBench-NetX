@@ -10,6 +10,34 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+_MCP_ENV_ALLOWLIST = frozenset(
+    {
+        "NETOPSBENCH_INFLUXDB_BUCKET",
+        "NETOPSBENCH_INFLUXDB_ORG",
+        "NETOPSBENCH_INFLUXDB_TOKEN",
+        "NETOPSBENCH_INFLUXDB_URL",
+        "NETOPSBENCH_LOG_LEVEL",
+        "NETOPSBENCH_NO_SUDO",
+        "NETOPSBENCH_PINGMESH_CONTEXT_FILE",
+        "NETOPSBENCH_PINGMESH_END_TIME",
+        "NETOPSBENCH_PINGMESH_START_TIME",
+        "NETOPSBENCH_TOPOLOGY_DIR",
+        "NETOPSBENCH_TOPOLOGY_ID",
+    }
+)
+_PROCESS_ENV_ALLOWLIST = frozenset(
+    {
+        "HOME",
+        "LANG",
+        "LC_ALL",
+        "LD_LIBRARY_PATH",
+        "PATH",
+        "TMPDIR",
+        "USER",
+        "VIRTUAL_ENV",
+    }
+)
+
 
 @dataclass
 class BuiltinMCPServerHandle:
@@ -49,21 +77,20 @@ def builtin_mcp_server_config(
 ) -> dict[str, dict[str, Any]]:
     """Return stdio MCP server config used by NetOpsBench built-in tools."""
 
-    repo_root = Path(workspace).resolve()
-    passthrough_env = {key: value for key, value in os.environ.items() if key.startswith("NETOPSBENCH_") and value}
+    resolved_workspace = Path(workspace).resolve()
+    passthrough_env = {key: os.environ[key] for key in _MCP_ENV_ALLOWLIST if os.environ.get(key)}
     if env:
-        passthrough_env.update({k: v for k, v in env.items() if isinstance(v, str) and v})
+        passthrough_env.update(
+            {key: value for key, value in env.items() if key in _MCP_ENV_ALLOWLIST and isinstance(value, str) and value}
+        )
 
     return {
         "netopsbench": {
             "transport": "stdio",
             "command": python_executable or sys.executable,
-            "args": ["scripts/toolkit/run_fastmcp_server.py"],
-            "cwd": str(repo_root),
-            "env": {
-                **passthrough_env,
-                "PYTHONPATH": str(repo_root),
-            },
+            "args": ["-m", "netopsbench.platform.toolkit.fastmcp_server"],
+            "cwd": str(resolved_workspace),
+            "env": passthrough_env,
         }
     }
 
@@ -94,10 +121,11 @@ def start_builtin_mcp_server(
 
     config = builtin_mcp_server_config(workspace=workspace, env=env, python_executable=python_executable)
     server = config["netopsbench"]
+    process_env = {key: os.environ[key] for key in _PROCESS_ENV_ALLOWLIST if os.environ.get(key)}
     process = subprocess.Popen(
         [server["command"], *server["args"]],
         cwd=server["cwd"],
-        env={**os.environ, **server["env"]},
+        env={**process_env, **server["env"]},
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,

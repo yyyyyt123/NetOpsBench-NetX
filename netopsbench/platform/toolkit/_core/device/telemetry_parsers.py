@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import csv
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from io import StringIO
-from typing import Any
+from typing import Any, Literal
 
-import requests
+from netopsbench.platform.observability.influxdb import query_flux
 
 
 def parse_influx_timestamp(value: str | None) -> datetime | None:
@@ -78,26 +79,20 @@ def parse_influx_interface_identity_rows(csv_text: str) -> list[dict[str, str | 
 
 
 def get_recent_influx_interface_identities(
-    toolkit, device: str, time_range_minutes: int, headers: dict[str, str] | None = None
+    toolkit, device: str, time_range_minutes: int
 ) -> list[dict[str, str | None]]:
     safe_device = toolkit._validate_device_name(device)
     safe_minutes = max(1, min(int(time_range_minutes), 24 * 60))
-    request_headers = headers or {
-        "Authorization": f"Token {toolkit.influxdb_token}",
-        "Content-Type": "application/vnd.flux",
-        "Accept": "application/csv",
-    }
     query = f"""\nfrom(bucket: "{toolkit.influxdb_bucket}")\n  |> range(start: -{safe_minutes}m)\n  |> filter(fn: (r) => r._measurement == "interfaces")\n  |> filter(fn: (r) => r.source == "{safe_device}")\n  |> keep(columns: ["_time", "name", "path", "source"])\n  |> limit(n: 2000)\n"""
-    response = requests.post(
-        f"{toolkit.influxdb_url}/api/v2/query?org={toolkit.influxdb_org}",
-        headers=request_headers,
-        data=query,
-        timeout=30,
-        proxies={"http": "", "https": ""},
+    result = query_flux(
+        toolkit.influxdb_url,
+        toolkit.influxdb_token,
+        toolkit.influxdb_org,
+        query,
     )
-    if response.status_code != 200:
+    if result.status != "ok":
         return []
-    return parse_influx_interface_identity_rows(response.text)
+    return parse_influx_interface_identity_rows(result.text)
 
 
 def summarize_counter_points(field: str, points: list[dict[str, Any]]) -> dict[str, Any]:
@@ -141,22 +136,23 @@ def summarize_counter_points(field: str, points: list[dict[str, Any]]) -> dict[s
     return summary
 
 
-def query_influx_rows(toolkit, query: str, require_value: bool = True) -> list[dict[str, Any]]:
-    headers = {
-        "Authorization": f"Token {toolkit.influxdb_token}",
-        "Content-Type": "application/vnd.flux",
-        "Accept": "application/csv",
-    }
-    response = requests.post(
-        f"{toolkit.influxdb_url}/api/v2/query?org={toolkit.influxdb_org}",
-        headers=headers,
-        data=query,
-        timeout=30,
-        proxies={"http": "", "https": ""},
-    )
-    response.raise_for_status()
+@dataclass(frozen=True)
+class InfluxQueryResult:
+    status: Literal["ok", "error"]
+    rows: list[dict[str, Any]] = field(default_factory=list)
+    error: str | None = None
+
+
+class InfluxQueryError(RuntimeError):
+    """Raised when a structured InfluxDB query result reports failure."""
+
+
+def query_influx(toolkit, query: str, require_value: bool = True) -> InfluxQueryResult:
+    result = query_flux(toolkit.influxdb_url, toolkit.influxdb_token, toolkit.influxdb_org, query)
+    if result.status != "ok":
+        return InfluxQueryResult(status="error", error=result.error)
     rows: list[dict[str, Any]] = []
-    reader = csv.DictReader(StringIO(response.text))
+    reader = csv.DictReader(StringIO(result.text))
     for row in reader:
         if row.get("result", "") == "result":
             continue
@@ -176,4 +172,12 @@ def query_influx_rows(toolkit, query: str, require_value: bool = True) -> list[d
         if not has_payload:
             continue
         rows.append(parsed)
-    return rows
+    return InfluxQueryResult(status="ok", rows=rows)
+
+
+def query_influx_rows(toolkit, query: str, require_value: bool = True) -> list[dict[str, Any]]:
+    """Return parsed rows, preserving query failure as an exception."""
+    result = query_influx(toolkit, query, require_value=require_value)
+    if result.status == "error":
+        raise InfluxQueryError(result.error or "InfluxDB query failed")
+    return result.rows

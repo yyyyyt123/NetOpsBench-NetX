@@ -17,6 +17,11 @@ def get_bgp_neighbors(device: str, format: str = "structured"):
     return as_payload(get_toolkit().get_bgp_neighbors(device=device, format=format))
 
 
+def get_bgp_neighbor(device: str, peer: str):
+    """Get live detail for one BGP neighbor on one network device."""
+    return as_payload(get_toolkit().get_bgp_neighbor(device=device, peer=peer))
+
+
 def get_route_table(
     device: str,
     prefix: str | None = None,
@@ -55,6 +60,7 @@ TOOL_SPECS = [
     ToolSpec(name="get_topology", group="inventory", handler=get_topology),
     ToolSpec(name="get_device_interfaces", group="inventory", handler=get_device_interfaces),
     ToolSpec(name="get_bgp_neighbors", group="inventory", handler=get_bgp_neighbors),
+    ToolSpec(name="get_bgp_neighbor", group="inventory", handler=get_bgp_neighbor),
     ToolSpec(name="get_route_table", group="inventory", handler=get_route_table),
     ToolSpec(name="get_device_config", group="inventory", handler=get_device_config),
     ToolSpec(name="get_bgp_rib", group="inventory", handler=get_bgp_rib),

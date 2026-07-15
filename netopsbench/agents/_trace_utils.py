@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from pathlib import Path
 from typing import Any
@@ -12,8 +11,7 @@ _SECRET_VALUE_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_\-]{12,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9_\-\.]{12,}\b", re.IGNORECASE),
 )
-_DEFAULT_MAX_FIELD_CHARS = 200_000
-_MAX_FIELD_CHARS_ENV = "NETOPSBENCH_TRACE_MAX_FIELD_CHARS"
+MAX_FIELD_CHARS = 200_000
 
 
 def jsonable(value: Any) -> Any:
@@ -65,17 +63,10 @@ def redact_secret_values(value: str) -> str:
 
 
 def truncate_text(value: str) -> str:
-    limit = max_field_chars()
+    limit = MAX_FIELD_CHARS
     if limit <= 0 or len(value) <= limit:
         return value
     return value[:limit] + f"...<truncated {len(value) - limit} chars>"
-
-
-def max_field_chars() -> int:
-    try:
-        return int(os.environ.get(_MAX_FIELD_CHARS_ENV, str(_DEFAULT_MAX_FIELD_CHARS)))
-    except ValueError:
-        return _DEFAULT_MAX_FIELD_CHARS
 
 
 __all__ = ["jsonable"]

@@ -1,29 +1,31 @@
 from __future__ import annotations
 
 import subprocess
+import tempfile
 
+from netopsbench.platform.observability.influxdb import FluxQueryResult
 from netopsbench.platform.toolkit.toolkit import AgentToolkit
-
-
-class _Response:
-    status_code = 200
-    text = ""
-
-    def __init__(self, text: str):
-        self.text = text
+from netopsbench.platform.topology.generator import generate_topology
 
 
 def _toolkit() -> AgentToolkit:
-    return AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.15"}],
-                "clients": [],
-            },
-        }
-    )
+    with tempfile.TemporaryDirectory() as tmpdir:
+        metadata = generate_topology("xs", tmpdir)["metadata"]
+    return AgentToolkit(topology_metadata=metadata)
+
+
+def test_toolkit_keeps_canonical_state_and_projects_public_topology(monkeypatch):
+    toolkit = _toolkit()
+
+    assert toolkit.topology_metadata["schema_version"] == "3"
+    assert isinstance(toolkit.topology_metadata["devices"], list)
+
+    public_topology = toolkit.get_topology()
+    assert public_topology.success is True
+    assert isinstance(public_topology.data["devices"], dict)
+    assert set(public_topology.data["devices"]) >= {"spines", "leafs", "clients"}
+
+    assert not hasattr(toolkit, "get_all_bgp_status")
 
 
 def test_get_device_logs_excludes_raw_csv_by_default(monkeypatch):
@@ -31,8 +33,8 @@ def test_get_device_logs_excludes_raw_csv_by_default(monkeypatch):
     csv_text = "_time,source,severity,_value\n2026-05-04T00:00:00Z,leaf1,notice,message-one\n"
 
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.device.log_ops.requests.post",
-        lambda *args, **kwargs: _Response(csv_text),
+        "netopsbench.platform.toolkit._core.device.log_ops.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok", text=csv_text),
     )
 
     result = toolkit.get_device_logs("leaf1", time_range_minutes=10)
@@ -47,8 +49,8 @@ def test_get_device_logs_can_include_raw_csv(monkeypatch):
     csv_text = "_time,source,severity,_value\n2026-05-04T00:00:00Z,leaf1,notice,message-one\n"
 
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.device.log_ops.requests.post",
-        lambda *args, **kwargs: _Response(csv_text),
+        "netopsbench.platform.toolkit._core.device.log_ops.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok", text=csv_text),
     )
 
     result = toolkit.get_device_logs("leaf1", time_range_minutes=10, include_raw=True)

@@ -31,6 +31,21 @@ def parse_route_table(text: str) -> list[dict[str, Any]]:
             hops.append({"via": via, "interface": iface})
         return hops
 
+    def add_route_state(route: dict[str, Any], raw_text: str) -> None:
+        code = str(route.get("code") or "")
+        route["selected"] = ">" in code or "best" in raw_text.lower()
+        discard_match = re.search(r"\b(Null0|blackhole|reject)\b", raw_text, re.IGNORECASE)
+        discard_hop = next(
+            (
+                hop.get("interface")
+                for hop in route.get("nexthops", [])
+                if str(hop.get("interface") or "").lower() == "null0"
+            ),
+            None,
+        )
+        route["is_discard"] = bool(discard_match or discard_hop)
+        route["discard_interface"] = discard_hop or (discard_match.group(1) if discard_match else None)
+
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     if lines and lines[0].startswith("Routing entry for "):
         prefix = lines[0].split("Routing entry for ", 1)[1].strip()
@@ -55,6 +70,7 @@ def parse_route_table(text: str) -> list[dict[str, Any]]:
             if nh_match:
                 via, iface = nh_match.groups()
                 route["nexthops"].append({"via": via, "interface": iface})
+        add_route_state(route, text)
         return [route]
     for raw in text.splitlines():
         if not raw.strip():
@@ -62,12 +78,19 @@ def parse_route_table(text: str) -> list[dict[str, Any]]:
         if raw.startswith(" "):
             if current:
                 current["nexthops"].extend(parse_nexthops(raw))
+                current["_raw"] = f"{current.get('_raw', '')} {raw.strip()}"
             continue
         match = re.match(r"^([A-Z*>]+)\s+([0-9.]+/\d+)\s*(.*)$", raw.strip())
         if not match:
             continue
         code, prefix, rest = match.groups()
-        route = {"prefix": prefix, "code": code, "protocol": protocol_from_code(code), "nexthops": []}
+        route = {
+            "prefix": prefix,
+            "code": code,
+            "protocol": protocol_from_code(code),
+            "nexthops": [],
+            "_raw": rest,
+        }
         metric_match = re.search(r"\[(\d+)/(\d+)\]", rest)
         if metric_match:
             route["admin_distance"] = int(metric_match.group(1))
@@ -79,4 +102,6 @@ def parse_route_table(text: str) -> list[dict[str, Any]]:
         route["nexthops"].extend(parse_nexthops(rest))
         routes.append(route)
         current = route
+    for route in routes:
+        add_route_state(route, str(route.pop("_raw", "")))
     return routes

@@ -1,17 +1,33 @@
 import random
 import subprocess
+import tempfile
 from datetime import UTC, datetime
-from pathlib import Path
 
 import pytest
 
 from netopsbench.platform.faults.injector import FaultInjector
+from netopsbench.platform.observability.bgp_parser import parse_bgp_summary
+from netopsbench.platform.observability.influxdb import FluxQueryResult
 from netopsbench.platform.scenario import generator as _generate_scenarios_mod
+from netopsbench.platform.toolkit._core.device.route_parsers import parse_route_table
+from netopsbench.platform.toolkit._core.device.telemetry_parsers import (
+    parse_influx_metric_rows,
+    parse_influx_timestamp,
+    query_influx,
+    summarize_counter_points,
+)
+from netopsbench.platform.toolkit._core.device.text_parsers import parse_table
 from netopsbench.platform.toolkit.toolkit import AgentToolkit
+from netopsbench.platform.topology.generator import generate_topology
+from netopsbench.platform.utils.interface_names import resolve_interface_metric_identities
+
+
+def _metadata() -> dict:
+    with tempfile.TemporaryDirectory() as tmpdir:
+        return generate_topology("xs", tmpdir)["metadata"]
 
 
 def test_parse_route_table_brief_output():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
     sample = """
 Codes: K - kernel route, C - connected, L - local, S - static,
 
@@ -20,11 +36,13 @@ S>* 192.168.2.2/32 [1/0] via 192.168.101.2, Ethernet8, weight 1, 01:14:52
 B>* 192.168.102.0/30 [20/0] via 192.168.11.1, Ethernet0, weight 1, 01:30:50
   *                         via 192.168.21.1, Ethernet4, weight 1, 01:30:50
 """
-    routes = toolkit._parse_route_table(sample)
+    routes = parse_route_table(sample)
 
     assert routes[0]["prefix"] == "192.168.2.2/32"
     assert routes[0]["protocol"] == "static"
     assert routes[0]["nexthops"] == [{"via": "192.168.101.2", "interface": "Ethernet8"}]
+    assert routes[0]["selected"] is True
+    assert routes[0]["is_discard"] is False
 
     assert routes[1]["prefix"] == "192.168.102.0/30"
     assert routes[1]["protocol"] == "bgp"
@@ -35,7 +53,6 @@ B>* 192.168.102.0/30 [20/0] via 192.168.11.1, Ethernet0, weight 1, 01:30:50
 
 
 def test_parse_route_table_detailed_output():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
     sample = """
 Routing entry for 192.168.102.0/30
   Known via "bgp", distance 20, metric 0, best
@@ -43,7 +60,7 @@ Routing entry for 192.168.102.0/30
   * 192.168.11.1, via Ethernet0, weight 1
   * 192.168.21.1, via Ethernet4, weight 1
 """
-    routes = toolkit._parse_route_table(sample)
+    routes = parse_route_table(sample)
 
     assert routes == [
         {
@@ -56,26 +73,53 @@ Routing entry for 192.168.102.0/30
             ],
             "admin_distance": 20,
             "metric": 0,
+            "selected": True,
+            "is_discard": False,
+            "discard_interface": None,
         }
     ]
 
 
-def test_build_fault_instance_static_route_targets_remote_client():
+def test_parse_route_table_marks_null0_as_discard_route():
+    sample = """
+Routing entry for 192.168.105.0/30
+  Known via "static", distance 1, metric 0, best
+  * directly connected, Null0
+"""
+
+    routes = parse_route_table(sample)
+
+    assert routes == [
+        {
+            "prefix": "192.168.105.0/30",
+            "code": None,
+            "protocol": "static",
+            "nexthops": [{"via": None, "interface": "Null0"}],
+            "admin_distance": 1,
+            "metric": 0,
+            "selected": True,
+            "is_discard": True,
+            "discard_interface": "Null0",
+        }
+    ]
+
+
+def test_parse_route_table_preserves_blackhole_discard_kind():
+    sample = "S>* 192.168.105.0/30 [1/0] blackhole, weight 1, 00:00:10"
+
+    routes = parse_route_table(sample)
+
+    assert routes[0]["protocol"] == "static"
+    assert routes[0]["selected"] is True
+    assert routes[0]["is_discard"] is True
+    assert routes[0]["discard_interface"] == "blackhole"
+
+
+def test_build_fault_instance_static_route_targets_remote_client(tmp_path):
     gs = _generate_scenarios_mod
-    topo = gs.TopologyContext(
-        scale="xs",
-        topology_dir=Path("lab-topology/generated_topology_xs"),
-        metadata={"scale": {"num_spines": 2}},
-        spines=["spine1", "spine2"],
-        leafs=["leaf1", "leaf2"],
-        clients=[
-            {"name": "client1", "leaf": "leaf1", "data_ip": "192.168.101.2"},
-            {"name": "client2", "leaf": "leaf2", "data_ip": "192.168.102.2"},
-        ],
-        device_interfaces={},
-        leaf_interface_roles={},
-        client_interfaces={},
-    )
+    topology_dir = tmp_path / "topology"
+    generate_topology("xs", str(topology_dir))
+    topo = gs.load_topology("xs", str(topology_dir))
     template = {"name": "static_route_misconfig", "device_role": "leaf", "severity": "medium"}
     defaults = {"seed": 42}
 
@@ -96,18 +140,7 @@ def test_build_fault_instance_static_route_targets_remote_client():
 
 
 def test_recover_static_route_misconfig_prefers_specific_nexthop(monkeypatch):
-    injector = FaultInjector(
-        topology_metadata={
-            "devices": {
-                "spines": [],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.13"}],
-                "clients": [
-                    {"name": "client1", "leaf": "leaf1", "data_ip": "192.168.101.2"},
-                    {"name": "client2", "leaf": "leaf2", "data_ip": "192.168.102.2"},
-                ],
-            }
-        }
-    )
+    injector = FaultInjector(topology_metadata=_metadata())
     injector.active_faults = [
         {
             "type": "static_route_misconfig",
@@ -150,19 +183,7 @@ def test_recover_static_route_misconfig_prefers_specific_nexthop(monkeypatch):
 
 
 def test_inject_static_route_misconfig_auto_uses_topology_clients(monkeypatch):
-    injector = FaultInjector(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.13"}],
-                "clients": [
-                    {"name": "client1", "leaf": "leaf1", "data_ip": "192.168.101.2"},
-                    {"name": "client2", "leaf": "leaf2", "data_ip": "192.168.102.2"},
-                ],
-            },
-        }
-    )
+    injector = FaultInjector(topology_metadata=_metadata())
 
     class Result:
         returncode = 0
@@ -190,15 +211,7 @@ def test_inject_static_route_misconfig_auto_uses_topology_clients(monkeypatch):
 
 
 def test_get_interface_mtu_falls_back_to_live_link(monkeypatch):
-    injector = FaultInjector(
-        topology_metadata={
-            "devices": {
-                "spines": [{"name": "spine1"}],
-                "leafs": [],
-                "clients": [],
-            }
-        }
-    )
+    injector = FaultInjector(topology_metadata=_metadata())
 
     class Result:
         def __init__(self, returncode=0, stdout="", stderr=""):
@@ -219,15 +232,7 @@ def test_get_interface_mtu_falls_back_to_live_link(monkeypatch):
 
 
 def test_recover_mtu_mismatch_normalizes_invalid_saved_mtu(monkeypatch):
-    injector = FaultInjector(
-        topology_metadata={
-            "devices": {
-                "spines": [{"name": "spine1"}],
-                "leafs": [],
-                "clients": [],
-            }
-        }
-    )
+    injector = FaultInjector(topology_metadata=_metadata())
 
     captured = []
 
@@ -256,14 +261,7 @@ def test_recover_mtu_mismatch_normalizes_invalid_saved_mtu(monkeypatch):
 
 
 def test_topology_view_adds_mtu_semantics():
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "defaults": {"link_mtu": 9232},
-            "devices": {"spines": [], "leafs": [], "clients": []},
-            "links": [],
-        }
-    )
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     topo = toolkit.get_topology()
 
@@ -275,16 +273,13 @@ def test_topology_view_adds_mtu_semantics():
 
 
 def test_interface_metric_identities_cover_cli_and_gnmi_names():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+    identities = resolve_interface_metric_identities("Ethernet8")
 
-    identities = toolkit._resolve_interface_metric_identities("Ethernet8")
-
-    assert identities["names"] == ["Ethernet8", "eth3"]
+    assert identities["names"] == ["Ethernet8", "e1-3", "eth3", "ethernet-1/3"]
     assert identities["paths"] == ["COUNTERS/Ethernet8", "/COUNTERS/Ethernet8"]
 
 
 def test_parse_influx_metric_rows_skips_repeated_headers():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
     csv_text = """#group,false,false,true,true,true,true
 #datatype,string,long,dateTime:RFC3339,double,string,string,string
 ,result,table,_time,_value,_field,path,source
@@ -294,7 +289,7 @@ def test_parse_influx_metric_rows_skips_repeated_headers():
 ,_result,1,2026-03-22T07:01:00Z,8,in_discarded_packets,Ethernet0,/COUNTERS/Ethernet0,leaf1
 """
 
-    rows = toolkit._parse_influx_metric_rows(csv_text)
+    rows = parse_influx_metric_rows(csv_text)
 
     assert rows == [
         {
@@ -311,13 +306,12 @@ def test_parse_influx_metric_rows_skips_repeated_headers():
 
 
 def test_interface_metric_summary_uses_window_delta_not_absolute_counter():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
     points = [
         {"time": "2026-03-22T07:00:00Z", "value": 8.0},
         {"time": "2026-03-22T07:01:00Z", "value": 8.0},
     ]
 
-    summary = toolkit._summarize_counter_points("in_discarded_packets", points)
+    summary = summarize_counter_points("in_discarded_packets", points)
 
     assert summary["counter_start"] == 8.0
     assert summary["counter_end"] == 8.0
@@ -328,23 +322,34 @@ def test_interface_metric_summary_uses_window_delta_not_absolute_counter():
 
 
 def test_parse_influx_timestamp_supports_nanosecond_precision():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
-
-    parsed = toolkit._parse_influx_timestamp("2026-03-22T07:26:29.338351792Z")
+    parsed = parse_influx_timestamp("2026-03-22T07:26:29.338351792Z")
 
     assert parsed is not None
     assert parsed.isoformat() == "2026-03-22T07:26:29.338351+00:00"
 
 
+def test_influx_query_failure_is_structured_not_empty_data(monkeypatch):
+    toolkit = AgentToolkit(topology_metadata=_metadata())
+    monkeypatch.setattr(
+        "netopsbench.platform.toolkit._core.device.telemetry_parsers.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="error", error="ConnectionError: offline"),
+    )
+
+    result = query_influx(toolkit, 'from(bucket: "test")')
+
+    assert result.status == "error"
+    assert result.rows == []
+    assert "offline" in result.error
+
+
 def test_parse_bgp_summary_skips_total_footer():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
     sample = """
 Neighbor        V         AS   MsgRcvd   MsgSent   TblVer  InQ OutQ  Up/Down State/PfxRcd   PfxSnt Desc
 192.168.11.2    4      65011       310       309       20    0    0 04:54:34            2       16 N/A
 Total number of neighbors 1
 """
 
-    rows = toolkit._parse_bgp_summary(sample)
+    rows = parse_bgp_summary(sample)
 
     assert rows == [
         {
@@ -362,20 +367,19 @@ Total number of neighbors 1
 
 
 def test_parse_table_skips_separator_row():
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
     sample = """
       IFACE    STATE      RX_OK    RX_BPS
 -----------  -------  ---------  --------
   Ethernet0        U    318,237       N/A
 """
 
-    rows = toolkit._parse_table(sample)
+    rows = parse_table(sample)
 
     assert rows == [{"IFACE": "Ethernet0", "STATE": "U", "RX_OK": "318,237", "RX_BPS": "N/A"}]
 
 
 def test_get_interface_metrics_summary_reports_windowed_rates(monkeypatch):
-    toolkit = AgentToolkit(topology_metadata={"devices": {"spines": [], "leafs": [], "clients": []}})
+    toolkit = AgentToolkit(topology_metadata=_metadata())
     csv_text = """#group,false,false,true,true,true,true,true
 #datatype,string,long,dateTime:RFC3339,double,string,string,string,string
 ,result,table,_time,_value,_field,path,source
@@ -387,13 +391,9 @@ def test_get_interface_metrics_summary_reports_windowed_rates(monkeypatch):
 ,_result,2,2026-03-22T07:01:00Z,8,in_discarded_packets,Ethernet0,/COUNTERS/Ethernet0,leaf1
 """
 
-    class FakeResponse:
-        status_code = 200
-        text = csv_text
-
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.observability.metrics_ops.requests.post",
-        lambda *args, **kwargs: FakeResponse(),
+        "netopsbench.platform.toolkit._core.observability.metrics_ops.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok", text=csv_text),
     )
 
     result = toolkit.get_interface_metrics("leaf1", "Ethernet0", time_range_minutes=5)
@@ -406,24 +406,11 @@ def test_get_interface_metrics_summary_reports_windowed_rates(monkeypatch):
 
 
 def test_get_interface_metrics_attaches_live_snapshot_when_influx_missing(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.15"}],
-                "clients": [],
-            },
-        }
-    )
-
-    class EmptyResponse:
-        status_code = 200
-        text = ""
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.observability.metrics_ops.requests.post",
-        lambda *args, **kwargs: EmptyResponse(),
+        "netopsbench.platform.toolkit._core.observability.metrics_ops.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok"),
     )
     monkeypatch.setattr(
         toolkit,
@@ -455,36 +442,24 @@ def test_get_interface_metrics_attaches_live_snapshot_when_influx_missing(monkey
 
 
 def test_get_interface_metrics_reports_recent_interface_coverage_gap(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.15"}],
-                "clients": [],
-            },
-        }
-    )
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
-    class FakeResponse:
-        def __init__(self, text):
-            self.status_code = 200
-            self.text = text
-
-    responses = iter(
-        [
-            FakeResponse(""),
-            FakeResponse("""#group,false,false,true,true,true
+    identity_result = FluxQueryResult(
+        status="ok",
+        text="""#group,false,false,true,true,true
 #datatype,string,long,dateTime:RFC3339,string,string
 ,result,table,_time,name,path
 ,_result,0,2026-03-23T14:00:00Z,Ethernet24,/COUNTERS/Ethernet24
-"""),
-        ]
+""",
     )
 
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.observability.metrics_ops.requests.post",
-        lambda *args, **kwargs: next(responses),
+        "netopsbench.platform.toolkit._core.observability.metrics_ops.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok"),
+    )
+    monkeypatch.setattr(
+        "netopsbench.platform.toolkit._core.device.telemetry_parsers.query_flux",
+        lambda *args, **kwargs: identity_result,
     )
     monkeypatch.setattr(
         toolkit,
@@ -514,24 +489,11 @@ def test_get_interface_metrics_reports_recent_interface_coverage_gap(monkeypatch
 
 
 def test_get_device_logs_falls_back_to_container_logs(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.15"}],
-                "clients": [],
-            },
-        }
-    )
-
-    class EmptyResponse:
-        status_code = 200
-        text = ""
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.device.log_ops.requests.post",
-        lambda *args, **kwargs: EmptyResponse(),
+        "netopsbench.platform.toolkit._core.device.log_ops.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok"),
     )
     monkeypatch.setattr(toolkit, "_resolve_container", lambda device: "clab-dcn-leaf1")
     monkeypatch.setattr(
@@ -554,19 +516,7 @@ def test_get_device_logs_falls_back_to_container_logs(monkeypatch):
 
 
 def test_ping_test_allows_infra_source(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [{"name": "spine1", "mgmt_ip": "172.20.20.11"}],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.12"}],
-                "clients": [
-                    {"name": "client1", "mgmt_ip": "172.20.20.21", "data_ip": "192.168.101.2"},
-                    {"name": "client2", "mgmt_ip": "172.20.20.22", "data_ip": "192.168.102.2"},
-                ],
-            },
-        }
-    )
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     class Result:
         returncode = 0
@@ -583,19 +533,7 @@ def test_ping_test_allows_infra_source(monkeypatch):
 
 
 def test_traceroute_allows_infra_source(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [{"name": "spine1", "mgmt_ip": "172.20.20.11"}],
-                "leafs": [{"name": "leaf1", "mgmt_ip": "172.20.20.12"}],
-                "clients": [
-                    {"name": "client1", "mgmt_ip": "172.20.20.21", "data_ip": "192.168.101.2"},
-                    {"name": "client2", "mgmt_ip": "172.20.20.22", "data_ip": "192.168.102.2"},
-                ],
-            },
-        }
-    )
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     class Result:
         returncode = 0
@@ -612,19 +550,7 @@ def test_traceroute_allows_infra_source(monkeypatch):
 
 
 def test_ping_test_allows_client_source(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [],
-                "clients": [
-                    {"name": "client1", "mgmt_ip": "172.20.20.21", "data_ip": "192.168.101.2"},
-                    {"name": "client2", "mgmt_ip": "172.20.20.22", "data_ip": "192.168.102.2"},
-                ],
-            },
-        }
-    )
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     class Result:
         returncode = 0
@@ -652,19 +578,7 @@ def test_ping_test_allows_client_source(monkeypatch):
 
 
 def test_ping_test_supports_large_packet_df_probe(monkeypatch):
-    toolkit = AgentToolkit(
-        topology_metadata={
-            "name": "dcn",
-            "devices": {
-                "spines": [],
-                "leafs": [],
-                "clients": [
-                    {"name": "client1", "mgmt_ip": "172.20.20.21", "data_ip": "192.168.101.2"},
-                    {"name": "client2", "mgmt_ip": "172.20.20.22", "data_ip": "192.168.102.2"},
-                ],
-            },
-        }
-    )
+    toolkit = AgentToolkit(topology_metadata=_metadata())
 
     class Result:
         returncode = 1

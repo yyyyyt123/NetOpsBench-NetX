@@ -84,7 +84,8 @@ from(bucket: "{self.influxdb_bucket}")
   |> aggregateWindow(every: 30s, fn: mean, createEmpty: false)
   |> last()
   |> pivot(rowKey: ["src_leaf", "dst_leaf"], columnKey: ["_field"], valueColumn: "_value")
-  |> sort(columns: ["rtt_p99"], desc: true)
+  |> group()
+  |> sort(columns: ["packet_loss", "rtt_p99"], desc: true)
   |> limit(n: {safe_limit})
 """
 

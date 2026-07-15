@@ -4,7 +4,10 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 
-from netopsbench.platform.session.reporting import create_run_report, next_run_id
+import pytest
+
+from netopsbench.platform.session.reporting import create_run_report, load_topology_metadata, next_run_id
+from netopsbench.platform.topology.generator import generate_topology
 
 
 def test_next_run_id_uses_utc_timestamp_and_collision_suffix(tmp_path: Path):
@@ -18,6 +21,25 @@ def test_next_run_id_uses_utc_timestamp_and_collision_suffix(tmp_path: Path):
 
     (artifact_root / "run-20260605T124040Z-02").mkdir()
     assert next_run_id(artifact_root, started_at=started_at) == "run-20260605T124040Z-03"
+
+
+def test_session_runtime_loader_preserves_canonical_topology_schema(tmp_path: Path):
+    topology_dir = tmp_path / "topology"
+    generate_topology("xs", str(topology_dir))
+
+    metadata = load_topology_metadata(topology_dir)
+
+    assert metadata["schema_version"] == "3"
+    assert isinstance(metadata["devices"], list)
+    assert {device["role"] for device in metadata["devices"]} == {"spine", "leaf", "client"}
+
+
+def test_session_runtime_loader_requires_canonical_topology(tmp_path: Path):
+    missing = tmp_path / "missing-topology"
+    missing.mkdir()
+
+    with pytest.raises(FileNotFoundError):
+        load_topology_metadata(missing)
 
 
 def test_create_run_report_preserves_topology_scale_and_agent_name(tmp_path: Path):

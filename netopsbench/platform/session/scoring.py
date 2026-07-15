@@ -174,17 +174,3 @@ def score_scenario_fault_episodes(
         eval_result.details["episode_id"] = episode_info.get("episode_id")
         scored_results.append(eval_result)
     return scored_results
-
-
-def resolve_scenario_files(path: str) -> list[str]:
-    target = Path(path)
-    if not target.exists():
-        raise FileNotFoundError(f"Scenario path not found: {path}")
-    if target.is_file():
-        if target.suffix not in {".yaml", ".yml"}:
-            raise ValueError(f"Scenario file must be .yaml/.yml: {path}")
-        return [str(target)]
-    files = sorted([str(p) for p in target.iterdir() if p.is_file() and p.suffix in {".yaml", ".yml"}])
-    if not files:
-        raise ValueError(f"No scenario YAML files found directly under {path}")
-    return files

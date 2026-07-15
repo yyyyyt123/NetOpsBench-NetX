@@ -30,7 +30,7 @@ class Scenario:
     name: str
     description: str
     topology_scale: str  # xs, small, medium, large
-    traffic_profile: str  # light, standard, stress
+    traffic_profile: str  # canonical value: standard
     episodes: list[Episode]
     metadata: dict = field(default_factory=dict)
     parameters: dict = field(default_factory=dict)

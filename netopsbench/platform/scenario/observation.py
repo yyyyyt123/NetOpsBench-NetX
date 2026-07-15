@@ -1,4 +1,4 @@
-"""Observation runtime helpers for scenario execution."""
+"""Observation timing and Pingmesh analysis for scenario execution."""
 
 from __future__ import annotations
 
@@ -7,209 +7,133 @@ from datetime import UTC, datetime, timedelta
 
 from netopsbench.config import config
 from netopsbench.logging_utils import get_logger
-from netopsbench.platform.utils.events import emit as _emit
+from netopsbench.platform.topology.topology_utils import coerce_topology_manifest
 
 logger = get_logger(__name__)
 
-# Minimum baseline window (seconds) to ensure enough samples for statistical detection.
-# With a 5s ping cycle, 60s guarantees ~12 data points per path.
 _MIN_BASELINE_WINDOW_SECONDS = 60
 
 
 def _utc_iso(dt: datetime) -> str:
-    """Format *dt* as an InfluxDB-compatible UTC ISO-8601 string ending in 'Z'.
-
-    ``datetime.isoformat()`` on an aware UTC datetime returns ``+00:00``;
-    appending ``Z`` on top of that produces the invalid ``+00:00Z`` which
-    InfluxDB's Flux ``time()`` rejects with HTTP 400.
-    """
-    s = dt.isoformat()
-    if s.endswith("+00:00"):
-        return s[:-6] + "Z"
-    return s if s.endswith("Z") else s + "Z"
+    value = dt.isoformat()
+    if value.endswith("+00:00"):
+        return value[:-6] + "Z"
+    return value if value.endswith("Z") else value + "Z"
 
 
-def wait_and_observe(runner, duration: int, baseline_end_time: datetime | None = None) -> dict:
-    """Collect a single observation window and run Pingmesh anomaly detection."""
+def _coverage_epoch_seconds(runner) -> int:
+    manifest = coerce_topology_manifest(runner.topology_metadata)
+    return manifest.pingmesh.coverage_epoch_seconds(manifest.facts.total_clients)
 
-    _emit(f"\n[Observation] Monitoring for {duration} seconds...")
 
+def capture_observation_window(runner, duration: int, *, name: str = "window") -> dict:
+    """Record one observation interval without querying observability backends."""
+    safe_duration = max(0, int(duration))
+    logger.info(f"\n[Observation] Monitoring for {safe_duration} seconds...")
     start_time = datetime.now(UTC).replace(microsecond=0)
-    observations = {
+    sleep_fn = getattr(runner, "sleep", time.sleep)
+    for index in range(safe_duration):
+        sleep_fn(1)
+        if (index + 1) % 10 == 0:
+            logger.info(f"  Observed {index + 1}/{safe_duration}s...")
+    end_time = datetime.now(UTC).replace(microsecond=0)
+    return {
+        "name": name,
         "start_time": _utc_iso(start_time),
-        "duration_seconds": duration,
-        "pingmesh_metrics": [],
-        "anomalies_detected": False,
-        "data_source_status": "unavailable",
+        "end_time": _utc_iso(end_time),
+        "duration_seconds": safe_duration,
     }
 
-    for i in range(duration):
-        time.sleep(1)
-        if (i + 1) % 10 == 0:
-            _emit(f"  Observed {i + 1}/{duration}s...")
 
-    end_time = datetime.now(UTC).replace(microsecond=0)
-    observations["end_time"] = _utc_iso(end_time)
-
-    baseline_end_dt = baseline_end_time or start_time
-    # Ensure minimum baseline window for reliable statistical detection
-    baseline_window = max(duration, _MIN_BASELINE_WINDOW_SECONDS)
-    baseline_start = _utc_iso(baseline_end_dt - timedelta(seconds=baseline_window))
-    baseline_end = _utc_iso(baseline_end_dt)
-    current_start = _utc_iso(start_time)
-    current_end = _utc_iso(end_time)
-
-    try:
-        from netopsbench.platform.pingmesh.detector import AnomalyDetector
-
-        detector = AnomalyDetector(
-            influxdb_url=runner.influxdb_url or config.influxdb_url,
-            token=runner.influxdb_token or config.influxdb_token,
-            org=runner.influxdb_org or config.influxdb_org,
-            bucket=runner.influxdb_bucket or config.influxdb_bucket,
-            topology_id=runner.topology_id,
-        )
-        report = detector.generate_anomaly_report(
-            baseline_start=baseline_start,
-            baseline_end=baseline_end,
-            current_start=current_start,
-            current_end=current_end,
-        )
-        observations["pingmesh_metrics"] = report
-        observations["anomalies_detected"] = report.get("summary", {}).get("total_anomalies", 0) > 0
-        query_status = report.get("query_status", {}) if isinstance(report, dict) else {}
-        if query_status.get("ok", False):
-            observations["data_source_status"] = "ok"
-        else:
-            error_msg = query_status.get("error") or "query_failed"
-            observations["data_source_status"] = f"error: {error_msg}"
-    except Exception as e:
-        observations["data_source_status"] = f"error: {e}"
-
-    return observations
+def _summary_for_window(anomalies: list[dict], window_name: str) -> dict:
+    selected = [item for item in anomalies if window_name in (item.get("windows_observed") or [])]
+    return {
+        "total_anomalies": len(selected),
+        "latency_spikes": sum(item.get("type") == "latency_spike" for item in selected),
+        "packet_loss_events": sum(item.get("type") == "packet_loss" for item in selected),
+        "path_unreachable_events": sum(item.get("type") == "path_unreachable" for item in selected),
+        "mtu_or_fragmentation_events": sum(item.get("type") == "mtu_or_fragmentation_suspect" for item in selected),
+        "jitter_spikes": sum(item.get("type") == "jitter_spike" for item in selected),
+    }
 
 
-def merge_observation_windows(windows: list[dict], total_duration_seconds: int) -> dict:
-    """Merge early/steady observation windows into one agent-facing payload."""
-    if not windows:
+def analyze_observation_windows(
+    runner,
+    windows: list[dict],
+    total_duration_seconds: int,
+    baseline_end_time: datetime | None = None,
+) -> dict:
+    """Analyze captured intervals using one baseline and one current snapshot."""
+    valid_windows = [window for window in windows if isinstance(window, dict) and window.get("start_time")]
+    if not valid_windows:
         now = _utc_iso(datetime.now(UTC).replace(microsecond=0))
         return {
             "start_time": now,
-            "duration_seconds": total_duration_seconds,
-            "pingmesh_metrics": {
-                "summary": {
-                    "total_anomalies": 0,
-                    "latency_spikes": 0,
-                    "packet_loss_events": 0,
-                    "path_unreachable_events": 0,
-                    "mtu_or_fragmentation_events": 0,
-                    "jitter_spikes": 0,
-                },
-                "anomalies": [],
-            },
-            "anomalies_detected": False,
-            "data_source_status": "unavailable",
             "end_time": now,
+            "duration_seconds": total_duration_seconds,
+            "pingmesh_metrics": {"summary": {"total_anomalies": 0}, "anomalies": []},
+            "anomalies_detected": False,
+            "coverage_status": "incomplete",
+            "data_source_status": "unavailable",
             "observation_windows": [],
         }
 
-    valid_windows = [w for w in windows if isinstance(w, dict) and w]
-    if not valid_windows:
-        return merge_observation_windows([], total_duration_seconds)
+    from netopsbench.platform.pingmesh.detector import AnomalyDetector
 
-    combined_anomalies: list[dict] = []
-    combined_src_leaf: dict[str, dict[str, int]] = {}
-    combined_dst_leaf: dict[str, dict[str, int]] = {}
-    combined_spine: dict[str, dict[str, int]] = {}
-    latency_spikes = 0
-    packet_loss_events = 0
-    path_unreachable_events = 0
-    mtu_or_fragmentation_events = 0
-    jitter_spikes = 0
-    query_ok = True
-    query_errors = []
-    observation_windows = []
+    baseline_end_dt = baseline_end_time or datetime.fromisoformat(
+        str(valid_windows[0]["start_time"]).replace("Z", "+00:00")
+    )
+    baseline_seconds = max(_MIN_BASELINE_WINDOW_SECONDS, _coverage_epoch_seconds(runner))
+    baseline_start = _utc_iso(baseline_end_dt - timedelta(seconds=baseline_seconds))
+    baseline_end = _utc_iso(baseline_end_dt)
+    current_start = str(valid_windows[0]["start_time"])
+    current_end = str(valid_windows[-1]["end_time"])
 
-    for idx, observation in enumerate(valid_windows, start=1):
-        pm = observation.get("pingmesh_metrics", {})
-        if not isinstance(pm, dict):
-            continue
-
-        summary = pm.get("summary", {}) or {}
-        latency_spikes += int(summary.get("latency_spikes", 0) or 0)
-        packet_loss_events += int(summary.get("packet_loss_events", 0) or 0)
-        path_unreachable_events += int(summary.get("path_unreachable_events", 0) or 0)
-        mtu_or_fragmentation_events += int(summary.get("mtu_or_fragmentation_events", 0) or 0)
-        jitter_spikes += int(summary.get("jitter_spikes", 0) or 0)
-
-        for anomaly in pm.get("anomalies", []) or []:
-            anomaly_with_window = dict(anomaly)
-            anomaly_with_window["observation_window"] = f"window_{idx}"
-            combined_anomalies.append(anomaly_with_window)
-
-        agg = pm.get("aggregated_anomalies", {}) or {}
-        _agg_keys = ("drop_count", "latency_spikes", "jitter_spikes", "path_unreachable")
-        for leaf, values in (agg.get("by_src_leaf", {}) or {}).items():
-            bucket = combined_src_leaf.setdefault(leaf, {k: 0 for k in _agg_keys})
-            for k in _agg_keys:
-                bucket[k] += int(values.get(k, 0) or 0)
-        for leaf, values in (agg.get("by_dst_leaf", {}) or {}).items():
-            bucket = combined_dst_leaf.setdefault(leaf, {k: 0 for k in _agg_keys})
-            for k in _agg_keys:
-                bucket[k] += int(values.get(k, 0) or 0)
-        for spine, values in (agg.get("by_spine", {}) or {}).items():
-            bucket = combined_spine.setdefault(spine, {k: 0 for k in _agg_keys})
-            for k in _agg_keys:
-                bucket[k] += int(values.get(k, 0) or 0)
-
-        query_status = pm.get("query_status", {}) or {}
-        if not query_status.get("ok", False):
-            query_ok = False
-            if query_status.get("error"):
-                query_errors.append(str(query_status["error"]))
-
-        observation_windows.append(
-            {
-                "name": f"window_{idx}",
-                "start_time": observation.get("start_time"),
-                "end_time": observation.get("end_time"),
-                "duration_seconds": observation.get("duration_seconds"),
-                "summary": summary,
-            }
-        )
-
-    merged_query_error = "; ".join(dict.fromkeys(query_errors)) if query_errors else None
-
+    detector = AnomalyDetector(
+        influxdb_url=runner.influxdb_url or config.influxdb_url,
+        token=runner.influxdb_token or config.influxdb_token,
+        org=runner.influxdb_org or config.influxdb_org,
+        bucket=runner.influxdb_bucket or config.influxdb_bucket,
+        topology_metadata=runner.topology_metadata,
+        topology_id=runner.topology_id,
+    )
+    report = detector.generate_windowed_anomaly_report(
+        baseline_start=baseline_start,
+        baseline_end=baseline_end,
+        current_start=current_start,
+        current_end=current_end,
+        windows=valid_windows,
+    )
+    query_status = report.get("query_status", {})
+    query_ok = bool(query_status.get("ok"))
+    anomalies = report.get("anomalies", []) or []
+    coverage = report.get("coverage", {}) or {}
+    observation_windows = [
+        {
+            **window,
+            "summary": _summary_for_window(anomalies, str(window.get("name") or "window")),
+        }
+        for window in valid_windows
+    ]
     return {
-        "start_time": valid_windows[0].get("start_time"),
+        "start_time": current_start,
+        "end_time": current_end,
         "duration_seconds": total_duration_seconds,
-        "pingmesh_metrics": {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "windows": {
-                "window_1": valid_windows[0].get("pingmesh_metrics", {}).get("windows", {}),
-                "window_2": valid_windows[-1].get("pingmesh_metrics", {}).get("windows", {}),
-            },
-            "query_status": {
-                "ok": query_ok,
-                "error": merged_query_error,
-            },
-            "summary": {
-                "total_anomalies": len(combined_anomalies),
-                "latency_spikes": latency_spikes,
-                "packet_loss_events": packet_loss_events,
-                "path_unreachable_events": path_unreachable_events,
-                "mtu_or_fragmentation_events": mtu_or_fragmentation_events,
-                "jitter_spikes": jitter_spikes,
-            },
-            "anomalies": combined_anomalies,
-            "aggregated_anomalies": {
-                "by_src_leaf": combined_src_leaf,
-                "by_dst_leaf": combined_dst_leaf,
-                "by_spine": combined_spine,
-            },
-        },
-        "anomalies_detected": len(combined_anomalies) > 0,
-        "data_source_status": "ok" if query_ok else f"error: {merged_query_error or 'query_failed'}",
-        "end_time": valid_windows[-1].get("end_time"),
+        "pingmesh_metrics": report,
+        "anomalies_detected": bool(report.get("summary", {}).get("total_anomalies", 0)),
+        "coverage_status": coverage.get("coverage_status", "error"),
+        "data_source_status": "ok" if query_ok else f"error: {query_status.get('error') or 'query_failed'}",
         "observation_windows": observation_windows,
+        "_coverage_audit": coverage,
     }
+
+
+def wait_and_observe(runner, duration: int, baseline_end_time: datetime | None = None) -> dict:
+    """Capture and analyze one observation window."""
+    window = capture_observation_window(runner, duration, name="steady")
+    return analyze_observation_windows(
+        runner,
+        [window],
+        total_duration_seconds=duration,
+        baseline_end_time=baseline_end_time,
+    )

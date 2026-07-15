@@ -1,53 +1,46 @@
-"""Shared topology context for fault injection components."""
+"""Canonical topology context shared by fault services and handlers."""
 
 from __future__ import annotations
 
-import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
-from netopsbench.platform.topology.topology_utils import TopologyState
+from netopsbench.models.topology import TopologyManifest
+from netopsbench.platform.topology.topology_utils import clab_container_name
 
 
-@dataclass
+@dataclass(frozen=True, slots=True)
 class FaultContext:
-    """Shared topology and runtime state passed to all fault services and handlers."""
+    """The manifest and artifact directory for one fault-injection runtime."""
 
-    topology_name: str = "dcn"
-    container_names: dict[str, str] = field(default_factory=dict)
-    topology_metadata: dict[str, Any] = field(default_factory=dict)
-    device_mgmt_ips: dict[str, str] = field(default_factory=dict)
-    clients: list[dict[str, Any]] = field(default_factory=list)
-    clients_by_leaf: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    clab_dir: str = ""
-    scenarios_dir: str = ""
+    manifest: TopologyManifest
+    clab_dir: Path
 
-    @classmethod
-    def from_topology_state(
-        cls,
-        state: TopologyState,
-        clab_dir: str = "",
-        scenarios_dir: str = "",
-    ) -> FaultContext:
-        return cls(
-            topology_name=state.topology_name,
-            container_names=dict(state.container_names),
-            topology_metadata=copy.deepcopy(state.topology_metadata),
-            device_mgmt_ips=dict(state.device_mgmt_ips),
-            clients=[copy.deepcopy(c) for c in state.clients],
-            clients_by_leaf={
-                leaf: [copy.deepcopy(c) for c in clients] for leaf, clients in state.clients_by_leaf.items()
-            },
-            clab_dir=clab_dir,
-            scenarios_dir=scenarios_dir,
-        )
+    @property
+    def topology_name(self) -> str:
+        return self.manifest.name
 
-    def update_from_topology_state(self, state: TopologyState) -> None:
-        self.topology_name = state.topology_name
-        self.container_names = dict(state.container_names)
-        self.topology_metadata = copy.deepcopy(state.topology_metadata)
-        self.device_mgmt_ips = dict(state.device_mgmt_ips)
-        self.clients = [copy.deepcopy(c) for c in state.clients]
-        self.clients_by_leaf = {
-            leaf: [copy.deepcopy(c) for c in clients] for leaf, clients in state.clients_by_leaf.items()
-        }
+    @property
+    def topology_metadata(self) -> dict[str, Any]:
+        return self.manifest.model_dump(mode="json")
+
+    @property
+    def container_names(self) -> dict[str, str]:
+        return {device.name: clab_container_name(self.manifest.name, device.name) for device in self.manifest.devices}
+
+    @property
+    def clients(self) -> list[dict[str, Any]]:
+        return list(self.manifest.to_agent_topology()["devices"]["clients"])
+
+    @property
+    def clients_by_leaf(self) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for client in self.clients:
+            attached_switch = str(client.get("leaf") or "").strip()
+            if attached_switch:
+                grouped.setdefault(attached_switch, []).append(client)
+        return grouped
+
+
+__all__ = ["FaultContext"]
