@@ -12,6 +12,7 @@
 #   small:  3 workers  (15 scenarios, 3×14=42 containers)
 #   medium: 2 workers  (28 scenarios, 2×28=56 containers)
 #   large:  2 workers  (52 scenarios, 2×84=168 containers)
+#   xlarge/fat-tree: 1 worker by default
 #
 # 跑完后汇总 CSV 写入 scenario_results/benchmark_summary_<ts>.csv
 # ─────────────────────────────────────────────────────────────
@@ -35,13 +36,9 @@ declare -A SCALE_WORKERS=(
     [medium]="${BENCH_WORKERS_MEDIUM:-2}"
     [large]="${BENCH_WORKERS_LARGE:-2}"
     [xlarge]="${BENCH_WORKERS_XLARGE:-1}"
+    [fat-tree-k8]="${BENCH_WORKERS_FAT_TREE_K8:-1}"
+    [fat-tree-k12]="${BENCH_WORKERS_FAT_TREE_K12:-1}"
 )
-# Limit worker deployment fan-out to avoid simultaneous SONiC-VS boot pressure.
-declare -A SCALE_DEPLOY_JOBS=( [xs]=2 [small]=2 [medium]=2 [large]=1 [xlarge]=1 )
-# Health check BGP retries: larger fabrics need more convergence time.
-declare -A SCALE_HEALTH_RETRIES=( [xs]=12 [small]=12 [medium]=12 [large]=36 [xlarge]=48 )
-# Worker deploy timeout in seconds; xlarge has 272 containers per worker.
-declare -A SCALE_DEPLOY_TIMEOUTS=( [xs]=1800 [small]=1800 [medium]=1800 [large]=2700 [xlarge]=3600 )
 # Ordered list of scales to run (override with BENCH_SCALES="xs small")
 IFS=' ' read -ra SCALES <<< "${BENCH_SCALES:-xs small medium large}"
 
@@ -124,10 +121,7 @@ for scale in "${SCALES[@]}"; do
     echo "[$(date '+%H:%M:%S')] >>> ${label}: workers=${workers}"
     list_run_dirs > "$runs_before"
 
-    if NETOPSBENCH_WORKER_DEPLOY_JOBS="${SCALE_DEPLOY_JOBS[$scale]:-${workers}}" \
-       NETOPSBENCH_WORKER_HEALTH_RETRIES="${SCALE_HEALTH_RETRIES[$scale]:-12}" \
-       NETOPSBENCH_WORKER_DEPLOY_TIMEOUT="${SCALE_DEPLOY_TIMEOUTS[$scale]:-1800}" \
-       PYTHONPATH="$REPO_ROOT" "$PYTHON" examples/03_run_scale_benchmark.py \
+    if PYTHONPATH="$REPO_ROOT" "$PYTHON" examples/03_run_scale_benchmark.py \
             --vendor "$VENDOR" --scale "$scale" --workers "$workers" \
             > "$log_file" 2>&1; then
         echo "[$(date '+%H:%M:%S')]  ✓  ${label} — 完成"
@@ -240,7 +234,7 @@ for rj in report_paths:
         if not sid:
             raw_ids = (data.get("raw") or {}).get("scenario_ids") or []
             sid = raw_ids[0] if raw_ids else ""
-        for sc in ("xs", "small", "medium", "large", "xlarge"):
+        for sc in ("xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12"):
             if f"_{sc}_" in sid:
                 scale = sc
                 break
@@ -276,7 +270,7 @@ if not reports:
     sys.exit(0)
 
 # Sort by vendor, scale
-scale_order = {"xs": 0, "small": 1, "medium": 2, "large": 3, "xlarge": 4}
+scale_order = {"xs": 0, "small": 1, "medium": 2, "large": 3, "xlarge": 4, "fat-tree-k8": 5, "fat-tree-k12": 6}
 reports.sort(key=lambda r: (r["vendor"], scale_order.get(r["scale"], 99), r["started_at"]))
 
 # Write CSV

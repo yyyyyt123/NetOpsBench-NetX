@@ -30,8 +30,9 @@ asks for a breaking change.
   experience; keep commands, docs, and imports aligned.
 - `scenarios/generated/<scale>/`: generated benchmark scenarios used by
   examples and suite runs.
-- `observability/` and `scripts/runtime/`: Docker, Containerlab, Telegraf,
-  Pingmesh, and BGP runtime support.
+- `netopsbench/platform/observability/assets/`: packaged Grafana, Telegraf,
+  and Docker Compose assets.
+- `scripts/runtime/`: documented thin wrappers around the Python runtime CLI.
 - `tests/`: lightweight unit and contract tests. Real Containerlab tests are
   usually marked `real` or named `*_real`.
 
@@ -136,9 +137,9 @@ Pingmesh, and BGP snapshots. Preserve these behaviors:
 
 Relevant files:
 
-- `scripts/observability/start_worker_telegraf.sh`
-- `scripts/runtime/run_bgp_collector.py`
-- `observability/telegraf.conf.template`
+- `netopsbench/platform/observability/lifecycle.py`
+- `netopsbench/platform/observability/bgp_collector.py`
+- `netopsbench/platform/observability/assets/telegraf.conf.template`
 - `tests/test_bgp_collector.py`
 - `tests/test_runtime_config_consistency.py`
 

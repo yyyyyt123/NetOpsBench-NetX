@@ -2,9 +2,9 @@
 
 This directory contains the benchmark scenario corpus for NetOpsBench.
 
-Only the campaign specs under `scenarios/specs/` are checked into git. The
-`scenarios/generated/` tree is a generated artifact and is absent on a fresh
-clone until you create it locally.
+The canonical campaign spec is packaged under
+`netopsbench/platform/scenario/specs/`. The `scenarios/generated/` tree is a
+generated artifact and is absent on a fresh clone until you create it locally.
 
 All scenarios are generated from campaign specs and organized under `scenarios/generated/` by topology scale:
 
@@ -13,7 +13,7 @@ All scenarios are generated from campaign specs and organized under `scenarios/g
 - `scenarios/generated/medium/`
 - `scenarios/generated/large/`
 
-Campaign spec files live under `scenarios/specs/` (e.g. `fault_campaign.yaml`).
+Pass `--spec` to use a custom campaign instead of the packaged default.
 
 ## Supported Fault Types
 
@@ -103,8 +103,8 @@ name: "Human Readable Name"
 description: |
   Detailed description of what this scenario tests
 
-topology_scale: xs  # xs, small, medium, large
-traffic_profile: standard  # light, standard, stress
+topology_scale: xs  # xs, small, medium, large, xlarge, fat-tree-k8, fat-tree-k12
+traffic_profile: standard  # canonical background traffic model
 
 metadata:
   difficulty: easy  # easy, medium, hard
@@ -147,26 +147,18 @@ episodes:
 4. **Recovery** - Restore to normal
 5. **Verification** (optional) - Verify recovery
 
-## Traffic Profiles
+## Traffic Profile
 
-### Light Profile
-- 25% of link capacity
-- Minimal flows per client
-- Good for initial testing
-
-### Standard Profile (Default)
-- 50% of link capacity
-- Moderate number of flows
-- Realistic production load
-
-### Stress Profile
-- 80% of link capacity
-- Maximum safe flows
-- Tests under pressure
+All benchmark scenarios use the canonical `standard` profile: at most four
+continuous flows per client, split evenly between UDP and TCP. Keeping one
+background traffic model avoids changing load as an untracked variable between
+fault types.
 
 ## PPS Limits by Topology
 
-Switch PPS limits are configurable via `NETOPSBENCH_SWITCH_PPS_LIMIT` (default: **5000**).
+The canonical switch PPS limit is **5000**. Per-client PPS caps are part of the
+scale profile so benchmark load cannot change through an undocumented process
+environment override.
 Per-client PPS caps scale linearly from the 1000 PPS baseline:
 
 | Scale  | Clients | Base Max PPS/Client (1000 PPS) |

@@ -192,7 +192,8 @@ def test_cli_scenario_generate_uses_existing_default_spec(tmp_path, monkeypatch,
     out = capsys.readouterr().out
     assert "generated scenarios" in out
     assert calls["scale"] == "xs"
-    assert calls["spec"] == tmp_path / "scenarios/specs/fault_campaign.yaml"
+    assert calls["spec"].name == "fault_campaign.yaml"
+    assert calls["spec"].is_file()
     assert calls["topology_dir"] is None
     assert calls["out"] is None
     assert calls["seed"] == 42
@@ -476,5 +477,6 @@ def test_cli_benchmark_prepare_runs_topology_then_scenario_generation(tmp_path, 
     assert "scenarios:medium" in out
     assert [call[1] for call in topology_calls] == ["xs", "medium"]
     assert [call[1] for call in scenario_calls] == ["xs", "medium"]
-    assert scenario_calls[0][2] == tmp_path / "scenarios/specs/fault_campaign.yaml"
+    assert scenario_calls[0][2].name == "fault_campaign.yaml"
+    assert scenario_calls[0][2].is_file()
     assert scenario_calls[0][5] == 7

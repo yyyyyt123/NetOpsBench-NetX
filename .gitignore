@@ -30,6 +30,8 @@ lab-topology/
 .worktrees/
 .agents/
 .pytest_cache/
+build/
+dist/
 tmp/
 .netopsbench*/
 
