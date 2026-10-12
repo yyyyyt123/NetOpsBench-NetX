@@ -192,3 +192,48 @@ def test_canonical_observation_compacts_without_changing_public_symptoms():
     assert compacted["truncated"] is True
     assert "aggregated_anomalies" not in compacted
     assert len(symptoms["observations"]["pingmesh_metrics"]["anomalies"]) == 20
+
+
+def test_agent_success_false_survives_runtime_callback(tmp_path):
+    from types import SimpleNamespace
+
+    from netopsbench.platform.session.diagnosis import build_runtime_diagnosis_callback
+    from netopsbench.sdk.agents import DiagnosisResult
+
+    async def diagnose(context):
+        return DiagnosisResult("provider", "inconclusive", success=False, reasoning="provider unavailable")
+
+    callback = build_runtime_diagnosis_callback(
+        SimpleNamespace(diagnose=diagnose, name="provider"), str(tmp_path), "case"
+    )
+    result = callback(
+        {},
+        diagnostic_session=SimpleNamespace(),
+        diagnostic_payload={"case_id": "anonymous", "topology": {}, "symptoms": {}, "canonical_observation": {}},
+    )
+    assert result["success"] is False
+    assert result["error"] == "provider unavailable"
+
+
+def test_agent_cancellation_waits_for_resource_cleanup():
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    import pytest
+
+    from netopsbench.platform.session.diagnosis import run_agent_diagnose
+
+    cleaned = []
+    cancelled = threading.Event()
+
+    async def diagnose(context):
+        try:
+            cancelled.set()
+            await asyncio.sleep(100)
+        finally:
+            cleaned.append(True)
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        run_agent_diagnose(SimpleNamespace(diagnose=diagnose), None, cancelled)
+    assert cleaned == [True]

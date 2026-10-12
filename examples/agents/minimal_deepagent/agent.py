@@ -39,6 +39,7 @@ from deepagents import create_deep_agent
 from deepagents.backends import FilesystemBackend
 
 from netopsbench.agents.base import DiagnosticContext
+from netopsbench.platform.toolkit.mcp.session_server import session_mcp
 from netopsbench.sdk.agents import DiagnosisResult
 from netopsbench.sdk.mcp import builtin_mcp_server_config
 
@@ -122,6 +123,15 @@ class MinimalDeepAgent:
 
         try:
             await exit_stack.__aenter__()
+            if self.mcp_server_config is None and context.tools is not None:
+                endpoint = await exit_stack.enter_async_context(session_mcp(context, record_trace=False))
+                server_config = {
+                    "netopsbench": {
+                        "transport": "streamable_http",
+                        "url": endpoint["url"],
+                        "headers": {"Authorization": f"Bearer {endpoint['token']}"},
+                    }
+                }
             mcp_tools = await _connect_mcp_tools(exit_stack, server_config)
 
             llm = self._provider.build_llm(

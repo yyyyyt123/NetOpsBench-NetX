@@ -5,11 +5,13 @@ This directory contains the official public agent examples for NetOpsBench.
 ## Recommended example
 
 - `minimal_deepagent/agent.py` — a runnable DeepAgent example with MCP tools and multiple provider presets
+- `codex_agent/agent.py` — native `codex exec` with episode MCP tools and an isolated Python/shell container; see [setup and acceptance](codex_agent/README.md)
 
 ## File roles
 
 - `minimal_deepagent/agent.py` — self-contained agent with LLM + MCP wiring (DeepAgents, LangChain, provider presets)
-- `minimal_deepagent/prompts.py` — system prompt and prompt-building helpers
+- `diagnosis.py` — shared diagnosis schema, public observation prompt and result mapping
+- `minimal_deepagent/prompts.py` — DeepAgent output framing
 - `minimal_deepagent/skills/` — example-local DeepAgents skills loaded via `FilesystemBackend`
 - `examples.agents.MinimalDeepAgent` re-exports the canonical agent class for stable imports
 
@@ -60,5 +62,6 @@ For `examples/01_run_scenario.py`, choose provider via CLI argument:
 
 - `PYTHONPATH=. python examples/01_run_scenario.py --vendor openai`
 - `PYTHONPATH=. python examples/01_run_scenario.py --vendor minimax`
+- `PYTHONPATH=. python examples/01_run_scenario.py --agent codex --scenario scenarios/generated/xs/generated_healthy_network_xs_001.yaml` (install `.[codex]` and sign in with the pinned native CLI)
 
 These examples are references for application code, not required internal platform machinery.

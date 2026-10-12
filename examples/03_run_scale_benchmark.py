@@ -24,11 +24,20 @@ from examples._common import (
     resolve_repo_root,
     wait_and_print_run,
 )
-from examples.agents import MinimalDeepAgent
 from netopsbench.sdk import NetOpsBench, supported_scales
 
 DEFAULT_SCALE = "xs"
 SCALE_CHOICES = list(supported_scales())
+DEFAULT_WORKERS = {
+    "xs": 3,
+    "small": 3,
+    "medium": 2,
+    "large": 2,
+    "xlarge": 1,
+    "fat-tree-k8": 1,
+    "fat-tree-k12": 1,
+    "fat-tree-k18": 1,
+}
 
 
 def main(
@@ -36,15 +45,18 @@ def main(
     *,
     scale: str = DEFAULT_SCALE,
     vendor: str = "minimax",
-    workers: int = 3,
+    workers: int | None = None,
     bench_cls=NetOpsBench,
-    agent_cls=MinimalDeepAgent,
+    agent_cls=None,
+    backend: str = "deepagent",
 ) -> int:
+    if workers is None:
+        workers = DEFAULT_WORKERS.get(scale, 1)
     repo = resolve_repo_root(repo_root)
     scenarios = discover_generated_scenarios(repo, scale)
 
     with bench_cls(workspace=str(repo)) as bench:
-        raw_agent, agent = build_wrapped_agent(bench, agent_cls, vendor=vendor)
+        raw_agent, agent = build_wrapped_agent(bench, agent_cls, vendor=vendor, backend=backend)
 
         print(f"03 — Scale benchmark (scale={scale})")
         print_agent_banner("agent", vendor, raw_agent)
@@ -77,8 +89,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--workers",
         type=int,
-        default=3,
-        help="Number of concurrent runtime worker labs to provision. Default: %(default)s.",
+        default=None,
+        help="Concurrent runtime labs. Default: xs/small=3, medium/large=2, xlarge/fat-tree=1.",
     )
     args = parser.parse_args()
-    raise SystemExit(main(repo_root=args.repo_root, scale=args.scale, vendor=args.vendor, workers=args.workers))
+    raise SystemExit(
+        main(repo_root=args.repo_root, scale=args.scale, vendor=args.vendor, workers=args.workers, backend=args.agent)
+    )

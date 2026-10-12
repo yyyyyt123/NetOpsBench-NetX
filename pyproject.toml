@@ -40,6 +40,10 @@ netopsbench-runtime = "netopsbench.platform.runtime.cli:main"
 netopsbench-simulator = "netopsbench.sdk.simulator_service:main"
 
 [project.optional-dependencies]
+codex = [
+    "fastmcp>=3.4.0",
+    "uvicorn>=0.30.0",
+]
 agent = [
     "openai>=1.0.0",
     "deepagents>=0.0.12",
@@ -47,7 +51,8 @@ agent = [
     "langchain-openai>=0.2.0",
     "langchain-mcp-adapters>=0.1.0",
     "langsmith>=0.3.0",
-    "fastmcp>=2.0.0",
+    "fastmcp>=3.4.0",
+    "uvicorn>=0.30.0",
     "json-repair>=0.54.0",
 ]
 plots = [

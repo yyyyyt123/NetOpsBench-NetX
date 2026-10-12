@@ -23,7 +23,6 @@ from examples._common import (
     resolve_repo_root,
     wait_and_print_run,
 )
-from examples.agents import MinimalDeepAgent
 from netopsbench.sdk import NetOpsBench
 
 
@@ -32,7 +31,8 @@ def main(
     *,
     vendor: str = "minimax",
     bench_cls=NetOpsBench,
-    agent_cls=MinimalDeepAgent,
+    agent_cls=None,
+    backend: str = "deepagent",
 ) -> int:
     repo = resolve_repo_root(repo_root)
     scenario = require_scenarios(
@@ -51,7 +51,7 @@ def main(
     print(f"  scenario: {scenario.name}")
     print(f"  runtime:  {runtime_name}")
     with bench_cls(workspace=str(repo)) as bench:
-        raw_agent, agent = build_wrapped_agent(bench, agent_cls, vendor=vendor)
+        raw_agent, agent = build_wrapped_agent(bench, agent_cls, vendor=vendor, backend=backend)
         print_agent_banner("agent", vendor, raw_agent)
         try:
             runtime = bench.runtimes.provision(scale="xs", workers=1, name=runtime_name)
@@ -78,4 +78,4 @@ def main(
 
 if __name__ == "__main__":
     args = build_arg_parser("Provision a runtime manually").parse_args()
-    raise SystemExit(main(repo_root=args.repo_root, vendor=args.vendor))
+    raise SystemExit(main(repo_root=args.repo_root, vendor=args.vendor, backend=args.agent))

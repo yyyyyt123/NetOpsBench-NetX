@@ -391,10 +391,10 @@ class ScenarioExecutor:
                             },
                         }
                     episode_result["diagnosis"] = diagnosis
-                    if not diagnosis or diagnosis.get("error"):
+                    if not diagnosis or diagnosis.get("error") or diagnosis.get("success") is False:
                         transition = session.terminate_failure(
                             domain=FailureDomain.AGENT,
-                            message=(diagnosis or {}).get("error", "diagnosis unavailable"),
+                            message=(diagnosis or {}).get("error") or "diagnosis unavailable",
                             reason=TerminationReason.AGENT_ERROR,
                         )
                     else:
@@ -431,9 +431,10 @@ class ScenarioExecutor:
                     episode_result["execution"] = transition.model_dump(mode="json")
                     if session.evaluation_result is not None:
                         episode_result["evaluation_result"] = session.evaluation_result
-                episode_result["success"] = True
+                execution_success = not (episode_result.get("execution") or {}).get("failure")
+                episode_result["success"] = execution_success
                 episode_result["state"] = "terminal"
-                scenario_result["success"] = True
+                scenario_result["success"] = execution_success
         except Exception as e:  # noqa: BLE001 - scenario result records infrastructure failures
             logger.info(f"\n✗ Scenario failed: {e}")
             scenario_result["error"] = str(e)

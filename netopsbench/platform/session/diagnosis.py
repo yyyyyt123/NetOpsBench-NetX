@@ -24,14 +24,33 @@ from netopsbench.platform.utils.files import atomic_write_json
 logger = get_logger(__name__)
 
 
-def run_agent_diagnose(handle: Any, context: DiagnosticContext):
+def run_agent_diagnose(handle: Any, context: DiagnosticContext, cancel_event=None):
     """Execute a sync or async diagnosis handle from a synchronous session."""
+
+    async def invoke():
+        task = asyncio.create_task(handle.diagnose(context))
+        try:
+            while not task.done():
+                if cancel_event is not None and cancel_event.is_set():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+                    raise RuntimeError("diagnosis cancelled")
+                await asyncio.wait({task}, timeout=0.2)
+            return await task
+        finally:
+            if not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
     try:
         asyncio.get_running_loop()
     except RuntimeError:
-        return asyncio.run(handle.diagnose(context))
+        return asyncio.run(invoke())
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(lambda: asyncio.run(handle.diagnose(context)))
+        future = executor.submit(lambda: asyncio.run(invoke()))
         return future.result()
 
 
@@ -51,6 +70,7 @@ def build_runtime_diagnosis_callback(
     worker_name: str | None = None,
     runtime_id: str | None = None,
     scenario_scale: str | None = None,
+    cancel_event=None,
 ):
     """Build the episode callback that presents observations to one agent."""
     handle = agent if isinstance(agent, AgentHandle) else AgentHandle(agent)
@@ -89,7 +109,7 @@ def build_runtime_diagnosis_callback(
             metadata=metadata,
         )
         try:
-            diagnosis = run_agent_diagnose(handle, context)
+            diagnosis = run_agent_diagnose(handle, context, cancel_event)
         except Exception as exc:
             trace_recorder.record_error(stage="agent", error=exc)
             ended_at = datetime.now(UTC)
@@ -147,6 +167,7 @@ def build_runtime_diagnosis_callback(
                 metadata[key] = recorder_metrics[key]
         recorded_tool_calls = trace_recorder.tool_calls()
         diagnosis_payload = {
+            "success": diagnosis.success,
             "verdict": diagnosis.verdict,
             "fault_type": findings.get("fault_type") or metadata.get("fault_type"),
             "location": {
@@ -164,6 +185,8 @@ def build_runtime_diagnosis_callback(
             "time_taken_seconds": max(0.0, (ended_at - start_time).total_seconds()),
             "metadata": metadata,
         }
+        if not diagnosis.success:
+            diagnosis_payload["error"] = diagnosis.reasoning or "agent diagnosis failed"
         if trace_writer is not None:
             try:
                 trace_result = trace_writer.write_case_trace(

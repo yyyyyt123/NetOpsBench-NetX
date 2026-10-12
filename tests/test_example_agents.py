@@ -1,4 +1,4 @@
-"""Tests for the public example DeepAgent implementation."""
+"""Tests for the public example diagnostic agent implementations."""
 
 import asyncio
 import json
@@ -8,6 +8,21 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 from uuid import uuid4
+
+import pytest
+
+
+@pytest.mark.parametrize("fenced", [True, False])
+def test_bundled_agents_receive_the_actual_output_type_contract(fenced):
+    from examples.agents.diagnosis import build_user_prompt
+
+    context = SimpleNamespace(metadata={"canonical_observation": {"case_id": "anonymous"}})
+    prompt = build_user_prompt(context, fenced_output=fenced)
+    schema = json.loads(prompt.split("DIAGNOSIS_OUTPUT_SCHEMA: ", 1)[1])
+    assert schema["properties"]["evidence"]["type"] == "array"
+    assert schema["properties"]["evidence"]["items"]["type"] == "string"
+    assert schema["properties"]["verdict"]["enum"] == ["fault_detected", "network_healthy", "inconclusive"]
+
 
 # Stub third-party agent deps so the module can be imported without them.
 for _mod in [
@@ -525,7 +540,7 @@ class _FakeBench:
 
 
 class _FakeAgent:
-    def __init__(self):
+    def __init__(self, *, vendor="minimax"):
         self.closed = False
 
     async def aclose(self):
@@ -579,6 +594,37 @@ def test_03_run_scale_benchmark_main(tmp_path):
     assert result == 0
 
 
+@pytest.mark.parametrize(
+    "scale,override,expected", [("xs", None, 3), ("medium", None, 2), ("fat-tree-k12", None, 1), ("fat-tree-k12", 2, 2)]
+)
+def test_scale_benchmark_default_workers_respect_topology_size(tmp_path, monkeypatch, scale, override, expected):
+    import importlib
+    from types import SimpleNamespace
+
+    mod = importlib.import_module("examples.03_run_scale_benchmark")
+    captured = {}
+    monkeypatch.setattr(mod, "discover_generated_scenarios", lambda *args: [])
+    monkeypatch.setattr(mod, "build_wrapped_agent", lambda *args, **kwargs: (object(), object()))
+    monkeypatch.setattr(mod, "print_agent_banner", lambda *args: None)
+    monkeypatch.setattr(mod, "wait_and_print_run", lambda *args, **kwargs: 0)
+
+    def run_suite(**kwargs):
+        captured.update(kwargs)
+
+    class Bench:
+        def __init__(self, **kwargs):
+            self.sessions = SimpleNamespace(run_suite=run_suite)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    assert mod.main(repo_root=tmp_path, scale=scale, workers=override, bench_cls=Bench) == 0
+    assert captured["workers"] == expected
+
+
 def test_04_custom_faults_main(tmp_path):
     import importlib
 
@@ -604,7 +650,7 @@ def test_05_manual_runtime_main(tmp_path, capsys):
     assert "PYTHONPATH=. netopsbench runtime teardown manual-" in output
 
 
-def test_example_common_builds_wrapped_agent_with_vendor_fallback():
+def test_example_common_does_not_mask_agent_constructor_errors():
     from examples._common import build_wrapped_agent
 
     class _NoVendorAgent:
@@ -613,15 +659,11 @@ def test_example_common_builds_wrapped_agent_with_vendor_fallback():
 
     bench = _FakeBench(workspace=".")
 
-    raw, wrapped = build_wrapped_agent(bench, _NoVendorAgent, vendor="minimax")
-
-    assert isinstance(raw, _NoVendorAgent)
-    assert wrapped is raw
+    with pytest.raises(TypeError, match="vendor"):
+        build_wrapped_agent(bench, _NoVendorAgent, vendor="minimax")
 
 
 def test_example_common_require_scenarios_accepts_single_path_and_raises_actionable_error(tmp_path):
-    import pytest
-
     from examples._common import require_scenarios
 
     with pytest.raises(FileNotFoundError) as exc_info:
@@ -631,8 +673,6 @@ def test_example_common_require_scenarios_accepts_single_path_and_raises_actiona
 
 
 def test_example_common_require_scenarios_reports_combined_missing_files(tmp_path):
-    import pytest
-
     from examples._common import require_scenarios
 
     (tmp_path / "present.yaml").write_text("scenario: present\n", encoding="utf-8")

@@ -99,7 +99,8 @@ def test_agent_exception_is_zero_outcome_not_infrastructure_failure(monkeypatch)
 
     result = runner.run_scenario(_healthy_scenario(), diagnosis_callback=fail)
 
-    assert result["success"] is True
+    assert result["success"] is False
+    assert result["case_valid"] is True
     assert result["episode"]["diagnosis"]["error"] == "agent crashed"
     assert result["episode"]["execution"]["reward"] == 0.0
     assert result["episode"]["execution"]["failure"]["domain"] == "agent"
@@ -128,7 +129,7 @@ def test_invalid_diagnosis_schema_is_protocol_outcome_zero(monkeypatch):
     )
 
     execution = result["episode"]["execution"]
-    assert result["success"] is True
+    assert result["success"] is False
     assert execution["reward"] == 0.0
     assert execution["failure"]["domain"] == "protocol"
     assert execution["termination_reason"] == "protocol_error"

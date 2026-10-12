@@ -42,6 +42,8 @@ def score_scenario_episode(
     scored_results: list[EvaluationResult] = []
     scenario_difficulty = (scenario.metadata or {}).get("difficulty", "unknown")
     episode_result = scenario_result.get("episode") or {}
+    if (episode_result.get("execution") or {}).get("failure"):
+        return scored_results
     episode_info = episode_result.get("episode", {})
     if not episode_info:
         return scored_results
