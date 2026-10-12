@@ -3,6 +3,8 @@ import subprocess
 import time
 from pathlib import Path
 
+import pytest
+
 from netopsbench.models.runtime import RuntimeIdentity
 from netopsbench.platform.runtime import health
 from netopsbench.platform.topology.topology_utils import coerce_topology_manifest
@@ -85,7 +87,8 @@ def test_fat_tree_sparse_expected_active_interface_counts():
         assert counts["edge72"]["active_interfaces"] == 8
 
 
-def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, monkeypatch):
+@pytest.mark.parametrize("budgeted", [False, True])
+def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, monkeypatch, budgeted):
     from netopsbench.platform.observability import influxdb, validation
     from netopsbench.platform.topology.generator import generate_topology
 
@@ -96,7 +99,7 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
         "safe_run",
         lambda *args, **kwargs: subprocess.CompletedProcess(args[0], 0, stdout="telegraf-health-xs\n", stderr=""),
     )
-    monkeypatch.setattr(health, "_running_container_count", lambda _lab_name: 6)
+    monkeypatch.setattr(health, "_running_container_count", lambda _lab_name, **kw: 6)
 
     exec_calls = []
 
@@ -147,6 +150,9 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
     def fake_check_observability(*_args, **_kwargs):
         check = next(iter(_kwargs["checks"]))
         attempts.append(check)
+        if budgeted:
+            time.sleep(0.02)
+            return ["collector still unavailable"]
         return (
             ["collector has not written its first sample"] if check == "syslog" and attempts.count(check) == 1 else []
         )
@@ -156,13 +162,142 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
         influxdb, "query_flux", lambda *_args, **_kwargs: type("Result", (), {"status": "ok", "text": ""})()
     )
 
+    started = time.monotonic()
     errors = health.check_worker_health(
         _runtime_identity(tmp_path, "health-xs"),
-        health_retries=2,
-        health_delay=0,
+        health_retries=100 if budgeted else 2,
+        health_delay=0.01 if budgeted else 0,
+        deadline=started + 0.15 if budgeted else None,
     )
 
+    if budgeted:
+        assert errors == ["Worker health check deadline exceeded"]
+        assert time.monotonic() - started < 1
+        assert attempts
+        return
     assert errors == []
     assert "logger -n" in " ".join(exec_calls[0])
     assert sum(c == ("bash", "-lc", "show interfaces status") for c in exec_calls) == 3
     assert sorted(attempts) == ["bgp", "interfaces", "pingmesh", "syslog", "syslog"]
+
+
+def test_network_probe_preserves_commands_order_and_deadlines():
+    from netopsbench.platform.runtime._network_probe import probe
+
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(command, 0, stdout="\n".join(command))
+
+    result = probe(run)
+    assert [c[0] for c in calls] == [
+        ["vtysh", "-c", "show ip bgp summary"],
+        ["bash", "-lc", "show interfaces status"],
+    ]
+    assert all(c[1]["timeout"] == 60 for c in calls)
+    assert result["checks"]["bgp"]["stdout"] == "vtysh\n-c\nshow ip bgp summary"
+
+
+@pytest.mark.parametrize("failure", [subprocess.TimeoutExpired("vtysh", 60), OSError("missing")])
+def test_network_probe_preserves_independent_check_after_failure(failure):
+    from netopsbench.platform.runtime._network_probe import probe
+
+    def run(command, **kwargs):
+        if command[0] == "vtysh":
+            raise failure
+        return subprocess.CompletedProcess(command, 0, stdout="Ethernet0 up up")
+
+    result = probe(run)
+    assert result["checks"]["bgp"]["returncode"] == -1
+    assert result["checks"]["interfaces"]["returncode"] == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    ["not json", "null", "[]", '{"version": 2}', '{"version": 1, "checks": {}}'],
+)
+def test_routing_state_rejects_invalid_response(monkeypatch, payload):
+    monkeypatch.setattr(health, "_docker_exec", lambda *a, **kw: subprocess.CompletedProcess(a, 0, stdout=payload))
+    assert health._routing_state("node") == ("", "")
+
+
+@pytest.mark.parametrize("failed", [None, "bgp", "interfaces", "transport"])
+def test_routing_state_uses_one_exec_and_rejects_failed_command(monkeypatch, failed):
+    calls = []
+
+    def execute(*args, **kwargs):
+        calls.append((args, kwargs))
+        payload = {
+            "version": 1,
+            "checks": {
+                name: {"returncode": 7 if name == failed else 0, "stdout": name} for name in ["bgp", "interfaces"]
+            },
+        }
+        return subprocess.CompletedProcess(args, 1 if failed == "transport" else 0, stdout=json.dumps(payload))
+
+    monkeypatch.setattr(health, "_docker_exec", execute)
+    assert health._routing_state("node") == (("bgp", "interfaces") if failed is None else ("", ""))
+    assert len(calls) == 1
+    assert calls[0][0][:3] == ("node", "python3", "-c")
+    assert calls[0][1]["timeout"] == 125
+
+
+def test_large_health_queue_stops_launching_probes_at_shared_deadline():
+    import threading
+
+    from netopsbench.platform.utils.control import OperationControl
+
+    control = OperationControl(deadline=time.monotonic() + 0.04)
+    started = []
+    lock = threading.Lock()
+
+    def probe(device):
+        with lock:
+            started.append(device)
+        control.sleep(0.02)
+        return device
+
+    before = time.monotonic()
+    with pytest.raises(TimeoutError):
+        health._parallel_check(probe, list(range(405)), 16, control)
+    assert len(started) < 405
+    assert time.monotonic() - before < 1
+
+
+def test_health_external_deadline_includes_initial_probes(tmp_path, monkeypatch):
+    from netopsbench.platform.topology.generator import generate_topology
+
+    generate_topology("xs", str(tmp_path), name="health-xs")
+    calls = []
+    monkeypatch.setattr(health, "safe_run", lambda *a, **kw: calls.append(a) or pytest.fail("expired probe started"))
+    errors = health.check_worker_health(_runtime_identity(tmp_path, "health-xs"), deadline=time.monotonic() - 1)
+    assert errors == ["Worker health check deadline exceeded"]
+    assert calls == []
+
+
+def test_warm_records_fresh_complete_health_check(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from netopsbench.platform.runtime import lifecycle
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "check_worker_health", lambda *a, **kw: calls.append(kw) or [])
+    runtime = SimpleNamespace(workers=[_runtime_identity(tmp_path, "warm-xs")], root_dir=tmp_path, size=1)
+    result = lifecycle.RuntimeLifecycle()._warm(runtime)
+    assert len(calls) == 1 and calls[0]["all_routing_devices"] is True
+    assert result["all_routing_devices"] is True and result["checked_at"]
+
+
+def test_quarantine_accumulates_workers_without_duplicate_writes(tmp_path, monkeypatch):
+    from netopsbench.platform.runtime.manager import RuntimePool
+
+    runtime = RuntimePool("id", "name", "xs", tmp_path, [])
+    writes = []
+    monkeypatch.setattr(runtime, "_write_metadata", lambda: writes.append(dict(runtime.metadata)))
+    runtime.mark_quarantined("scenario_cleanup_failure", ["worker-1"])
+    runtime.mark_quarantined("scenario_cleanup_failure", ["worker-1"])
+    runtime.mark_quarantined("scenario_cleanup_failure", ["worker-2"])
+    assert runtime.state == "quarantined"
+    assert runtime.metadata["quarantined_workers"] == ["worker-1", "worker-2"]
+    assert len(writes) == 2

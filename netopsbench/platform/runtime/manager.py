@@ -8,6 +8,7 @@ import shutil
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import RLock
 
 from pydantic import ValidationError
 
@@ -24,6 +25,7 @@ from netopsbench.platform.runtime.lifecycle import (
     RuntimeLifecycleError,
     teardown_workers,
 )
+from netopsbench.platform.utils.control import OperationControl
 from netopsbench.platform.utils.files import atomic_write_json
 from netopsbench.platform.utils.proc import safe_run
 
@@ -47,6 +49,8 @@ class RuntimePool:
     scale_registry: ScaleRegistry = field(default_factory=default_scale_registry, repr=False)
     telemetry_ownership_file: Path = field(repr=False, default=Path(".netopsbench/telemetry-buckets.json"))
     _provision_created_buckets: list[str] = field(default_factory=list, repr=False)
+    operation_control: OperationControl | None = field(default=None, repr=False)
+    _metadata_lock: RLock = field(default_factory=RLock, repr=False, compare=False)
 
     @property
     def size(self) -> int:
@@ -74,11 +78,15 @@ class RuntimePool:
         atomic_write_json(self.root_dir / "runtime.json", self.describe())
 
     def _run_stage(self, stage: str, next_state: str) -> RuntimePool:
+        if stage != "teardown" and self.operation_control is not None:
+            self.operation_control.remaining()
         previous = self.stage_results.get(stage)
         if previous is not None and previous.status == "completed":
             return self
         try:
-            result = RuntimeLifecycle(scale_registry=self.scale_registry).run(stage, self)
+            lifecycle = RuntimeLifecycle(scale_registry=self.scale_registry)
+            lifecycle.control = None if stage == "teardown" else self.operation_control
+            result = lifecycle.run(stage, self)
         except RuntimeLifecycleError as exc:
             self.stage_results[stage] = exc.result
             self._write_metadata()
@@ -87,6 +95,20 @@ class RuntimePool:
         self.state = next_state
         self._write_metadata()
         return self
+
+    def mark_quarantined(self, reason: str, workers: list[str] | None = None) -> None:
+        """Persist recovery failure immediately and accumulate affected workers."""
+        with self._metadata_lock:
+            changes = {"quarantined": True, "quarantine_reason": reason}
+            if workers is not None:
+                previous = self.metadata.get("quarantined_workers")
+                known = {str(worker) for worker in previous} if isinstance(previous, list) else set()
+                changes["quarantined_workers"] = sorted(known | set(workers))
+            if self.state == "quarantined" and all(self.metadata.get(k) == v for k, v in changes.items()):
+                return
+            self.metadata.update(changes)
+            self.state = "quarantined"
+            self._write_metadata()
 
     def deploy(self) -> RuntimePool:
         return self._run_stage("deploy", "deployed")

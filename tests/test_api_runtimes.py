@@ -282,13 +282,14 @@ def test_python_worker_deploy_owns_topology_containerlab_and_activation(tmp_path
         lambda deployed_worker: calls.append(("pid1", deployed_worker.worker_id)),
     )
     monkeypatch.setattr(deployment, "apply_configs", lambda *args: SimpleNamespace(failed=[]))
+    monkeypatch.setattr(deployment, "managed_command", lambda: ["netopsbench-managed-test"])
     deployment.deploy_worker_lab(worker, "xs")
 
     generated = next(item for item in calls if item[0] == "generate")[1]
     commands = [item[1] for item in calls if item[0] == "command"]
     assert generated["name"] == "deploy-lab"
     assert generated["mgmt_subnet"] == worker.mgmt_subnet
-    assert any("containerlab" in command and "deploy" in command for command in commands)
+    assert any("netopsbench-managed-test" in command and "deploy" in command for command in commands)
     assert ("pid1", worker.worker_id) in calls
     assert not any("telegraf" in " ".join(command) or "pingmesh" in " ".join(command) for command in commands)
 
@@ -315,9 +316,12 @@ def test_k12_worker_deploy_uses_profile_containerlab_parallelism(tmp_path, monke
     monkeypatch.setattr(deployment, "safe_run", fake_safe_run)
     monkeypatch.setattr(deployment, "_verify_sonic_pid1_contract", lambda _worker: None)
     monkeypatch.setattr(deployment, "apply_configs", lambda *args: SimpleNamespace(failed=[]))
+    monkeypatch.setattr(deployment, "managed_command", lambda: ["netopsbench-managed-test"])
     deployment.deploy_worker_lab(worker, "fat-tree-k12")
 
-    deploy_command = next(command for command in commands if "containerlab" in command and "deploy" in command)
+    deploy_command = next(
+        command for command in commands if "netopsbench-managed-test" in command and "deploy" in command
+    )
     assert deploy_command[-2:] == ["--max-workers", "16"]
 
 
@@ -345,9 +349,12 @@ def test_removed_containerlab_env_does_not_override_scale_profile(tmp_path, monk
     monkeypatch.setattr(deployment, "apply_configs", lambda *args: SimpleNamespace(failed=[]))
     monkeypatch.setenv("NETOPSBENCH_CONTAINERLAB_MAX_WORKERS", "3")
 
+    monkeypatch.setattr(deployment, "managed_command", lambda: ["netopsbench-managed-test"])
     deployment.deploy_worker_lab(worker, "fat-tree-k12")
 
-    deploy_command = next(command for command in commands if "containerlab" in command and "deploy" in command)
+    deploy_command = next(
+        command for command in commands if "netopsbench-managed-test" in command and "deploy" in command
+    )
     assert deploy_command[-2:] == ["--max-workers", "16"]
 
 
@@ -745,7 +752,7 @@ def test_worker_teardown_without_generated_manifest_uses_exact_lab_name(monkeypa
     monkeypatch.setattr(
         deployment,
         "safe_run",
-        lambda command, **_kwargs: (commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr="")),
+        lambda command, **_kwargs: commands.append(command) or SimpleNamespace(returncode=0, stdout="", stderr=""),
     )
     monkeypatch.setattr(deployment, "_stop_collector", lambda *_paths: None)
     monkeypatch.setattr(deployment, "_lab_container_names", lambda *_args: [])
@@ -1031,3 +1038,47 @@ def test_provision_preserves_quarantined_metadata_when_cleanup_fails(tmp_path, m
     assert runtime.state == "cleanup_failed"
     assert runtime.metadata["quarantined"] is True
     assert "cleanup failed" in str(runtime.metadata["cleanup_error"])
+
+
+def test_managed_teardown_finishes_controller_cleanup_after_forced_container_removal(tmp_path, monkeypatch):
+    import subprocess
+
+    from netopsbench.models.runtime import RuntimeIdentity
+    from netopsbench.platform.runtime import deployment
+
+    topology = tmp_path / "worker-1"
+    topology.mkdir()
+    (topology / ".netopsbench-managed").touch()
+    worker = RuntimeIdentity.create(
+        runtime_id="managed-xs",
+        worker_id="worker-1",
+        worker_index=1,
+        lab_name="managed-xs",
+        topology_dir=topology,
+        mgmt_subnet="172.31.1.0/24",
+        mgmt_network="owned-network",
+    )
+    calls = []
+    destroyed = 0
+
+    def run(command, **kwargs):
+        nonlocal destroyed
+        calls.append(command)
+        if command[0] == "managed":
+            destroyed += 1
+            return subprocess.CompletedProcess(command, 1 if destroyed == 1 else 0, "", "")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(deployment, "managed_command", lambda: ["managed"])
+    monkeypatch.setattr(deployment, "sudo_prefix", lambda: [])
+    monkeypatch.setattr(deployment, "docker_prefix", lambda: [])
+    monkeypatch.setattr(deployment, "safe_run", run)
+    monkeypatch.setattr(deployment, "_stop_collector", lambda *a: None)
+    monkeypatch.setattr(deployment, "_lab_container_names", lambda *a: ["clab-managed-xs-client1"])
+    monkeypatch.setattr(deployment, "_wait_for_lab_removal", lambda *a: None)
+    monkeypatch.setattr(deployment, "_container_exists", lambda *a: False)
+    monkeypatch.setattr(deployment, "_network_exists", lambda *a: False)
+    deployment.teardown_worker_lab(worker)
+    first, second = [i for i, c in enumerate(calls) if c[0] == "managed"]
+    removal = calls.index(["docker", "rm", "-f", "clab-managed-xs-client1"])
+    assert first < removal < second

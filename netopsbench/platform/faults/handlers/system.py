@@ -6,6 +6,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from netopsbench.platform.runtime.apply_configs import activate_device
+from netopsbench.platform.runtime.toolchain import runtime_tools
 from netopsbench.platform.utils.proc import docker_prefix, sudo_prefix
 
 if TYPE_CHECKING:
@@ -40,7 +41,7 @@ class SystemHandler:
     def _containerlab_node_command(self, operation: str, device: str) -> list[str]:
         return [
             *sudo_prefix(),
-            "containerlab",
+            str(runtime_tools() / "containerlab"),
             operation,
             "-t",
             str(self._ctx.topology_file),

@@ -11,12 +11,14 @@ Programmatic usage::
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import time
 from concurrent.futures import ThreadPoolExecutor
 from math import ceil
+from pathlib import Path
 
 from netopsbench.config import config
 from netopsbench.logging_utils import get_logger
@@ -32,16 +34,23 @@ from netopsbench.platform.topology.topology_utils import (
     clab_container_name,
     load_topology_manifest,
 )
+from netopsbench.platform.utils.control import OperationControl
 from netopsbench.platform.utils.proc import docker_prefix, safe_run
 
 logger = get_logger(__name__)
 
 HEALTH_POLL_INTERVAL_SECONDS = 5
 ACTIVE_INTERFACE_COVERAGE_MIN_RATIO = 0.5
+_NETWORK_PROBE_SOURCE = Path(__file__).with_name("_network_probe.py").read_text(encoding="utf-8")
 
 
 def _docker_exec(
-    container: str, *cmd: str, check: bool = False, capture: bool = True, timeout: float = 60
+    container: str,
+    *cmd: str,
+    check: bool = False,
+    capture: bool = True,
+    timeout: float = 60,
+    control: OperationControl | None = None,
 ) -> subprocess.CompletedProcess:
     prefix = docker_prefix()
     return safe_run(
@@ -50,22 +59,40 @@ def _docker_exec(
         capture_output=capture,
         text=True,
         timeout=timeout,
+        control=control,
     )
 
 
-def _routing_state(container: str) -> tuple[str, str]:
-    bgp = _docker_exec(container, "vtysh", "-c", "show ip bgp summary")
-    interfaces = _docker_exec(container, "bash", "-lc", "show interfaces status")
-    return (bgp.stdout or "", interfaces.stdout or "") if bgp.returncode == interfaces.returncode == 0 else ("", "")
+def _routing_state(container: str, control: OperationControl | None = None) -> tuple[str, str]:
+    # Retain the two original commands and their individual 60-second limits.
+    # One transport covers both, with five seconds for Python/exec overhead.
+    result = _docker_exec(container, "python3", "-c", _NETWORK_PROBE_SOURCE, timeout=125, control=control)
+    if result.returncode != 0:
+        return "", ""
+    try:
+        payload = json.loads(result.stdout)
+        if payload["version"] != 1:
+            return "", ""
+        checks = payload["checks"]
+        outputs = []
+        for name in ("bgp", "interfaces"):
+            check = checks[name]
+            if check["returncode"] != 0 or not isinstance(check["stdout"], str):
+                return "", ""
+            outputs.append(check["stdout"])
+        return outputs[0], outputs[1]
+    except (KeyError, TypeError, ValueError):
+        return "", ""
 
 
-def _running_container_count(lab_name: str) -> int:
+def _running_container_count(lab_name: str, control: OperationControl | None = None) -> int:
     result = safe_run(
         [*docker_prefix(), "docker", "ps", "--filter", f"label=containerlab={lab_name}", "--format", "{{.Names}}"],
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
+        control=control,
     )
     return len([line for line in result.stdout.strip().splitlines() if line])
 
@@ -146,6 +173,67 @@ def check_worker_health(
     scale_registry: ScaleRegistry | None = None,
     require_client_agent: bool = True,
     all_routing_devices: bool = False,
+    *,
+    deadline: float | None = None,
+    cancel_event=None,
+) -> list[str]:
+    """Check health within one elapsed-time budget, including all retries."""
+    started = time.monotonic()
+    topo = _load_topology_metadata(str(worker.topology_dir))
+    limit = started + get_scale_profile(topo.scale, scale_registry).health_timeout_seconds
+    control = OperationControl(cancel_event, min(limit, deadline) if deadline is not None else limit)
+    try:
+        control.remaining()
+        return _check_worker_health(
+            worker,
+            influxdb_url,
+            influxdb_token,
+            influxdb_org,
+            health_retries,
+            health_delay,
+            scale_registry,
+            require_client_agent,
+            all_routing_devices,
+            topology=topo,
+            control=control,
+        )
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return ["Worker health check deadline exceeded"]
+
+
+def _parallel_check(function, items, workers, control):
+    """Queued probes must not start after cancellation or deadline expiry."""
+
+    def probe(item):
+        control.remaining()
+        result = function(item)
+        control.remaining()
+        return result
+
+    executor = ThreadPoolExecutor(max_workers=min(workers, max(1, len(items))))
+    futures = []
+    try:
+        for item in items:
+            control.remaining()
+            futures.append(executor.submit(probe, item))
+        return [future.result(timeout=control.remaining()) for future in futures]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _check_worker_health(
+    worker: RuntimeIdentity,
+    influxdb_url: str | None = None,
+    influxdb_token: str | None = None,
+    influxdb_org: str | None = None,
+    health_retries: int | None = None,
+    health_delay: int | None = None,
+    scale_registry: ScaleRegistry | None = None,
+    require_client_agent: bool = True,
+    all_routing_devices: bool = False,
+    *,
+    topology: TopologyManifest,
+    control: OperationControl,
 ) -> list[str]:
     """Run all health checks and return a list of error messages (empty = healthy).
 
@@ -158,7 +246,7 @@ def check_worker_health(
     """
     errors: list[str] = []
     topology_dir = str(worker.topology_dir)
-    topo = _load_topology_metadata(topology_dir)
+    topo = topology
     projected_topo = topo.to_agent_topology()
     lab_name = worker.lab_name
     if topo.name != worker.lab_name or topo.topology_id != worker.topology_id:
@@ -198,6 +286,7 @@ def check_worker_health(
         text=True,
         check=False,
         timeout=30,
+        control=control,
     )
     if telegraf_container not in ret.stdout.strip().splitlines():
         errors.append(f"worker telegraf container is not running: {telegraf_container}")
@@ -207,7 +296,7 @@ def check_worker_health(
     # [2/5] Container count
     logger.info("[2/5] Checking container count...")
     expected_nodes = len(switches) + len(clients)
-    running_nodes = _running_container_count(lab_name)
+    running_nodes = _running_container_count(lab_name, control=control)
     if running_nodes < expected_nodes:
         errors.append(
             f"running node count mismatch for {lab_name}: got {running_nodes} expected at least {expected_nodes}"
@@ -225,6 +314,7 @@ def check_worker_health(
             "bash",
             "-lc",
             f"logger -n '{collector_ip}' -P 514 -d '{syslog_marker}'",
+            control=control,
         )
     network_interfaces: dict[str, set[str]] = {}
     expected_counts = expected_network_counts(topo)
@@ -236,7 +326,7 @@ def check_worker_health(
 
     def network_state(device) -> tuple[str, int, int, int, int]:
         container = clab_container_name(lab_name, device.name)
-        bgp, interfaces = _routing_state(container)
+        bgp, interfaces = _routing_state(container, control=control)
         network_interfaces[device.name] = _parse_active_interfaces(interfaces)
         return (
             device.name,
@@ -249,8 +339,7 @@ def check_worker_health(
     pending: dict[str, tuple[int, int, int, int]] = {}
     pending_devices = list(convergence_targets)
     for attempt in range(retries):
-        with ThreadPoolExecutor(max_workers=min(16, max(1, len(pending_devices)))) as network_executor:
-            network_states = list(network_executor.map(network_state, pending_devices))
+        network_states = _parallel_check(network_state, pending_devices, 16, control)
         pending = {
             device: (established, expected_bgp, active, expected_active)
             for device, established, expected_bgp, active, expected_active in network_states
@@ -260,7 +349,7 @@ def check_worker_health(
             break
         pending_devices = [device for device in pending_devices if device.name in pending]
         if attempt + 1 < retries:
-            time.sleep(delay)
+            control.sleep(delay)
     if pending:
         details = ", ".join(
             f"{device}(bgp={state[0]}/{state[1]},if={state[2]}/{state[3]})"
@@ -291,11 +380,11 @@ def check_worker_health(
     src_container = clab_container_name(lab_name, src_name)
     connectivity_ok = False
     for _ in range(retries):
-        ret = _docker_exec(src_container, "ping", "-c", "1", "-W", "2", dst_ip)
+        ret = _docker_exec(src_container, "ping", "-c", "1", "-W", "2", dst_ip, control=control)
         if ret.returncode == 0:
             connectivity_ok = True
             break
-        time.sleep(delay)
+        control.sleep(delay)
     if not connectivity_ok:
         errors.append(f"client connectivity failed from {src_container} to {dst_ip}")
         return errors
@@ -309,7 +398,7 @@ def check_worker_health(
             if not management_ip:
                 return name, False
             try:
-                response = request_agent(management_ip, PINGMESH_CONTROL_PORT, "status")
+                response = request_agent(management_ip, PINGMESH_CONTROL_PORT, "status", timeout=control.remaining(2))
             except (OSError, RuntimeError, ValueError):
                 response = {}
             status = response.get("status") or {}
@@ -326,15 +415,14 @@ def check_worker_health(
         pending_agents = list(agent_targets)
         failed_agents: list[str] = []
         for attempt in range(retries):
-            with ThreadPoolExecutor(max_workers=min(32, max(1, len(pending_agents)))) as agent_executor:
-                agent_states = list(agent_executor.map(agent_state, pending_agents))
+            agent_states = _parallel_check(agent_state, pending_agents, 32, control)
             failed_agents = [name for name, ready in agent_states if not ready]
             if not failed_agents:
                 break
             failed_set = set(failed_agents)
             pending_agents = [client for client in pending_agents if str(client.get("name", "")).strip() in failed_set]
             if attempt + 1 < retries:
-                time.sleep(delay)
+                control.sleep(delay)
         if failed_agents:
             preview = ", ".join(sorted(failed_agents)[:12])
             errors.append(f"Native Pingmesh process is not ready on {len(failed_agents)} clients: {preview}")
@@ -345,7 +433,9 @@ def check_worker_health(
     if obs_device in network_interfaces:
         observed_active_interfaces = sorted(network_interfaces[obs_device])
     else:
-        ret = _docker_exec(clab_container_name(lab_name, obs_device), "bash", "-lc", "show interfaces status")
+        ret = _docker_exec(
+            clab_container_name(lab_name, obs_device), "bash", "-lc", "show interfaces status", control=control
+        )
         observed_active_interfaces = sorted(_parse_active_interfaces(ret.stdout or ""))
 
     # Delegate to the observability validation module
@@ -353,7 +443,9 @@ def check_worker_health(
     from netopsbench.platform.observability.validation import check_observability
 
     def query_runner(query: str) -> str:
-        result = query_flux(influxdb_url, influxdb_token, influxdb_org, query, timeout=20)
+        result = query_flux(
+            influxdb_url, influxdb_token, influxdb_org, query, timeout=control.remaining(20), deadline=control.deadline
+        )
         if result.status != "ok":
             raise RuntimeError(result.error or "InfluxDB query failed")
         return result.text
@@ -385,14 +477,13 @@ def check_worker_health(
 
     obs_errors: list[str] = []
     for attempt in range(retries):
-        with ThreadPoolExecutor(max_workers=min(4, len(pending_checks))) as observation_executor:
-            results = list(observation_executor.map(observe, sorted(pending_checks)))
+        results = _parallel_check(observe, sorted(pending_checks), 4, control)
         obs_errors = [error for _check, check_errors in results for error in check_errors]
         pending_checks = {check for check, check_errors in results if check_errors}
         if not pending_checks:
             break
         if attempt + 1 < retries:
-            time.sleep(delay)
+            control.sleep(delay)
     errors.extend(obs_errors)
 
     if not errors:

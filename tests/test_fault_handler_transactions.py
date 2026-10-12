@@ -14,6 +14,12 @@ from netopsbench.platform.faults.services.tracking import FaultTracker
 from netopsbench.platform.topology.generator import generate_topology
 
 
+@pytest.fixture(autouse=True)
+def mocked_runtime_tools(monkeypatch, tmp_path):
+    # These transaction tests mock every command; toolchain validation has its own tests.
+    monkeypatch.setattr("netopsbench.platform.faults.handlers.system.runtime_tools", lambda: tmp_path)
+
+
 def _metadata() -> dict:
     with tempfile.TemporaryDirectory() as tmpdir:
         return generate_topology("xs", tmpdir)["metadata"]

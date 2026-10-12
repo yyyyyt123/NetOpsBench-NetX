@@ -24,6 +24,7 @@ dependencies = [
     "requests>=2.25.0",
     "pyyaml>=5.4.0",
     "pydantic>=2.0.0",
+    "dnspython>=2.7.0",
     "harbor>=0.13.1,<0.14",
 ]
 
@@ -76,6 +77,7 @@ netopsbench = [
     "models/*.yaml",
     "platform/topology/*.json",
     "platform/topology/*.sh",
+    "platform/runtime/assets/*",
     "platform/observability/assets/**/*",
     "platform/scenario/specs/*.yaml",
 ]
@@ -84,6 +86,7 @@ netopsbench = [
 "*" = ["**/__pycache__", "**/__pycache__/*", "**/*.pyc"]
 
 [tool.pytest.ini_options]
+testpaths = ["tests"]
 markers = [
     "real: tests requiring deployed real environment and external services",
     "slow: tests that are slow but do not need a real environment",

@@ -149,6 +149,7 @@ def _containerlab_topology(plan: FabricPlan) -> dict[str, Any]:
                         f"configs/sonic/__clabNodeName__/port_config.ini:{SONIC_PORT_CONFIG_PATH}:rw",
                         f"configs/sonic/__clabNodeName__/lanemap.ini:{SONIC_LANEMAP_PATH}:rw",
                         "configs/sonic/start.sh:/usr/bin/start.sh:ro",
+                        "configs/sonic/start_group.py:/opt/nb-start-group.py:ro",
                         "configs/frr/__clabNodeName__.conf:/etc/frr/frr.conf:rw",
                     ],
                 },
@@ -200,6 +201,7 @@ def _render_into(plan: FabricPlan, root: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"SONiC startup wrapper source not found: {SONIC_START_WRAPPER_SOURCE}")
     sonic_start_wrapper.write_bytes(SONIC_START_WRAPPER_SOURCE.read_bytes())
     sonic_start_wrapper.chmod(0o755)
+    (sonic_root / "start_group.py").write_bytes(Path(__file__).with_name("sonic_start_group.py").read_bytes())
 
     yaml_path = root / f"{plan.manifest.name}.clab.yaml"
     with yaml_path.open("w", encoding="utf-8") as handle:

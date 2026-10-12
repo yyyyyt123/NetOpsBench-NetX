@@ -64,6 +64,7 @@ cd NetOpsBench
 python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[agent]"
+python -m netopsbench.platform.runtime.build_tools --test  # Go 1.25+, git, C compiler
 
 netopsbench benchmark prepare --scales xs
 export OPENAI_API_KEY=...
@@ -72,7 +73,7 @@ PYTHONPATH=. python examples/01_run_scenario.py --vendor openai
 
 The first successful run produces a `BenchmarkReport` with case-level scores, timing, and artifact paths. For Docker, Containerlab, and runtime setup details, read [Quickstart](docs/content/docs/quickstart.mdx).
 
-Build the current client image with `docker build -f containers/client/Dockerfile -t netopsbench-client:pingmesh-v2 .`. Pingmesh uses one immutable offline plan for execution, coverage checks, and observation windows. Xlarge has 256 clients and a 66-second minimum window; Fat-tree K12/K18 use 42 seconds. K18 has 405 switches and 324 clients. Regenerate scenario assets with `netopsbench benchmark prepare --scales xlarge,fat-tree-k12,fat-tree-k18` and recreate runtimes after this refactor; previous artifact formats are rejected. `NETOPSBENCH_CLIENT_IMAGE` selects a matching custom image.
+Runtime creation uses the repository's pinned Containerlab build, including direct veth creation, managed DNS/restart recovery, and grouped SONiC initialization. It does not replace the system Containerlab or rebuild Docker. Build once after installation and configure the scoped privileged commands in Quickstart. Build the current client image with `docker build -f containers/client/Dockerfile -t netopsbench-client:pingmesh-v2 .`. Pingmesh uses one immutable offline plan for execution, coverage checks, and observation windows. Xlarge has 256 clients and a 66-second minimum window; Fat-tree K12/K18 use 42 seconds. K18 has 405 switches and 324 clients. Regenerate scenario assets with `netopsbench benchmark prepare --scales xlarge,fat-tree-k12,fat-tree-k18` and recreate runtimes after this refactor; previous artifact formats are rejected. `NETOPSBENCH_CLIENT_IMAGE` selects a matching custom image.
 
 ### Run a scenario from Python
 

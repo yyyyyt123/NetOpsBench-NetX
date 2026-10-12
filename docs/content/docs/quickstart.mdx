@@ -15,7 +15,7 @@ NetOpsBench depends on Containerlab and Linux networking primitives such as netw
 
 - Python 3.12+
 - Docker
-- Containerlab
+- Go 1.25+, Git, and a C compiler for the pinned Containerlab build and race tests
 - An API key for the selected LLM provider
 
 Install Docker:
@@ -26,34 +26,9 @@ sudo usermod -aG docker $USER   # re-login after this step
 docker run --rm hello-world
 ```
 
-Install Containerlab:
+NetOpsBench builds its pinned Containerlab backend after Python installation. The system `containerlab` command can remain installed for other labs; SDK-created runtimes use the repository-owned binary.
 
-```bash
-bash -c "$(curl -sL https://get.containerlab.dev)"
-containerlab version
-```
-
-Enable non-interactive access for the privileged commands used by the benchmark scripts:
-
-```bash
-echo "$USER ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/containerlab, /usr/bin/rm" \
-  | sudo tee /etc/sudoers.d/netopsbench
-sudo chmod 440 /etc/sudoers.d/netopsbench
-sudo visudo -cf /etc/sudoers.d/netopsbench
-```
-
-Check the same shell session you will use for the run:
-
-```bash
-python3 --version
-docker run --rm hello-world
-containerlab version
-sudo -n docker ps
-sudo -n containerlab version
-sudo -n rm --version
-```
-
-If Docker still reports a socket permission error after `sudo usermod -aG docker $USER`, log out and back in, or start a new shell with `newgrp docker`. The `sudo -n` commands must not prompt for a password.
+If Docker reports a socket permission error after adding the Docker group, log out and back in, or start a new shell with `newgrp docker`.
 
 ## Install
 
@@ -64,6 +39,61 @@ python -m venv .venv
 source .venv/bin/activate
 pip install -e ".[agent]"
 ```
+
+Build the runtime tools once (and rebuild after the packaged patch changes):
+
+```bash
+python -m netopsbench.platform.runtime.build_tools --test
+docker build -f containers/client/Dockerfile -t netopsbench-client:pingmesh-v2 .
+```
+
+The builder verifies the pinned upstream archive and patch checksums, applies the patch in an isolated directory, and installs `containerlab` and `mgmt-link` under the Python package's `platform/runtime/_bin/`. It neither replaces `/usr/bin/containerlab` nor recompiles or restarts Docker. Offline builds may use `--archive /path/to/pinned-source.tar.gz` and a populated Go module cache. Missing or incompatible tools fail before deployment instead of silently using a slower backend.
+
+### Privileged runtime operations
+
+The ordinary SDK process runs as your user. Management veth creation and destruction run the same virtual environment's `netopsbench.platform.runtime.management` module through `sudo -n`. An administrator should authorize only the checkout and runtime directory used for this installation. The following creates scoped rules for a standard checkout with `.venv` (sudo 1.9.10+ argument regex support):
+
+```bash
+python - <<'PYRULES' > /tmp/netopsbench-runtime.sudoers
+import getpass, re, sys
+from pathlib import Path
+repo = Path.cwd().resolve()
+base = re.escape(str(repo))
+worker = base + r'/\.netopsbench/runtimes/[A-Za-z0-9_-]+/worker-[0-9]+'
+topology = worker + r'/[A-Za-z0-9_-]+\.clab\.yaml'
+module = r'-m netopsbench\.platform\.runtime\.management '
+prefix = f'{getpass.getuser()} ALL=(root) NOPASSWD: '
+python = str(repo / '.venv/bin/python')
+for args in [
+    module + 'deploy -t ' + topology + r' --reconfigure( --max-workers [0-9]+)?',
+    module + 'destroy -t ' + topology + r' --cleanup( --max-workers [0-9]+)?',
+    module + r'destroy --name [A-Za-z0-9_-]+ --cleanup( --max-workers [0-9]+)?',
+]:
+    print(prefix + python + ' ^' + args + '$')
+for operation in ('stop', 'start'):
+    print(prefix + str(repo / 'netopsbench/platform/runtime/_bin/containerlab') + ' ^' + operation + ' -t ' + topology
+          + r' --node [A-Za-z0-9_-]+ --timeout 120s$')
+paths = worker + r'/(configs|clab-[A-Za-z0-9_-]+)'
+print(prefix + '/usr/bin/rm ^-rf ' + paths + '( ' + paths + ')*$')
+print(prefix + '/usr/bin/rm ^-rf ' + base + r'/\.netopsbench/runtimes/[A-Za-z0-9_-]+$')
+PYRULES
+sudo visudo -cf /tmp/netopsbench-runtime.sudoers
+sudo install -o root -g root -m 0440 /tmp/netopsbench-runtime.sudoers /etc/sudoers.d/netopsbench-runtime
+```
+
+The restart controller restores management IP, routes, DNS reachability, and the namespace handle. A Docker restart still removes Containerlab data links and in-container agents; recreate the runtime to restore the complete benchmark topology.
+
+Use a trusted checkout: this privileged module and its imported Python code are executable with root privileges. Custom workspaces or Python interpreter paths need matching administrator-reviewed rules. These rules do not authorize arbitrary Python commands. Controller state and logs live under `/var/lib/netopsbench/management/<lab>`; the SDK teardown stops that lab's DNS/restart controller and removes its owned management network.
+
+### Large-topology defaults
+
+The k12 profile selects 16 container creation workers and Pingmesh destination batches of 32. The backend creates both data-link endpoints directly, uses single-queue management veths with final interface names, delays SONiC data-interface activation until initialization, and bounds SONiC service startup and container queries. Full SONiC completion and runtime health gates remain enabled.
+
+Generate current assets with `netopsbench benchmark prepare --scales xlarge,fat-tree-k12,fat-tree-k18`. Healthy scenarios use the same baseline and diagnostic episode lifecycle as fault cases. Complete observation windows are 66 seconds for Xlarge and 42 seconds for K12/K18. Xlarge and K18 use two clients per rack with 50 PPS per client. K18 has 405 switches, 324 clients, and a `/22` management subnet. Pingmesh plans are generated once; client processes execute the fixed peer/port schedule. Coverage refers to topology candidate paths, not verified ECMP paths.
+
+This refactor requires topology/runtime schema v4, scale profiles v2 and client configuration v2. Recreate old runtimes and regenerate their topology/scenario assets; old formats are rejected. Client addresses now start at `192.168.1.0/24`, and Fat-tree ASNs are allocated consecutively by tier. The default local image is `netopsbench-client:pingmesh-v2`; `NETOPSBENCH_CLIENT_IMAGE` selects another image built from the current source.
+
+Shared InfluxDB and Grafana containers are reused without automatic recreation during provisioning. Apply shared-service configuration upgrades explicitly when no active runtimes depend on them.
 
 ## Run one case
 
@@ -93,10 +123,3 @@ The run provisions an XS topology, starts observability, injects one generated f
 - Implement your own agent with [Custom Troubleshooting Agents](/docs/build-your-agent/custom-agents).
 - Run larger evaluations with [Running Benchmarks](/docs/run-benchmarks/run-scenario-vs-suite).
 - Use [Operations](/docs/debug-operate/observability) only when a runtime, Grafana dashboard, or cleanup path needs inspection.
-
-
-### Fixed Pingmesh plans and K18
-
-Generate current assets with `netopsbench benchmark prepare --scales xlarge,fat-tree-k12,fat-tree-k18`. Healthy scenarios use the same baseline and diagnostic episode lifecycle as fault cases. Complete observation windows are 66 seconds for Xlarge and 42 seconds for K12/K18. Xlarge and K18 use two clients per rack with 50 PPS per client. K18 has 405 switches, 324 clients, and a `/22` management subnet. Pingmesh plans are generated once; client processes execute the fixed peer/port schedule. Coverage refers to topology candidate paths, not verified ECMP paths.
-
-This refactor requires topology/runtime schema v4, scale profiles v2 and client configuration v2. Recreate old runtimes and regenerate their topology/scenario assets; old formats are rejected. Client addresses now start at `192.168.1.0/24`, and Fat-tree ASNs are allocated consecutively by tier. The default local image is `netopsbench-client:pingmesh-v2`; `NETOPSBENCH_CLIENT_IMAGE` selects another image built from the current source.
