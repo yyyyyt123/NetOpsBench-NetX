@@ -93,3 +93,10 @@ The run provisions an XS topology, starts observability, injects one generated f
 - Implement your own agent with [Custom Troubleshooting Agents](/docs/build-your-agent/custom-agents).
 - Run larger evaluations with [Running Benchmarks](/docs/run-benchmarks/run-scenario-vs-suite).
 - Use [Operations](/docs/debug-operate/observability) only when a runtime, Grafana dashboard, or cleanup path needs inspection.
+
+
+### Fixed Pingmesh plans and K18
+
+Generate current assets with `netopsbench benchmark prepare --scales xlarge,fat-tree-k12,fat-tree-k18`. Healthy scenarios use the same baseline and diagnostic episode lifecycle as fault cases. Complete observation windows are 66 seconds for Xlarge and 42 seconds for K12/K18. Xlarge and K18 use two clients per rack with 50 PPS per client. K18 has 405 switches, 324 clients, and a `/22` management subnet. Pingmesh plans are generated once; client processes execute the fixed peer/port schedule. Coverage refers to topology candidate paths, not verified ECMP paths.
+
+This refactor requires topology/runtime schema v4, scale profiles v2 and client configuration v2. Recreate old runtimes and regenerate their topology/scenario assets; old formats are rejected. Client addresses now start at `192.168.1.0/24`, and Fat-tree ASNs are allocated consecutively by tier. The default local image is `netopsbench-client:pingmesh-v2`; `NETOPSBENCH_CLIENT_IMAGE` selects another image built from the current source.

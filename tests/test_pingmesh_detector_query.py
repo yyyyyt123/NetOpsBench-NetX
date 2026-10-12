@@ -15,6 +15,7 @@ class _Detector(DetectorQueryMixin):
         self.token = "token"
         self.org = "org"
         self.topology_id = "runtime-topology"
+        self.plan_id = "current-plan"
         self._pingmesh_clients = clients
         self.client_to_leaf: dict[str, str] = {}
 
@@ -63,6 +64,7 @@ def test_snapshot_query_uses_bounded_pushdown_source_shards(monkeypatch):
     assert result.status == "ok"
     assert len(queries) == 5
     assert worker_counts == [4]
+    assert all('r.plan_id == "current-plan"' in query for query in queries)
     assert all("contains(" not in query for query in queries)
     assert all('r.topology_id == "runtime-topology"' in query for query in queries)
     assert sorted(len(re.findall(r'r\.src_name == "client\d+"', query)) for query in queries) == [1, 16, 16, 16, 16]
@@ -108,3 +110,29 @@ def test_snapshot_query_discards_partial_rows_when_any_shard_fails(monkeypatch):
     assert result.status == "error"
     assert result.rows == []
     assert result.error == "snapshot shard 2/2 failed: influx timeout"
+
+
+def test_baseline_and_current_reads_overlap_and_remain_fresh(monkeypatch, tmp_path):
+    import threading
+
+    from netopsbench.platform.pingmesh.detector import AnomalyDetector
+    from netopsbench.platform.topology.generator import generate_topology
+
+    metadata = generate_topology("xs", str(tmp_path))["metadata"]
+    detector = AnomalyDetector("http://test", "token", "org", "bucket", topology_metadata=metadata)
+    barrier = threading.Barrier(2)
+    reads = []
+
+    def query(start, end):
+        reads.append((start, end))
+        barrier.wait(timeout=5)
+        return SnapshotQueryResult(status="error", rows=[], error="test incomplete"), {}
+
+    monkeypatch.setattr(detector, "_query_covered_snapshot", query)
+    for _ in range(2):
+        report = detector.generate_windowed_anomaly_report(
+            baseline_start="b1", baseline_end="b2", current_start="c1", current_end="c2", windows=[]
+        )
+        assert report["query_status"]["ok"] is False
+    assert reads.count(("b1", "b2")) == 2
+    assert reads.count(("c1", "c2")) == 2

@@ -36,7 +36,7 @@ def test_session_runtime_loader_preserves_canonical_topology_schema(tmp_path: Pa
 
     metadata = load_topology_metadata(topology_dir)
 
-    assert metadata["schema_version"] == "3"
+    assert metadata["schema_version"] == "4"
     assert isinstance(metadata["devices"], list)
     assert {device["role"] for device in metadata["devices"]} == {"spine", "leaf", "client"}
 

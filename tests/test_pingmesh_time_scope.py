@@ -7,6 +7,8 @@ from netopsbench.models.topology import (
     Collector,
     Device,
     DeviceRole,
+    Link,
+    LinkEndpoint,
     Management,
     PingmeshPolicy,
     RoutingMetadata,
@@ -59,7 +61,16 @@ def _coverage_detector(client_count=144, *, rtt_ports_per_cycle=4):
             total_switches=1,
         ),
         devices=[Device(name="leaf1", role=DeviceRole.LEAF), *clients],
-        links=[],
+        links=[
+            Link(
+                kind="access",
+                endpoints=(
+                    LinkEndpoint(device="leaf1", interface=f"eth{i}"),
+                    LinkEndpoint(device=client.name, interface="eth1"),
+                ),
+            )
+            for i, client in enumerate(clients)
+        ],
         routing=RoutingMetadata(ecmp_hash_policy_by_role={DeviceRole.LEAF: 1}),
         pingmesh=PingmeshPolicy(
             destination_batch_size=16,
@@ -68,6 +79,9 @@ def _coverage_detector(client_count=144, *, rtt_ports_per_cycle=4):
             cycle_interval_seconds=2,
         ),
     )
+    from netopsbench.platform.pingmesh.planner import compile_pingmesh_plan
+
+    topology.pingmesh_plan = compile_pingmesh_plan(topology)
     return AnomalyDetector(
         "http://influxdb:8086",
         "token",
@@ -462,6 +476,81 @@ def test_generate_report_queries_each_snapshot_once(monkeypatch):
     ]
 
 
+def test_equal_snapshot_window_reuses_analysis_and_keeps_anomaly_labels(monkeypatch):
+    detector = _coverage_detector(client_count=2)
+    _snapshot_sequence(monkeypatch, detector, [_rtt_rows([1]), _rtt_rows([100])])
+    monkeypatch.setattr(detector, "summarize_coverage", lambda rows: {"coverage_status": "complete"})
+    original = detector.analyze_snapshot_rows
+    calls = []
+
+    def analyze(baseline, current):
+        calls.append(len(current))
+        return original(baseline, current)
+
+    monkeypatch.setattr(detector, "analyze_snapshot_rows", analyze)
+    report = detector.generate_windowed_anomaly_report(
+        baseline_start="2025-12-31T23:59:00Z",
+        baseline_end="2026-01-01T00:00:00Z",
+        current_start="2026-01-01T00:00:00Z",
+        current_end="2026-01-01T00:00:01Z",
+        windows=[{"name": "steady", "start_time": "2026-01-01T00:00:00Z", "end_time": "2026-01-01T00:00:01Z"}],
+    )
+    assert calls == [1]
+    assert report["summary"]["latency_spikes"] == 1
+    assert report["anomalies"][0]["windows_observed"] == ["full", "steady"]
+    assert report["anomalies"][0]["persistence"] == "steady_only"
+
+
+def test_window_analysis_does_not_reuse_rows_excluded_by_slice(monkeypatch):
+    detector = _coverage_detector(client_count=2)
+    current = _rtt_rows([100, 1]) + [{"_time": "invalid", "rtt_avg": 100}]
+    _snapshot_sequence(monkeypatch, detector, [_rtt_rows([1]), current])
+    monkeypatch.setattr(detector, "summarize_coverage", lambda rows: {"coverage_status": "complete"})
+    original = detector.analyze_snapshot_rows
+    calls = []
+
+    def analyze(baseline, rows):
+        calls.append(len(rows))
+        return original(baseline, rows)
+
+    monkeypatch.setattr(detector, "analyze_snapshot_rows", analyze)
+    detector.generate_windowed_anomaly_report(
+        baseline_start="2025-12-31T23:59:00Z",
+        baseline_end="2026-01-01T00:00:00Z",
+        current_start="2026-01-01T00:00:00Z",
+        current_end="2026-01-01T00:00:02Z",
+        windows=[
+            {"name": "steady", "start_time": "2026-01-01T00:00:00Z", "end_time": "2026-01-01T00:00:02Z"},
+            {"name": "early", "start_time": "2026-01-01T00:00:00Z", "end_time": "2026-01-01T00:00:01Z"},
+        ],
+    )
+    assert calls == [3, 2, 1]
+
+
+def test_analysis_groups_each_snapshot_once_without_modifying_rows(monkeypatch):
+    from copy import deepcopy
+
+    from netopsbench.platform.pingmesh import _detector_analysis as module
+
+    counts = {"_group_by_path": 0, "_group_by_path_port_batch": 0}
+
+    def wrap(name, original):
+        def grouped(rows):
+            counts[name] += 1
+            return original(rows)
+
+        return grouped
+
+    for name in counts:
+        monkeypatch.setattr(module, name, wrap(name, getattr(module, name)))
+    baseline, current = [_probe_sample()], [_probe_sample(lost=4, df_lost=4)]
+    before = deepcopy((baseline, current))
+    analysis = _coverage_detector(client_count=2).analyze_snapshot_rows(baseline, current)
+    assert counts == {"_group_by_path": 2, "_group_by_path_port_batch": 2}
+    assert (baseline, current) == before
+    assert analysis.quality["absolute_unreachable_paths"] == 1
+
+
 def test_generate_report_keeps_baseline_coverage_separate_from_current(monkeypatch):
     detector = _coverage_detector(client_count=2)
     _snapshot_sequence(monkeypatch, detector, [[_probe_sample()], [_probe_sample()]])
@@ -611,37 +700,6 @@ def test_snapshot_csv_parser_accepts_pivoted_rows():
     ]
 
 
-def test_pingmesh_coverage_summary_reports_complete_epoch():
-    detector = _coverage_detector()
-    rows = []
-    for source in range(1, 145):
-        for offset in range(1, 144):
-            destination_batch = (offset - 1) // 16
-            for port_batch in range(4):
-                cycle = destination_batch + port_batch * 9
-                rows.append(
-                    {
-                        "probe_cycle": float(cycle),
-                        "destination_batch_index": float(destination_batch),
-                        "port_batch_index": float(port_batch),
-                        "src_name": f"client{source}",
-                        "dst_name": f"client{((source + offset - 1) % 144) + 1}",
-                        "rtt_ports_active": 4,
-                        "rtt_ports_total": 16,
-                        "local_probe_errors": 0,
-                    }
-                )
-    audit = detector.summarize_coverage(rows)
-
-    assert audit["coverage_status"] == "complete"
-    assert audit["expected_epoch_cycles"] == 36
-    assert audit["min_source_cycle_span"] == 36
-    assert audit["destination_batches_observed"] == list(range(9))
-    assert audit["port_batches_observed"] == list(range(4))
-    assert audit["pair_port_combinations_observed"] == 20_592 * 4
-    assert audit["missing_pair_port_combinations"] == 0
-
-
 def test_detector_projects_canonical_manifest_before_loading_coverage_policy(tmp_path):
     from netopsbench.platform.topology.generator import generate_topology
     from netopsbench.platform.topology.topology_utils import load_topology_manifest
@@ -658,44 +716,16 @@ def test_detector_projects_canonical_manifest_before_loading_coverage_policy(tmp
         topology_id=manifest.topology_id,
     )
 
-    assert detector._pingmesh_policy["destination_batch_count"] == 8
-    assert detector._pingmesh_policy["port_batch_count"] == 4
-    assert detector._pingmesh_policy["coverage_epoch_cycles"] == 32
-
-
-def test_xlarge_and_k8_coverage_counts_all_pairs_and_port_batches():
-    client_count = 128
-    rows = []
-    for source in range(1, client_count + 1):
-        for offset in range(1, client_count):
-            destination_batch = (offset - 1) // 16
-            destination = ((source + offset - 1) % client_count) + 1
-            for port_batch in range(4):
-                rows.append(
-                    {
-                        "probe_cycle": float(destination_batch + port_batch * 8),
-                        "destination_batch_index": float(destination_batch),
-                        "port_batch_index": float(port_batch),
-                        "src_name": f"client{source}",
-                        "dst_name": f"client{destination}",
-                        "rtt_ports_active": 4,
-                        "rtt_ports_total": 16,
-                        "local_probe_errors": 0,
-                    }
-                )
-
-    audit = _coverage_detector(client_count).summarize_coverage(rows)
-
-    assert audit["coverage_status"] == "complete"
-    assert audit["expected_epoch_cycles"] == 32
-    assert audit["destination_pairs_observed"] == 16_256
-    assert audit["pair_port_combinations_observed"] == 65_024
+    assert len(detector._pingmesh_plan.settings.port_batches) == 4
+    assert detector._pingmesh_plan.settings.coverage_epoch_cycles == 20
+    assert detector._pingmesh_plan.directed_pair_count == 16512
 
 
 def test_coverage_rejects_incomplete_socket_pool():
     detector = _coverage_detector(2)
     rows = [
         {
+            "plan_id": detector.plan_id,
             "probe_cycle": float(port_batch),
             "destination_batch_index": 0.0,
             "port_batch_index": float(port_batch),
@@ -719,6 +749,7 @@ def test_coverage_accepts_smaller_final_port_batch():
     detector = _coverage_detector(2, rtt_ports_per_cycle=6)
     rows = [
         {
+            "plan_id": detector.plan_id,
             "probe_cycle": float(port_batch),
             "destination_batch_index": 0.0,
             "port_batch_index": float(port_batch),
@@ -741,6 +772,7 @@ def test_coverage_accepts_smaller_final_port_batch():
 
 def _coverage_row(source: str, destination: str, port_batch: int, *, probe_cycle: int | None = None) -> dict:
     return {
+        "plan_id": _coverage_detector(2).plan_id,
         "probe_cycle": float(port_batch if probe_cycle is None else probe_cycle),
         "destination_batch_index": 0.0,
         "port_batch_index": float(port_batch),
@@ -775,7 +807,7 @@ def test_coverage_rejects_local_probe_errors():
     assert audit["invalid_socket_rows"] == 1
 
 
-def test_coverage_accepts_df_send_error_explained_by_strong_rtt_loss():
+def test_coverage_rejects_df_send_error_even_with_strong_rtt_loss():
     detector = _coverage_detector(2)
     rows = _complete_coverage_rows(
         {
@@ -789,11 +821,11 @@ def test_coverage_accepts_df_send_error_explained_by_strong_rtt_loss():
 
     audit = detector.summarize_coverage(rows)
 
-    assert audit["coverage_status"] == "complete"
-    assert audit["invalid_socket_rows"] == 0
+    assert audit["coverage_status"] == "incomplete"
+    assert audit["invalid_socket_rows"] == 1
 
 
-def test_coverage_accepts_transition_df_error_with_full_window_socket_batch_loss():
+def test_coverage_rejects_local_df_error_despite_later_valid_sample():
     detector = _coverage_detector(2)
     rows = _complete_coverage_rows(
         {
@@ -810,8 +842,8 @@ def test_coverage_accepts_transition_df_error_with_full_window_socket_batch_loss
 
     audit = detector.summarize_coverage(rows)
 
-    assert audit["coverage_status"] == "complete"
-    assert audit["invalid_socket_rows"] == 0
+    assert audit["coverage_status"] == "incomplete"
+    assert audit["invalid_socket_rows"] == 1
 
 
 def test_coverage_does_not_use_loss_from_another_socket_batch_to_explain_df_error():
@@ -855,26 +887,6 @@ def test_coverage_rejects_df_send_error_without_strong_rtt_loss():
     ):
         assert audit["coverage_status"] == "incomplete"
         assert audit["invalid_socket_rows"] == 1
-
-
-def test_pingmesh_coverage_summary_reports_missing_batches():
-    detector = _coverage_detector()
-    rows = [
-        {
-            "probe_cycle": float(index),
-            "destination_batch_index": float(index % 8),
-            "port_batch_index": float(index % 3),
-            "src_name": "client1",
-            "dst_name": "client2",
-        }
-        for index in range(10)
-    ]
-    audit = detector.summarize_coverage(rows)
-
-    assert audit["coverage_status"] == "incomplete"
-    assert audit["missing_destination_batches"] == [8]
-    assert audit["missing_port_batches"] == [3]
-    assert audit["missing_source_clients"] == 143
 
 
 def test_pingmesh_time_scope_uses_explicit_window_first(monkeypatch):

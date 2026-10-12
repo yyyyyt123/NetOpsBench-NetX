@@ -151,9 +151,10 @@ class DetectorAnalysisMixin:
             sample_count=sample_count,
         )
 
-    def _detect_latency_from_rows(self, baseline_rows: list[dict], current_rows: list[dict]) -> list:
-        baseline_paths = _group_by_path(baseline_rows)
-        current_paths = _group_by_path(current_rows)
+    def _detect_latency_from_rows(self, baseline_rows: list[dict], current_rows: list[dict], *, _paths=None) -> list:
+        baseline_paths, current_paths = (
+            _paths if _paths is not None else (_group_by_path(baseline_rows), _group_by_path(current_rows))
+        )
         anomalies = []
         for path_key, current_points in current_paths.items():
             baseline_points = baseline_paths.get(path_key, [])
@@ -181,9 +182,12 @@ class DetectorAnalysisMixin:
             )
         return anomalies
 
-    def _detect_loss_from_rows(self, baseline_rows: list[dict], current_rows: list[dict]) -> tuple[list, int]:
-        baseline_paths = _group_by_path(baseline_rows)
-        current_paths = _group_by_path(current_rows)
+    def _detect_loss_from_rows(
+        self, baseline_rows: list[dict], current_rows: list[dict], *, _paths=None
+    ) -> tuple[list, int]:
+        baseline_paths, current_paths = (
+            _paths if _paths is not None else (_group_by_path(baseline_rows), _group_by_path(current_rows))
+        )
         anomalies = []
         insufficient_baseline = 0
         for path_key, current_points in current_paths.items():
@@ -224,9 +228,12 @@ class DetectorAnalysisMixin:
                 )
         return anomalies, insufficient_baseline
 
-    def _detect_df_from_rows(self, baseline_rows: list[dict], current_rows: list[dict]) -> list:
-        baseline_batches = _group_by_path_port_batch(baseline_rows)
-        current_batches = _group_by_path_port_batch(current_rows)
+    def _detect_df_from_rows(self, baseline_rows: list[dict], current_rows: list[dict], *, _batches=None) -> list:
+        baseline_batches, current_batches = (
+            _batches
+            if _batches is not None
+            else (_group_by_path_port_batch(baseline_rows), _group_by_path_port_batch(current_rows))
+        )
         anomalies_by_path: dict[tuple[str, str], Any] = {}
         for batch_key, current_points in current_batches.items():
             baseline_points = baseline_batches.get(batch_key, [])
@@ -262,14 +269,19 @@ class DetectorAnalysisMixin:
         return list(anomalies_by_path.values())
 
     def analyze_snapshot_rows(self, baseline_rows: list[dict], current_rows: list[dict]) -> SnapshotAnalysis:
-        loss_anomalies, insufficient_baseline = self._detect_loss_from_rows(baseline_rows, current_rows)
-        anomalies = [
-            *self._detect_latency_from_rows(baseline_rows, current_rows),
-            *loss_anomalies,
-            *self._detect_df_from_rows(baseline_rows, current_rows),
-        ]
+        # These indexes are local to this analysis: no stale cross-window data,
+        # and all detectors retain the same row ordering and sample population.
         baseline_paths = _group_by_path(baseline_rows)
         current_paths = _group_by_path(current_rows)
+        paths = (baseline_paths, current_paths)
+        baseline_batches = _group_by_path_port_batch(baseline_rows)
+        current_batches = _group_by_path_port_batch(current_rows)
+        loss_anomalies, insufficient_baseline = self._detect_loss_from_rows(baseline_rows, current_rows, _paths=paths)
+        anomalies = [
+            *self._detect_latency_from_rows(baseline_rows, current_rows, _paths=paths),
+            *loss_anomalies,
+            *self._detect_df_from_rows(baseline_rows, current_rows, _batches=(baseline_batches, current_batches)),
+        ]
         absolute_unreachable_paths = 0
         absolute_loss_paths = 0
         absolute_mtu_paths: set[tuple[str, str]] = set()
@@ -282,7 +294,7 @@ class DetectorAnalysisMixin:
             elif regular["loss_pct"] >= self.loss_pct_threshold and regular["lost"] >= _MIN_PATH_LOST_PROBES:
                 absolute_loss_paths += 1
 
-        for batch_key, current_points in _group_by_path_port_batch(current_rows).items():
+        for batch_key, current_points in current_batches.items():
             regular = _loss_stats(current_points)
             df = _loss_stats(current_points, prefix="df_")
             if (

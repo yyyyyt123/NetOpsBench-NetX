@@ -92,9 +92,9 @@ class DetectorQueryMixin:
             + source_filter
             + f"  |> filter(fn: (r) => {fields})\n"
             '  |> keep(columns: ["_time", "_field", "_value", "src_ip", "dst_ip", '
-            '"src_name", "dst_name", "src_leaf", "dst_leaf", "path_type"])\n'
+            '"src_name", "dst_name", "src_leaf", "dst_leaf", "path_type", "plan_id"])\n'
             '  |> pivot(rowKey: ["_time", "src_ip", "dst_ip", "src_name", "dst_name", '
-            '"src_leaf", "dst_leaf", "path_type"], columnKey: ["_field"], valueColumn: "_value")\n'
+            '"src_leaf", "dst_leaf", "path_type", "plan_id"], columnKey: ["_field"], valueColumn: "_value")\n'
         )
         result = query_flux(
             self.influxdb_url,
@@ -147,10 +147,12 @@ class DetectorQueryMixin:
         return SnapshotQueryResult(status="ok", rows=rows)
 
     def _topology_filter(self) -> str:
-        if not self.topology_id:
-            return ""
-        safe = str(self.topology_id).replace("\\", "\\\\").replace('"', '\\"')
-        return f'  |> filter(fn: (r) => r.topology_id == "{safe}")\n'
+        filters = {"topology_id": self.topology_id, "plan_id": self.plan_id}
+        return "".join(
+            f'  |> filter(fn: (r) => r.{tag} == "{self._safe_flux_string(value)}")\n'
+            for tag, value in filters.items()
+            if value
+        )
 
     def _load_topology_metadata(self, metadata: dict) -> None:
         devices = metadata.get("devices", {}) if isinstance(metadata, dict) else {}

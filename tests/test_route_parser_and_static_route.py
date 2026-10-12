@@ -135,7 +135,7 @@ def test_build_fault_instance_static_route_targets_remote_client(tmp_path):
 
     episode = scenario["episode"]
     assert episode["target_device"] == "leaf1"
-    assert episode["metadata"]["target_ip"] == "192.168.102.2/32"
+    assert episode["metadata"]["target_ip"] == "192.168.2.2/32"
     assert episode["metadata"]["wrong_nexthop"] == "auto"
 
 
@@ -193,14 +193,14 @@ def test_inject_static_route_misconfig_auto_uses_topology_clients(monkeypatch):
     class Result:
         returncode = 0
         stderr = ""
-        stdout = "ip route 192.168.102.2/32 192.168.101.2\n"
+        stdout = "ip route 192.168.2.2/32 192.168.1.2\n"
 
     captured = []
 
     def fake_vtysh(device, commands):
         if commands == ["show running-config"]:
             return Result()
-        if commands == ["show ip route 192.168.102.2/32"]:
+        if commands == ["show ip route 192.168.2.2/32"]:
             return Result()
         captured.append((device, commands))
         return Result()
@@ -209,18 +209,18 @@ def test_inject_static_route_misconfig_auto_uses_topology_clients(monkeypatch):
 
     result = injector.inject_static_route_misconfig(
         device="leaf1",
-        target_ip="192.168.102.2/32",
+        target_ip="192.168.2.2/32",
         wrong_nexthop="auto",
     )
 
     assert result["success"] is True
-    assert result["wrong_nexthop"] == "192.168.101.2"
+    assert result["wrong_nexthop"] == "192.168.1.2"
     assert captured == [
         (
             "leaf1",
             [
                 "configure terminal",
-                "ip route 192.168.102.2/32 192.168.101.2",
+                "ip route 192.168.2.2/32 192.168.1.2",
                 "end",
                 "write memory",
             ],

@@ -8,9 +8,8 @@ import pytest
 import yaml
 
 from netopsbench.models import topology as topology_models
-from netopsbench.models.profiles import default_scale_registry
 from netopsbench.models.scenario import EpisodeSpec, ScenarioSpec
-from netopsbench.models.topology import Collector, Device, DeviceRole, Management, TopologyManifest
+from netopsbench.models.topology import TopologyManifest
 from netopsbench.platform.faults.specs import FaultSpec, create_fault_registry
 from netopsbench.platform.scenario import generator as scenario_generator
 from netopsbench.platform.scenario.executor import ScenarioExecutor
@@ -20,112 +19,66 @@ from netopsbench.platform.topology.generator import generate_topology
 
 
 def _minimal_canonical_topology() -> dict:
-    manifest = TopologyManifest(
-        topology_id="dcn",
-        name="dcn",
-        scale="xs",
-        family="clos",
-        management=Management(network="clab-dcn", ipv4_subnet="172.20.20.0/24"),
-        collector=Collector(ipv4="172.20.20.200"),
-        defaults=topology_models.TopologyDefaults(),
-        facts=topology_models.TopologyFacts(
-            num_spines=1,
-            num_leafs=1,
-            clients_per_attached_switch=1,
-            total_clients=0,
-            total_switches=2,
-        ),
-        routing=topology_models.RoutingMetadata(ecmp_hash_policy_by_role={DeviceRole.SPINE: 1, DeviceRole.LEAF: 1}),
-        devices=[
-            Device(name="spine1", role=DeviceRole.SPINE),
-            Device(name="leaf1", role=DeviceRole.LEAF),
-        ],
-        links=[],
-    )
-    return manifest.model_dump(mode="json")
+    from netopsbench.platform.topology.clos_builder import build_clos_plan
+    from netopsbench.platform.topology.config import TopologyConfig
+
+    return build_clos_plan(TopologyConfig(scale_name="xs")).manifest.model_dump(mode="json")
 
 
 def test_all_diagnostic_observation_durations_use_complete_pingmesh_window():
-    k12 = topology_models.PingmeshPolicy(
-        destination_batch_size=16,
-        rtt_port_pool_size=16,
-        rtt_ports_per_cycle=4,
-        cycle_interval_seconds=3,
-    )
-    manifest = TopologyManifest.model_validate(
-        {
-            **_minimal_canonical_topology(),
-            "facts": {
-                "clients_per_attached_switch": 2,
-                "total_clients": 144,
-                "total_switches": 180,
-            },
-            "pingmesh": k12.model_dump(),
-        }
-    )
+    from netopsbench.platform.topology.config import config_for_scale
+    from netopsbench.platform.topology.fat_tree_builder import build_fat_tree_plan
 
-    assert scenario_generator.diagnostic_observation_duration(20, manifest) == 114
-    assert scenario_generator.diagnostic_observation_duration(30, manifest) == 114
-    assert scenario_generator.diagnostic_observation_duration(90, manifest) == 114
-    assert scenario_generator.diagnostic_observation_duration(120, manifest) == 120
-
-    xlarge = manifest.model_copy(
-        update={
-            "facts": manifest.facts.model_copy(update={"total_clients": 128}),
-            "pingmesh": topology_models.PingmeshPolicy(
-                destination_batch_size=16,
-                rtt_port_pool_size=16,
-                rtt_ports_per_cycle=4,
-                cycle_interval_seconds=3,
-            ),
-        }
-    )
-    assert scenario_generator.diagnostic_observation_duration(30, xlarge) == 102
+    manifest = build_fat_tree_plan(config_for_scale("fat-tree-k12")).manifest
+    assert scenario_generator.diagnostic_observation_duration(20, manifest) == 42
+    assert scenario_generator.diagnostic_observation_duration(30, manifest) == 42
+    assert scenario_generator.diagnostic_observation_duration(90, manifest) == 90
 
 
 @pytest.mark.parametrize(
-    ("scale", "expected_window"),
+    "scale,expected_window",
     [
         ("xs", 7),
         ("small", 7),
         ("medium", 8),
-        ("large", 54),
-        ("xlarge", 102),
-        ("fat-tree-k8", 102),
-        ("fat-tree-k12", 114),
+        ("large", 30),
+        ("xlarge", 66),
+        ("fat-tree-k8", 42),
+        ("fat-tree-k12", 42),
+        ("fat-tree-k18", 42),
     ],
 )
 def test_builtin_scale_complete_windows_are_topology_derived(scale, expected_window):
-    profile = default_scale_registry().get(scale)
-    policy = topology_models.PingmeshPolicy(
-        destination_batch_size=profile.pingmesh_destination_batch_size,
-        rtt_port_pool_size=profile.pingmesh_rtt_port_pool_size,
-        rtt_ports_per_cycle=profile.pingmesh_rtt_ports_per_cycle,
-        cycle_interval_seconds=profile.pingmesh_cycle_interval_seconds,
-    )
+    from netopsbench.platform.topology.clos_builder import build_clos_plan
+    from netopsbench.platform.topology.config import TopologyConfig, config_for_scale
+    from netopsbench.platform.topology.fat_tree_builder import build_fat_tree_plan
 
-    assert policy.complete_window_seconds(profile.total_clients) == expected_window
-    assert max(30, policy.complete_window_seconds(profile.total_clients)) == (
-        expected_window if scale in {"large", "xlarge", "fat-tree-k8", "fat-tree-k12"} else 30
-    )
+    config = config_for_scale(scale)
+    manifest = (build_clos_plan if isinstance(config, TopologyConfig) else build_fat_tree_plan)(config).manifest
+    assert manifest.require_pingmesh_plan().settings.complete_window_seconds == expected_window
+    assert scenario_generator.diagnostic_observation_duration(30, manifest) == max(30, expected_window)
 
 
 def test_custom_pingmesh_policy_derives_complete_window_without_scale_name():
-    policy = topology_models.PingmeshPolicy(
-        destination_batch_size=10,
-        rtt_port_pool_size=12,
-        rtt_ports_per_cycle=3,
-        cycle_interval_seconds=3,
-    )
+    from netopsbench.platform.topology.clos_builder import build_clos_plan
+    from netopsbench.platform.topology.config import TopologyConfig
 
-    assert policy.coverage_epoch_seconds(41) == 48
-    assert policy.coverage_grace_seconds() == 6
-    assert policy.complete_window_seconds(41) == 54
+    policy = topology_models.PingmeshPolicy(
+        destination_batch_size=10, rtt_port_pool_size=12, rtt_ports_per_cycle=3, cycle_interval_seconds=3
+    )
+    manifest = build_clos_plan(TopologyConfig(num_leafs=42, scale_name="xs", pingmesh_policy=policy)).manifest
+    assert manifest.require_pingmesh_plan().settings.coverage_epoch_seconds == 60
+    assert manifest.require_pingmesh_plan().settings.complete_window_seconds == 66
 
 
 def test_executor_recovery_wait_covers_one_pingmesh_cycle(tmp_path):
     metadata = _minimal_canonical_topology()
     metadata["pingmesh"]["cycle_interval_seconds"] = 3
+    from netopsbench.platform.pingmesh.planner import compile_pingmesh_plan
+
+    manifest = TopologyManifest.model_validate(metadata)
+    manifest.pingmesh_plan = compile_pingmesh_plan(manifest)
+    metadata = manifest.model_dump(mode="json")
 
     runner = ScenarioExecutor(
         topology_dir=str(tmp_path),
@@ -224,7 +177,7 @@ def test_parse_scenario_preserves_episode_parameters(tmp_path):
                     "duration_seconds": 10,
                     "stabilization_time": 1,
                     "parameters": {
-                        "target_ip": "192.168.102.2/32",
+                        "target_ip": "192.168.2.2/32",
                         "wrong_nexthop": "auto",
                     },
                 },
@@ -237,7 +190,7 @@ def test_parse_scenario_preserves_episode_parameters(tmp_path):
 
     assert scenario.episode.fault_type == "static_route_misconfig"
     assert scenario.episode.parameters == {
-        "target_ip": "192.168.102.2/32",
+        "target_ip": "192.168.2.2/32",
         "wrong_nexthop": "auto",
     }
     assert validate_scenario(scenario) == []
@@ -397,7 +350,7 @@ def test_validate_scenario_topology_rejects_legacy_grouped_topology(tmp_path):
         episode=EpisodeSpec(episode_id="diagnosis", fault_type="none"),
     )
 
-    with pytest.raises(ValueError, match="schema_version.*3.*Regenerate"):
+    with pytest.raises(ValueError, match="schema_version.*4.*Regenerate"):
         validate_scenario_topology(scenario, str(topology_dir))
 
 
@@ -455,9 +408,13 @@ def _xlarge_topology_context(tmp_path):
 
 
 def _pingmesh_destination_names(topo, src_leaf: str) -> set[str]:
-    clients = topo.manifest.clients()
-    sources = [client for client in clients if client.attached_switch == src_leaf]
-    return {destination.name for source in sources for destination in clients if destination.name != source.name}
+    sources = {client.name for client in topo.manifest.clients() if client.attached_switch == src_leaf}
+    return {
+        destination
+        for client in topo.manifest.require_pingmesh_plan().clients
+        if client.name in sources
+        for destination in client.targets
+    }
 
 
 def _client_for_prefix(topo, prefix: str) -> dict:

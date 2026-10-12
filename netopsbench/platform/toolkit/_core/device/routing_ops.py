@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import subprocess
 
 from netopsbench.logging_utils import get_logger
@@ -204,17 +205,14 @@ class RoutingOpsMixin:
             if not is_network_device_name(device):
                 return ToolResult(success=False, data=None, error=f"Device {device} does not support running-config")
             container = self._resolve_container(device)
-            if section:
-                import re
-
-                safe_section = re.sub(r"[^a-zA-Z0-9 _-]", "", section)
-                cmd = f"show running-config | section {safe_section}"
-            else:
-                cmd = "show running-config"
-            result = self._docker_exec(container, ["vtysh", "-c", cmd], timeout=30)
+            result = self._docker_exec(container, ["vtysh", "-c", "show running-config"], timeout=30)
             if result.returncode != 0:
                 return ToolResult(success=False, data=None, error=result.stderr)
-            config_text, config_meta = truncate_text_lines(result.stdout, max_lines)
+            text = result.stdout
+            if section:
+                blocks = re.split(r"(?m)^!\s*$", text)
+                text = "\n!\n".join(block.strip("\n") for block in blocks if section.lower() in block.lower())
+            config_text, config_meta = truncate_text_lines(text, max_lines)
             return ToolResult(
                 success=True,
                 data={

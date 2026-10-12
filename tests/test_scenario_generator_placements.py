@@ -53,7 +53,7 @@ def test_large_campaign_uses_complete_pingmesh_window(tmp_path):
     _topology, rows = _generate_default("large", tmp_path)
 
     assert len(rows) == 52
-    assert {row["episode"]["duration_seconds"] for row in rows} == {54}
+    assert {row["episode"]["duration_seconds"] for row in rows} == {30}
 
 
 @pytest.mark.parametrize("scale", ["xlarge", "fat-tree-k8", "fat-tree-k12"])

@@ -373,6 +373,17 @@ def _pick_client_for_route_fault(
         remote = [c for c in candidates if _client_leaf(c) != excluded_leaf]
         if remote:
             candidates = remote
+        sources = {client.name for client in topo.manifest.clients() if client.attached_switch == excluded_leaf}
+        if sources:
+            planned = {
+                destination
+                for client in topo.manifest.require_pingmesh_plan().clients
+                if client.name in sources
+                for destination in client.targets
+            }
+            candidates = [client for client in candidates if client["name"] in planned]
+            if not candidates:
+                raise ValueError(f"No planned remote Pingmesh destination for {excluded_leaf}")
     return rng.choice(candidates)
 
 
@@ -609,7 +620,7 @@ FAULT_SCENARIO_BUILDERS: dict[str, FaultScenarioBuilder] = {
 
 def diagnostic_observation_duration(base_duration: int, manifest: TopologyManifest) -> int:
     """Return one complete Pingmesh epoch plus topology-derived ingestion grace."""
-    complete_seconds = manifest.pingmesh.complete_window_seconds(manifest.facts.total_clients)
+    complete_seconds = manifest.require_pingmesh_plan().settings.complete_window_seconds
     return max(base_duration, complete_seconds)
 
 
@@ -646,6 +657,7 @@ def build_fault_instance(
             "topology_scale": topo.scale,
             "traffic_profile": "standard",
             "metadata": {
+                "negative_sample": True,
                 "difficulty": difficulty,
                 "generator": {
                     "seed": defaults.get("seed"),

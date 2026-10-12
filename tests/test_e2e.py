@@ -168,12 +168,12 @@ class TestTopologyGeneration:
             assert metadata["management"]["ipv4_subnet"] == "172.20.20.0/23"
             assert metadata["scale"]["num_spines"] == 16
             assert metadata["scale"]["num_leafs"] == 128
-            assert metadata["scale"]["clients_per_leaf"] == 1
-            assert metadata["scale"]["total_clients"] == 128
+            assert metadata["scale"]["clients_per_leaf"] == 2
+            assert metadata["scale"]["total_clients"] == 256
             assert metadata["pingmesh"]["destination_batch_size"] == 16
 
             mgmt_ips = {item["mgmt_ip"] for role in ("spines", "leafs", "clients") for item in devices[role]}
-            assert len(mgmt_ips) == 16 + 128 + 128
+            assert len(mgmt_ips) == 16 + 128 + 256
             assert metadata["collector"]["ipv4"] not in mgmt_ips
 
             spine16_config = json.loads(
@@ -200,12 +200,12 @@ class TestTopologyGeneration:
             assert "eth1:1,2,3,4" in spine16_lanemap
             assert "eth128:509,510,511,512" in spine16_lanemap
             assert len([line for line in spine16_lanemap.splitlines() if line.startswith("eth")]) == 128
-            assert len([key for key in leaf128_config["INTERFACE"] if "|" not in key]) == 17
+            assert len([key for key in leaf128_config["INTERFACE"] if "|" not in key]) == 18
             assert leaf128_config["INTERFACE"]["Ethernet60|10.16.128.2/30"] == {}
-            assert leaf128_config["INTERFACE"]["Ethernet64|192.168.228.1/30"] == {}
-            assert "network 192.168.228.0/30 route-map RM-ALLOW" in leaf128_frr
+            assert leaf128_config["INTERFACE"]["Ethernet64|192.168.128.1/30"] == {}
+            assert "network 192.168.128.0/30 route-map RM-ALLOW" in leaf128_frr
             leaf128_lanemap = Path(tmpdir, "configs", "sonic", "leaf128", "lanemap.ini").read_text(encoding="utf-8")
-            assert len([line for line in leaf128_lanemap.splitlines() if line.startswith("eth")]) == 17
+            assert len([line for line in leaf128_lanemap.splitlines() if line.startswith("eth")]) == 18
 
     def test_structured_startup_artifacts_drive_scenario_parsers(self):
         """Scenario parsers should use generated ConfigDB and FRR artifacts as the normal path."""
@@ -291,10 +291,10 @@ class TestClientAgentConfig:
             second = build_client_agent_config(manifest)
 
             assert first == second
-            assert len(first["clients"]) == 128
-            assert len(json.dumps(first).encode()) < 100_000
-            assert first["pingmesh_policy"]["destination_batch_size"] == 16
-            assert first["pingmesh_policy"]["coverage_epoch_cycles"] == 32
+            assert len(first["clients"]) == 256
+            assert len(json.dumps(first).encode()) < 150_000
+            assert first["pingmesh_plan"]["destination_batch_size"] == 16
+            assert first["pingmesh_plan"]["coverage_epoch_cycles"] == 20
 
 
 class TestFastMCPServer:

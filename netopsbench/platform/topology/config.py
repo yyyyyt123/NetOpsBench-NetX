@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
 
@@ -15,9 +16,8 @@ DEFAULT_SONIC_VS_IMAGE = (
     "yyyyyt123/netopsbench-sonic-vs-202505-telemetry"
     "@sha256:0e039d2fea3f85788f15db8ebad27cf5bd5b2cdaf17e8c31eab852021e23ea73"
 )
-DEFAULT_CLIENT_IMAGE = (
-    "docker.io/yyyyyt123/netopsbench-client" "@sha256:8c3c2997cac3796f9145a5a88f038a86c026972fa5594e157c7d7c323bd9dbd7"
-)
+DEFAULT_CLIENT_IMAGE = "netopsbench-client:pingmesh-v2"
+
 SONIC_PLATFORM = "x86_64-kvm_x86_64-r0"
 SONIC_HWSKU = "Force10-S6000"
 SONIC_HWSKU_PATH = f"/usr/share/sonic/device/{SONIC_PLATFORM}/{SONIC_HWSKU}"
@@ -47,7 +47,7 @@ class TopologyConfig:
     clients_per_leaf: int = 1
     nos_kind: str = "sonic-vs"
     nos_image: str = DEFAULT_SONIC_VS_IMAGE
-    client_image: str = DEFAULT_CLIENT_IMAGE
+    client_image: str = field(default_factory=lambda: os.environ.get("NETOPSBENCH_CLIENT_IMAGE", DEFAULT_CLIENT_IMAGE))
     mgmt_ipv4_subnet: str = "172.20.20.0/24"
     mgmt_network_name: str | None = None
     collector_ip: str | None = None
@@ -65,13 +65,11 @@ class FatTreeConfig:
     name: str = "dcn"
     nos_kind: str = "sonic-vs"
     nos_image: str = DEFAULT_SONIC_VS_IMAGE
-    client_image: str = DEFAULT_CLIENT_IMAGE
+    client_image: str = field(default_factory=lambda: os.environ.get("NETOPSBENCH_CLIENT_IMAGE", DEFAULT_CLIENT_IMAGE))
     mgmt_ipv4_subnet: str = "172.20.20.0/24"
     mgmt_network_name: str | None = None
     collector_ip: str | None = None
-    core_asn_start: int = 65001
-    agg_asn_start: int = 65101
-    edge_asn_start: int = 65201
+    asn_base: int = 65001
     clients_per_edge: int | None = None
     scale_name: str | None = None
     pingmesh_policy: PingmeshPolicy | None = None

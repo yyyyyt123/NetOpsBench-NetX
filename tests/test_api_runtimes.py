@@ -171,7 +171,7 @@ def test_same_scale_runtime_identities_are_isolated_and_persisted(tmp_path):
     assert first_identity.mgmt_network == "clab-mgmt-run-a"
 
     payload = json.loads((first.root_dir / "runtime.json").read_text(encoding="utf-8"))
-    assert payload["schema_version"] == "3"
+    assert payload["schema_version"] == "4"
     assert payload["scale_registry_sha256"] == manager.scale_registry.digest
     assert payload["scale_profile_sha256"] == manager.scale_registry.get("xlarge").digest
     assert payload["resolved_scale_profile"]["name"] == "xlarge"
@@ -318,7 +318,7 @@ def test_k12_worker_deploy_uses_profile_containerlab_parallelism(tmp_path, monke
     deployment.deploy_worker_lab(worker, "fat-tree-k12")
 
     deploy_command = next(command for command in commands if "containerlab" in command and "deploy" in command)
-    assert deploy_command[-2:] == ["--max-workers", "1"]
+    assert deploy_command[-2:] == ["--max-workers", "16"]
 
 
 def test_removed_containerlab_env_does_not_override_scale_profile(tmp_path, monkeypatch):
@@ -348,7 +348,7 @@ def test_removed_containerlab_env_does_not_override_scale_profile(tmp_path, monk
     deployment.deploy_worker_lab(worker, "fat-tree-k12")
 
     deploy_command = next(command for command in commands if "containerlab" in command and "deploy" in command)
-    assert deploy_command[-2:] == ["--max-workers", "1"]
+    assert deploy_command[-2:] == ["--max-workers", "16"]
 
 
 def test_management_subnet_allocation_batches_docker_inspection(monkeypatch):

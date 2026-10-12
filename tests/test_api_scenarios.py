@@ -86,7 +86,16 @@ def test_scenario_manager_rejects_nonstandard_traffic_profile(tmp_path, profile)
 def test_supported_scales_are_available_from_public_sdk():
     from netopsbench.sdk import supported_scales
 
-    assert supported_scales() == ("xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12")
+    assert supported_scales() == (
+        "xs",
+        "small",
+        "medium",
+        "large",
+        "xlarge",
+        "fat-tree-k8",
+        "fat-tree-k12",
+        "fat-tree-k18",
+    )
 
 
 def test_scenario_validation_uses_fault_registry(tmp_path):

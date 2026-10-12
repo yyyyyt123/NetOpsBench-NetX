@@ -1,3 +1,4 @@
+import json
 import subprocess
 import time
 from pathlib import Path
@@ -7,40 +8,34 @@ from netopsbench.platform.runtime import health
 from netopsbench.platform.topology.topology_utils import coerce_topology_manifest
 
 
+def test_k18_expectations_distinguish_client_links_and_bgp_fabric():
+    from netopsbench.platform.topology.config import config_for_scale
+    from netopsbench.platform.topology.fat_tree_builder import build_fat_tree_plan
+
+    topo = build_fat_tree_plan(config_for_scale("fat-tree-k18")).manifest
+    counts = health.expected_network_counts(topo)
+    assert counts["core81"] == {"active_interfaces": 18, "bgp_neighbors": 18}
+    assert counts["agg162"] == {"active_interfaces": 18, "bgp_neighbors": 18}
+    assert counts["edge162"] == {"active_interfaces": 11, "bgp_neighbors": 9}
+    assert counts["client324"] == {"active_interfaces": 1, "bgp_neighbors": 0}
+    assert sum(row["bgp_neighbors"] for row in counts.values()) == 5832
+    assert sum(row["active_interfaces"] for row in counts.values()) == 6480
+
+
 def _canonical_topology_dict(*, scale: str, spines: int, leafs: int, clients: int) -> dict:
-    devices = [
-        *[{"name": f"spine{i}", "role": "spine", "mgmt_ip": f"172.20.20.{10 + i}"} for i in range(1, spines + 1)],
-        *[{"name": f"leaf{i}", "role": "leaf", "mgmt_ip": f"172.20.20.{10 + spines + i}"} for i in range(1, leafs + 1)],
-        *[
-            {
-                "name": f"client{i}",
-                "role": "client",
-                "attached_switch": f"leaf{((i - 1) % leafs) + 1}",
-                "data_ip": f"192.168.{100 + i}.2",
-            }
-            for i in range(1, clients + 1)
-        ],
-    ]
-    return {
-        "schema_version": "3",
-        "topology_id": scale,
-        "name": scale,
-        "scale": scale,
-        "family": "clos",
-        "management": {"network": f"clab-{scale}", "ipv4_subnet": "172.20.20.0/23"},
-        "collector": {"ipv4": "172.20.20.200"},
-        "defaults": {"link_mtu": 9232, "sonic_port_mtu": 9100},
-        "facts": {
-            "num_spines": spines,
-            "num_leafs": leafs,
-            "clients_per_attached_switch": 1,
-            "total_clients": clients,
-            "total_switches": spines + leafs,
-        },
-        "routing": {"ecmp_hash_policy_by_role": {"spine": 1, "leaf": 1}},
-        "devices": devices,
-        "links": [],
-    }
+    from netopsbench.platform.topology.clos_builder import build_clos_plan
+    from netopsbench.platform.topology.config import TopologyConfig
+
+    return build_clos_plan(
+        TopologyConfig(
+            name=scale,
+            scale_name=scale,
+            num_spines=spines,
+            num_leafs=leafs,
+            clients_per_leaf=clients // leafs,
+            mgmt_ipv4_subnet="172.20.20.0/23",
+        )
+    ).manifest.model_dump(mode="json")
 
 
 def _runtime_identity(topology_dir: Path, name: str) -> RuntimeIdentity:
@@ -57,17 +52,18 @@ def _runtime_identity(topology_dir: Path, name: str) -> RuntimeIdentity:
 
 
 def test_active_interface_parser_exposes_incomplete_xlarge_spine():
-    topo = _canonical_topology_dict(scale="xlarge", spines=16, leafs=128, clients=128)
+    topo = coerce_topology_manifest(_canonical_topology_dict(scale="xlarge", spines=16, leafs=128, clients=256))
     output = "\n".join(f"Ethernet{idx * 4} 1,2,3,4 100G 9100 N/A up up QSFP" for idx in range(32))
 
     active = health._parse_active_interfaces(output)
     assert len(active) == 32
-    assert health._expected_active_interface_count(topo, "spine1") == 128
-    assert health._expected_active_interface_count(topo, "leaf128") == 17
+    counts = health.expected_network_counts(topo)
+    assert counts["spine1"]["active_interfaces"] == 128
+    assert counts["leaf128"]["active_interfaces"] == 18
 
 
 def test_deployment_convergence_checks_every_routing_device():
-    topo = coerce_topology_manifest(_canonical_topology_dict(scale="xlarge", spines=16, leafs=128, clients=128))
+    topo = coerce_topology_manifest(_canonical_topology_dict(scale="xlarge", spines=16, leafs=128, clients=256))
 
     assert len(health._convergence_targets(topo, all_routing_devices=True)) == 144
     assert len(health._convergence_targets(topo, all_routing_devices=False)) == 3
@@ -83,16 +79,17 @@ def test_fat_tree_sparse_expected_active_interface_counts():
         generate_topology("fat-tree-k12", raw_dir)
         topo = load_topology_manifest(raw_dir)
 
-        assert health._expected_active_interface_count(topo, "core1") == 12
-        assert health._expected_active_interface_count(topo, "agg1") == 12
-        assert health._expected_active_interface_count(topo, "edge72") == 8
+        counts = health.expected_network_counts(topo)
+        assert counts["core1"]["active_interfaces"] == 12
+        assert counts["agg1"]["active_interfaces"] == 12
+        assert counts["edge72"]["active_interfaces"] == 8
 
 
 def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, monkeypatch):
     from netopsbench.platform.observability import influxdb, validation
     from netopsbench.platform.topology.generator import generate_topology
 
-    generate_topology("xs", str(tmp_path), name="health-xs")
+    metadata = generate_topology("xs", str(tmp_path), name="health-xs")["metadata"]
 
     monkeypatch.setattr(
         health,
@@ -101,9 +98,28 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
     )
     monkeypatch.setattr(health, "_running_container_count", lambda _lab_name: 6)
 
+    exec_calls = []
+
     def fake_docker_exec(_container, *command, **_kwargs):
+        exec_calls.append(command)
         joined = " ".join(command)
-        if "show ip bgp summary" in joined:
+        if command[:2] == ("python3", "-c"):
+            output = json.dumps(
+                {
+                    "version": 1,
+                    "checks": {
+                        "bgp": {
+                            "returncode": 0,
+                            "stdout": fake_docker_exec(_container, "vtysh", "-c", "show ip bgp summary").stdout,
+                        },
+                        "interfaces": {
+                            "returncode": 0,
+                            "stdout": fake_docker_exec(_container, "bash", "-lc", "show interfaces status").stdout,
+                        },
+                    },
+                }
+            )
+        elif "show ip bgp summary" in joined:
             output = "".join(f"10.0.0.{index} 4 65001 0 0 0 0 0 00:10:00 1\n" for index in range(1, 5))
         elif "show interfaces status" in joined:
             output = "".join(f"Ethernet{index * 4} 1,2,3,4 100G 9100 N/A up up QSFP\n" for index in range(4))
@@ -121,14 +137,19 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
             "status": {
                 "ready": True,
                 "heartbeat_unix_ns": time.time_ns(),
+                "plan_id": metadata["pingmesh_plan"]["settings"]["plan_id"],
+                "config_schema_version": 2,
             },
         },
     )
     attempts = []
 
     def fake_check_observability(*_args, **_kwargs):
-        attempts.append(1)
-        return ["collector has not written its first sample"] if len(attempts) == 1 else []
+        check = next(iter(_kwargs["checks"]))
+        attempts.append(check)
+        return (
+            ["collector has not written its first sample"] if check == "syslog" and attempts.count(check) == 1 else []
+        )
 
     monkeypatch.setattr(validation, "check_observability", fake_check_observability)
     monkeypatch.setattr(
@@ -142,4 +163,6 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
     )
 
     assert errors == []
-    assert len(attempts) == 2
+    assert "logger -n" in " ".join(exec_calls[0])
+    assert sum(c == ("bash", "-lc", "show interfaces status") for c in exec_calls) == 3
+    assert sorted(attempts) == ["bgp", "interfaces", "pingmesh", "syslog", "syslog"]

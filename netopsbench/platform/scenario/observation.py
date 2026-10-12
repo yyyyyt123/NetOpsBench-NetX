@@ -22,7 +22,7 @@ def _utc_iso(dt: datetime) -> str:
 def complete_window_seconds(runner) -> int:
     """Return the topology-derived complete Pingmesh observation window."""
     manifest = coerce_topology_manifest(runner.topology_metadata)
-    return manifest.pingmesh.complete_window_seconds(manifest.facts.total_clients)
+    return manifest.require_pingmesh_plan().settings.complete_window_seconds
 
 
 def baseline_window_seconds(runner, minimum_seconds: int) -> int:
@@ -43,6 +43,7 @@ def capture_observation_window(runner, duration: int, *, name: str = "window") -
     end_time = datetime.now(UTC).replace(microsecond=0)
     return {
         "name": name,
+        "plan_id": runner.topology_metadata["pingmesh_plan"]["settings"]["plan_id"],
         "start_time": _utc_iso(start_time),
         "end_time": _utc_iso(end_time),
         "duration_seconds": safe_duration,
@@ -60,30 +61,19 @@ def capture_baseline_window(runner, minimum_seconds: int) -> dict:
 
 def baseline_gate_errors(observation: dict) -> list[str]:
     """Return absolute health failures for a candidate healthy Pingmesh window."""
-    errors: list[str] = []
-    if observation.get("data_source_status") != "ok":
-        errors.append(f"data={observation.get('data_source_status')}")
-    if observation.get("coverage_status") != "complete":
-        errors.append(f"coverage={observation.get('coverage_status')}")
-    baseline_coverage = observation.get("_baseline_coverage") or {}
-    if baseline_coverage.get("coverage_status") != "complete":
-        errors.append(f"baseline_coverage={baseline_coverage.get('coverage_status') or 'missing'}")
-
+    errors = observation_integrity_errors(observation)
     report = observation.get("pingmesh_metrics") or {}
     summary = report.get("summary") or {}
     quality = report.get("quality") or {}
     absolute_health = observation.get("_baseline_health") or quality
     current_paths = int(quality.get("current_paths_observed", 0) or 0)
     if current_paths <= 0:
-        errors.append("current_paths_observed=0")
         return errors
 
     exact_zero = {
         "absolute_unreachable_paths": int(absolute_health.get("absolute_unreachable_paths", 0) or 0),
         "latency_spikes": int(summary.get("latency_spikes", 0) or 0),
         "absolute_network_mtu_paths": int(absolute_health.get("absolute_network_mtu_paths", 0) or 0),
-        "local_df_mtu_drops": int(quality.get("local_df_mtu_drops", 0) or 0),
-        "local_probe_errors": int(quality.get("local_probe_errors", 0) or 0),
     }
     errors.extend(f"{name}={value}" for name, value in exact_zero.items() if value)
 

@@ -49,6 +49,7 @@ class ManagementProfile(BaseModel):
 
 
 class PingmeshProfile(BaseModel):
+    cross_rack_pairs: int | None = Field(default=None, gt=0)
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     destination_batch_size: int | None = Field(default=None, gt=0)
@@ -196,7 +197,7 @@ class ScaleProfile(BaseModel):
 class ScaleProfileDocument(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1"] = "1"
+    schema_version: Literal["2"] = "2"
     override: bool = False
     profiles: list[ScaleProfile]
 

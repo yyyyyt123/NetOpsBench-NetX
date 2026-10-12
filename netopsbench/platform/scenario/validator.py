@@ -144,7 +144,7 @@ def validate_scenario_topology(scenario, topology_dir: str) -> dict:
             f"actual='{actual_scale}'. Use matching scenario files or redeploy the topology."
         )
 
-    required_duration = manifest.pingmesh.complete_window_seconds(manifest.facts.total_clients)
+    required_duration = manifest.require_pingmesh_plan().settings.complete_window_seconds
     if scenario.episode.duration_seconds < required_duration:
         errors.append(
             f"[scenario={scenario.scenario_id} episode={scenario.episode.episode_id}] "

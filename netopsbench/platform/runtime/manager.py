@@ -56,7 +56,7 @@ class RuntimePool:
         """Return the canonical serializable runtime description."""
         profile = self.scale_registry.get(self.scale)
         return {
-            "schema_version": "3",
+            "schema_version": "4",
             "id": self.id,
             "name": self.name,
             "scale": self.scale,
@@ -311,7 +311,7 @@ class RuntimeManager:
             raise
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeMetadataError(f"Unable to read runtime metadata {metadata_path}: {exc}") from exc
-        if payload.get("schema_version") != "3":
+        if payload.get("schema_version") != "4":
             raise RuntimeMetadataError(
                 "Unsupported runtime.json schema; recreate the runtime with the current RuntimeManager"
             )
@@ -342,7 +342,7 @@ class RuntimeManager:
             }
         except (KeyError, TypeError, ValidationError, ValueError) as exc:
             raise RuntimeMetadataError(
-                f"Invalid schema-v3 runtime metadata in {metadata_path}; recreate the runtime: {exc}"
+                f"Invalid schema-v4 runtime metadata in {metadata_path}; recreate the runtime: {exc}"
             ) from exc
         return RuntimePool(
             id=str(payload["id"]),

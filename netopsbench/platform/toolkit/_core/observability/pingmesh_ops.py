@@ -8,6 +8,16 @@ from ..common import ToolResult
 
 
 class PingmeshOpsMixin:
+    def _pingmesh_plan_filter(self) -> str:
+        plan_id = self.manifest.require_pingmesh_plan().settings.plan_id
+        filters = {"topology_id": self.topology_id, "plan_id": plan_id}
+        clauses = []
+        for tag, value in filters.items():
+            if value:
+                safe = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                clauses.append(f'  |> filter(fn: (r) => r.{tag} == "{safe}")\n')
+        return "".join(clauses)
+
     def get_pingmesh_summary(
         self,
         time_range_minutes: int = 10,
@@ -20,10 +30,7 @@ class PingmeshOpsMixin:
                 start_time=start_time,
                 end_time=end_time,
             )
-            topology_filter = ""
-            if self.topology_id:
-                safe = str(self.topology_id).replace("\\", "\\\\").replace('"', '\\"')
-                topology_filter = f'  |> filter(fn: (r) => r.topology_id == "{safe}")\n'
+            topology_filter = self._pingmesh_plan_filter()
             query = f"""
 from(bucket: "{self.influxdb_bucket}")
 {time_scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "pingmesh")
@@ -47,6 +54,7 @@ from(bucket: "{self.influxdb_bucket}")
             return ToolResult(
                 success=True,
                 data={
+                    "plan_id": self.manifest.require_pingmesh_plan().settings.plan_id,
                     "time_scope": {key: value for key, value in time_scope.items() if key != "range_clause"},
                     "path_type_summary": summary,
                     "rows": rows,
@@ -71,10 +79,7 @@ from(bucket: "{self.influxdb_bucket}")
                 end_time=end_time,
             )
             safe_limit = max(1, min(int(limit), 50))
-            topology_filter = ""
-            if self.topology_id:
-                safe = str(self.topology_id).replace("\\", "\\\\").replace('"', '\\"')
-                topology_filter = f'  |> filter(fn: (r) => r.topology_id == "{safe}")\n'
+            topology_filter = self._pingmesh_plan_filter()
             query = f"""
 from(bucket: "{self.influxdb_bucket}")
 {time_scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "pingmesh")
@@ -102,6 +107,7 @@ from(bucket: "{self.influxdb_bucket}")
             return ToolResult(
                 success=True,
                 data={
+                    "plan_id": self.manifest.require_pingmesh_plan().settings.plan_id,
                     "time_scope": {key: value for key, value in time_scope.items() if key != "range_clause"},
                     "limit": safe_limit,
                     "hotspots": hotspots,

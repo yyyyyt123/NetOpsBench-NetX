@@ -29,9 +29,10 @@ Pingmesh endpoint density.
 | Small | CLOS | 2 spine + 4 leaf | 8 |
 | Medium | CLOS | 4 spine + 8 leaf | 16 |
 | Large | CLOS | 4 spine + 16 leaf | 64 |
-| Xlarge | CLOS | 16 spine + 128 leaf | 128 |
+| Xlarge | CLOS | 16 spine + 128 leaf | 256 |
 | Fat-tree K=8 | Fat-tree | 16 core + 32 aggregation + 32 edge | 128 |
 | Fat-tree K=12 | Fat-tree | 36 core + 72 aggregation + 72 edge | 144 |
+| Fat-tree K=18 | Fat-tree | 81 core + 162 aggregation + 162 edge | 324 |
 
 The benchmark covers twelve canonical fault types:
 
@@ -54,6 +55,7 @@ Each scale combines fault cases with healthy negative samples:
 | Xlarge | 66 | 4 | 70 |
 | Fat-tree K=8 | 66 | 4 | 70 |
 | Fat-tree K=12 | 66 | 4 | 70 |
+| Fat-tree K=18 | 66 | 4 | 70 |
 
 Scenarios are generated from the packaged canonical campaign spec. Running `netopsbench benchmark prepare --scales <scale>` materializes YAML files under `scenarios/generated/<scale>/`; `--spec` can select a custom campaign.
 
@@ -72,10 +74,19 @@ The canonical packet-loss campaign applies 30% loss on one selected egress
 member. On redundant fabrics, ECMP can dilute the endpoint-visible symptom;
 the benchmark reports only the evidence actually measured and does not lower
 detector thresholds to force an anomaly. Large profiles use a three-second
-probe cycle so complete ECMP coverage is spread over 102 seconds (xlarge/K8)
-or 114 seconds (K12) instead of being emitted in a host-scheduling burst.
+probe interval. Their fixed offline schedules require 66-second complete windows
+for Xlarge and 42 seconds for K8/K12/K18. Every rack pair participates; same-rack
+clients form a complete directed mesh, while cross-rack tasks use deterministic
+client matching. Xlarge and K18 split each rack-pair task between two clients.
+The plan audits all directed links through candidate shortest-path DAGs, including
+access links. This is topology coverage; source ports sample ECMP without proving
+which kernel forwarding paths were selected. Runtime coverage checks the exact
+planned peer/port-batch set and filters by `plan_id`.
+Records with any local send error cannot satisfy that coverage requirement;
+network packet loss still counts as an executed probe.
 
 Background traffic must start its complete topology-derived flow matrix before the baseline is captured. A partial matrix is an infrastructure-invalid case, rather than a degraded observation presented to the agent.
+The profile's per-client PPS value is a hard ceiling. A smaller switch budget can reduce it; a larger switch budget cannot increase it. Xlarge and K18 cap background traffic at 50 PPS per client.
 The baseline is also invalid when coverage is incomplete, any path is
 unreachable, latency or network-MTU anomalies exist, or an unexplained local DF
 probe error occurs. A DF-only local send error is treated as a consequence of

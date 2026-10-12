@@ -36,7 +36,7 @@ def _max_pps_per_client(scale: str, switch_pps_limit: int | None, registry: Scal
     base = get_scale_profile(scale, registry).traffic_max_pps_per_client
     if switch_pps_limit is None:
         return base
-    return max(1, int(round(base * switch_pps_limit / BASE_SWITCH_PPS_LIMIT)))
+    return min(base, max(1, int(round(base * switch_pps_limit / BASE_SWITCH_PPS_LIMIT))))
 
 
 def _standard_bandwidths(max_pps_per_client: int) -> dict[str, str]:
