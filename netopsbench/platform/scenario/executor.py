@@ -29,6 +29,7 @@ from netopsbench.platform.traffic.controller import TrafficController
 from netopsbench.platform.traffic.scenario_execution import setup_traffic as _setup_traffic_impl
 from netopsbench.platform.traffic.scenario_execution import stop_traffic as _stop_traffic_impl
 
+from .baseline import BaselineHandoff, runtime_scope
 from .incident_backend import ExecutorIncidentBackend
 from .observation import analyze_observation_windows as _analyze_observation_windows_impl
 from .observation import capture_baseline_window as _capture_baseline_window_impl
@@ -88,6 +89,10 @@ class ScenarioExecutor:
         if metadata is None:
             raise ValueError(f"Canonical topology metadata is required for ScenarioExecutor: {topology_dir}")
         manifest = coerce_topology_manifest(metadata)
+        self.manifest = manifest
+        self._manifest_file_stamp = self._topology_file_stamp()
+        self._detector = None
+        self._detector_scope = None
         self.fault_registry = fault_registry or create_fault_registry()
         self.scale_registry = scale_registry or default_scale_registry()
         self.scale_registry.get(manifest.scale)
@@ -110,23 +115,75 @@ class ScenarioExecutor:
             manifest.pingmesh.cycle_interval_seconds,
         )
         self._sleep_fn = sleep_fn or time.sleep
+        self._cancel_event = None
+        self._recovering = False
         self.evaluator = evaluator or Evaluator()
         self.runtime_worker = runtime_worker
+        self._baseline_handoff = BaselineHandoff()
+        self._healthy_baseline_candidate: dict | None = None
+
+    def _topology_file_stamp(self):
+        path = Path(self.topology_dir) / "topology.json"
+        if not path.exists():
+            return None
+        stat = path.stat()
+        return stat.st_ino, stat.st_mtime_ns, stat.st_size
+
+    def current_manifest(self):
+        """Reload changed topology artifacts without reparsing every window."""
+        stamp = self._topology_file_stamp()
+        if stamp != self._manifest_file_stamp:
+            manifest = load_topology_manifest(self.topology_dir)
+            if manifest.topology_id != self.topology_id:
+                raise ValueError("Executor topology identity changed; create a new executor")
+            self.manifest = manifest
+            self.topology_metadata = manifest.model_dump(mode="json")
+            self._manifest_file_stamp = stamp
+            self._baseline_handoff.clear()
+        return self.manifest
 
     def sleep(self, seconds: float) -> None:
+        self._check_cancelled()
         self._sleep_fn(seconds)
+        self._check_cancelled()
+
+    def _check_cancelled(self) -> None:
+        if not self._recovering and self._cancel_event is not None and self._cancel_event.is_set():
+            raise RuntimeError("scenario cancelled")
 
     def _setup_traffic(self, scale: str, profile: str) -> dict:
-        return _setup_traffic_impl(self, scale, profile)
+        self._traffic_config = _setup_traffic_impl(self, scale, profile)
+        return self._traffic_config
 
     def _stop_traffic(self):
         _stop_traffic_impl(self)
 
     def close(self) -> None:
         """Release runtime-owned traffic after the worker or simulator is done."""
+        if handoff := getattr(self, "_baseline_handoff", None):
+            handoff.clear()
         self._stop_traffic()
 
+    def _baseline_scope(self, scenario: ScenarioSpec) -> str | None:
+        try:
+            return runtime_scope(self, scenario)
+        except Exception as exc:
+            logger.warning("Baseline handoff disabled: %s", type(exc).__name__)
+            return None
+
+    def _offer_healthy_window(self, observation: dict) -> None:
+        from .observation import baseline_gate_errors
+
+        absolute = observation.get("_baseline_health") or {}
+        required = {"absolute_unreachable_paths", "absolute_packet_loss_paths", "absolute_network_mtu_paths"}
+        if required <= absolute.keys() and not baseline_gate_errors(observation):
+            self._healthy_baseline_candidate = {
+                "name": "baseline",
+                **{key: observation[key] for key in ("start_time", "end_time", "duration_seconds")},
+            }
+
     def _inject_fault(self, episode: EpisodeSpec) -> dict:
+        self._check_cancelled()
         return _inject_fault_impl(self, episode)
 
     def _wait_and_observe(
@@ -194,7 +251,7 @@ class ScenarioExecutor:
                     recovery_complete = self._recovery_results_succeeded(recovery_results) and not active_faults
                     if not recovery_complete:
                         errors.append(
-                            f"fault_recovery: remaining_faults={len(active_faults)} " f"results={recovery_results!r}"
+                            f"fault_recovery: remaining_faults={len(active_faults)} results={recovery_results!r}"
                         )
                         terminal_recovery_failure = self._recovery_has_terminal_failure(recovery_results)
                 except Exception as exc:  # noqa: BLE001 - bounded retry records the failure
@@ -205,7 +262,7 @@ class ScenarioExecutor:
                 if recovery_attempted and recovery_results and not post_recovery_waited:
                     post_recovery_wait = getattr(self, "post_recovery_wait_seconds", 0)
                     if post_recovery_wait:
-                        self.sleep(post_recovery_wait)
+                        self.sleep(min(post_recovery_wait, max(0, deadline - monotonic())))
                     post_recovery_waited = True
                 convergence_errors: list[str] = []
                 controller = getattr(self, "traffic_controller", None)
@@ -220,6 +277,7 @@ class ScenarioExecutor:
                             runtime_worker,
                             scale_registry=self.scale_registry,
                             all_routing_devices=True,
+                            deadline=deadline,
                         )
                     )
                 if convergence_errors:
@@ -316,14 +374,14 @@ class ScenarioExecutor:
         Returns:
             Scenario result dict
         """
-        logger.info(f"\n{'#'*70}")
+        logger.info(f"\n{'#' * 70}")
         logger.info(f"# Scenario: {scenario.name}")
         logger.info(f"# ID: {scenario.scenario_id}")
         logger.info(f"# Description: {scenario.description}")
         logger.info(f"# Topology: {scenario.topology_scale}")
         logger.info(f"# Traffic Profile: {scenario.traffic_profile}")
         logger.info("# Episode: 1")
-        logger.info(f"{'#'*70}")
+        logger.info(f"{'#' * 70}")
 
         scenario_result: dict[str, Any] = {
             "scenario_id": scenario.scenario_id,
@@ -337,6 +395,7 @@ class ScenarioExecutor:
         }
 
         incident = None
+        self._healthy_baseline_candidate = None
         backend = ExecutorIncidentBackend(self)
         try:
             from netopsbench.platform.incident.contracts import (
@@ -352,6 +411,7 @@ class ScenarioExecutor:
             )
 
             incident = IncidentEngine(lambda: backend, evaluator=self.evaluator).prepare(scenario)
+            scenario_result["baseline_preparation"] = backend.baseline_preparation
             scenario_result["traffic_config"] = backend.traffic_config
             scenario_result["episode"] = backend.episode_result
             if incident.state is IncidentState.BROKEN:
@@ -460,9 +520,9 @@ class ScenarioExecutor:
 
             scenario_result["end_time"] = datetime.now(UTC).isoformat()
 
-        logger.info(f"\n{'#'*70}")
+        logger.info(f"\n{'#' * 70}")
         logger.info("# Scenario Complete")
         logger.info(f"# Success: {scenario_result['success']}")
-        logger.info(f"{'#'*70}")
+        logger.info(f"{'#' * 70}")
 
         return scenario_result

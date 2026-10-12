@@ -31,6 +31,15 @@ logger = logging.getLogger(__name__)
 WorkerRunResult = tuple[list[Any], list[dict[str, Any]], dict[str, Any]]
 
 
+@dataclass
+class ExecutionControl:
+    """Internal acceptance hooks; ordinary SDK sessions keep their defaults."""
+
+    on_case: Callable[[dict[str, Any], dict[str, Any], list[Any]], None] | None = None
+    stop_on_failure: bool = False
+    cancel_event: Any = None
+
+
 @dataclass(frozen=True)
 class PoolDispatchResult:
     evaluations: list[Any]
@@ -126,6 +135,7 @@ def _run_worker(
     scale_registry: ScaleRegistry,
     worker: RuntimeIdentity,
     scenarios: list[ScenarioSpec],
+    control: ExecutionControl | None = None,
 ) -> WorkerRunResult:
     worker_context = build_worker_execution_context(worker, worker.topology_dir)
     for scenario in scenarios:
@@ -141,6 +151,8 @@ def _run_worker(
         scale_registry=scale_registry,
     )
     evaluator = runner.evaluator
+    if control:
+        runner._cancel_event = control.cancel_event
 
     evaluations: list[Any] = []
     scenario_summaries: list[dict[str, Any]] = []
@@ -149,6 +161,9 @@ def _run_worker(
     executed_count = 0
     try:
         for scenario_index, scenario in enumerate(scenarios):
+            if control and control.cancel_event and control.cancel_event.is_set():
+                worker_success = False
+                break
             callback = build_runtime_diagnosis_callback(
                 agent,
                 str(worker_context.topology_dir),
@@ -158,6 +173,7 @@ def _run_worker(
                 worker.worker_id,
                 runtime.id,
                 scenario.scale,
+                cancel_event=control.cancel_event if control else None,
             )
             scenario_result = runner.run_scenario(scenario, diagnosis_callback=callback)
             executed_count += 1
@@ -218,14 +234,20 @@ def _run_worker(
             )
             worker_success &= success
             if not cleanup_success:
+                runtime.mark_quarantined("scenario_cleanup_failure", [worker.worker_id])
+            if control and control.on_case:
+                control.on_case(scenario_summaries[-1], scenario_result, scored)
+            if not cleanup_success or (control and control.stop_on_failure and not success):
                 for skipped in scenarios[scenario_index + 1 :]:
                     scenario_summaries.append(
                         {
                             "scenario_id": skipped.id,
-                            "status": "skipped_infrastructure_failure",
+                            "status": (
+                                "skipped_infrastructure_failure" if not cleanup_success else "skipped_execution_failure"
+                            ),
                             "scale": skipped.scale,
                             "worker": worker.worker_id,
-                            "failure_stage": "prior_case_cleanup",
+                            "failure_stage": "prior_case_cleanup" if not cleanup_success else "prior_case_execution",
                         }
                     )
                 break
@@ -267,6 +289,7 @@ def execute_on_runtime_pool(
     fault_registry: Any = None,
     minimum_baseline_seconds: int = 60,
     post_recovery_wait_seconds: int = 2,
+    control: ExecutionControl | None = None,
 ) -> PoolDispatchResult:
     """Run scenarios on an existing runtime and return ordered execution data."""
     if runtime.state != "warm" or bool(runtime.metadata.get("quarantined")):
@@ -291,17 +314,14 @@ def execute_on_runtime_pool(
             scale_registry=runtime.scale_registry,
             worker=worker,
             scenarios=assigned,
+            control=control,
         ),
     )
     cleanup_failures = sorted(
         {str(item["worker"]) for item in result.scenarios if item.get("cleanup_failed") is True and item.get("worker")}
     )
     if cleanup_failures:
-        runtime.state = "quarantined"
-        runtime.metadata["quarantined"] = True
-        runtime.metadata["quarantine_reason"] = "scenario_cleanup_failure"
-        runtime.metadata["quarantined_workers"] = cleanup_failures
-        runtime._write_metadata()
+        runtime.mark_quarantined("scenario_cleanup_failure", cleanup_failures)
     return result
 
 

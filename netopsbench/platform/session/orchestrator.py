@@ -13,7 +13,7 @@ from netopsbench.logging_utils import get_logger
 from netopsbench.models.scenario import ScenarioSpec
 from netopsbench.platform.runtime.manager import RuntimeManager, RuntimePool
 from netopsbench.platform.scenario.parser import parse_scenario_file
-from netopsbench.platform.session.dispatch import execute_on_runtime_pool
+from netopsbench.platform.session.dispatch import ExecutionControl, execute_on_runtime_pool
 from netopsbench.platform.session.reporting import (
     LocalArtifactStore,
     artifacts_root,
@@ -215,6 +215,7 @@ class SessionOrchestrator:
         agent: Any,
         artifacts_dir: str | Path | None,
         trace: bool,
+        control: ExecutionControl | None = None,
     ) -> Any:
         started_at = self._timestamp()
         run_id = reserve_run_id(self._artifacts_root(artifacts_dir), started_at=started_at)
@@ -229,6 +230,7 @@ class SessionOrchestrator:
             runtime_owner="user",
             teardown="skipped",
             started_at=started_at,
+            control=control,
         )
 
     def _execute_on_runtime_pool(
@@ -244,6 +246,7 @@ class SessionOrchestrator:
         runtime_owner: str,
         teardown: str,
         started_at: datetime,
+        control: ExecutionControl | None = None,
     ) -> Any:
         artifact_dir = self._artifacts_root(artifacts_dir) / run_id
         raw_dir = artifact_dir / "raw"
@@ -259,6 +262,7 @@ class SessionOrchestrator:
             raw_dir=raw_dir,
             trace_writer=trace_writer,
             fault_registry=getattr(getattr(self.platform, "faults", None), "spec_registry", None),
+            control=control,
         )
         aggregate_report = (
             Evaluator().generate_report(

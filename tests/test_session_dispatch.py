@@ -127,7 +127,7 @@ def test_execute_on_runtime_pool_uses_per_worker_evaluators_and_session_raw_pers
     monkeypatch.setattr(dispatch, "ScenarioExecutor", _FakeRunner)
     monkeypatch.setattr(dispatch, "_create_evaluator", _FakeEvaluator)
     monkeypatch.setattr(dispatch, "score_scenario_episode", score_episode)
-    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *_args: lambda _payload: {})
+    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *_args, **_kwargs: lambda _payload: {})
     monkeypatch.setattr(
         dispatch,
         "build_worker_execution_context",
@@ -240,7 +240,7 @@ def test_cleanup_failure_skips_only_that_workers_remaining_cases(tmp_path, monke
         "score_scenario_episode",
         lambda _scenario, _result, evaluator, **_kwargs: [SimpleNamespace(score=1.0, evaluator_id=evaluator.id)],
     )
-    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *_args: lambda _payload: {})
+    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *_args, **_kwargs: lambda _payload: {})
     monkeypatch.setattr(
         dispatch,
         "build_worker_execution_context",
@@ -319,7 +319,7 @@ def test_invalid_case_with_cleanup_failure_still_quarantines_runtime(tmp_path, m
     )
     monkeypatch.setattr(dispatch, "ScenarioExecutor", InvalidCleanupRunner)
     monkeypatch.setattr(dispatch, "_create_evaluator", _FakeEvaluator)
-    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *_args: lambda _payload: {})
+    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *_args, **_kwargs: lambda _payload: {})
     monkeypatch.setattr(
         dispatch,
         "build_worker_execution_context",

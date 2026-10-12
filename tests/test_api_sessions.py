@@ -807,3 +807,63 @@ def test_run_scenario_does_not_leak_fault_ground_truth_into_agent_context(tmp_pa
     assert "target_device" not in episode
     assert "target_interface" not in episode
     assert not hasattr(context, "ground_truth")
+
+
+def test_acceptance_control_reuses_executor_checkpoints_and_stops_after_failed_case(monkeypatch, tmp_path):
+    import threading
+
+    import netopsbench.platform.session.dispatch as dispatch
+    from netopsbench.models.scenario import EpisodeSpec, ScenarioSpec
+
+    executions, checkpoints, closes, builds = [], [], [], []
+    scenarios = [
+        ScenarioSpec(
+            scenario_id=str(i),
+            name=str(i),
+            topology_scale="xs",
+            episode=EpisodeSpec(episode_id="diagnosis", fault_type="none"),
+        )
+        for i in range(3)
+    ]
+    worker = SimpleNamespace(worker_id="worker-1", lab_name="lab", topology_dir=tmp_path)
+    runtime = SimpleNamespace(id="runtime", metadata={}, state="warm")
+
+    class Runner:
+        evaluator = None
+
+        def run_scenario(self, scenario, diagnosis_callback=None):
+            executions.append(scenario.id)
+            return {"case_valid": True, "success": scenario.id == "0", "cleanup": {"success": True}, "episode": {}}
+
+        def close(self):
+            closes.append(True)
+
+    def build(*a, **kw):
+        builds.append(True)
+        return Runner()
+
+    monkeypatch.setattr(dispatch, "_build_scenario_executor", build)
+    monkeypatch.setattr(dispatch, "build_worker_execution_context", lambda *a: SimpleNamespace(topology_dir=tmp_path))
+    monkeypatch.setattr(dispatch, "require_scenario_topology", lambda *a: None)
+    monkeypatch.setattr(dispatch, "build_runtime_diagnosis_callback", lambda *a, **kw: None)
+    control = dispatch.ExecutionControl(
+        on_case=lambda summary, *a: checkpoints.append(summary), stop_on_failure=True, cancel_event=threading.Event()
+    )
+    result = dispatch._run_worker(
+        runtime=runtime,
+        agent=None,
+        raw_dir=tmp_path,
+        trace_writer=None,
+        fault_registry=None,
+        minimum_baseline_seconds=60,
+        post_recovery_wait_seconds=2,
+        scale_registry=None,
+        worker=worker,
+        scenarios=scenarios,
+        control=control,
+    )
+    assert executions == ["0", "1"]
+    assert len(builds) == len(closes) == 1
+    assert [item["status"] for item in checkpoints] == ["completed", "failed"]
+    assert result[1][-1]["status"] == "skipped_execution_failure"
+    assert runtime.state == "warm"

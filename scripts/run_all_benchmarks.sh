@@ -38,6 +38,7 @@ declare -A SCALE_WORKERS=(
     [xlarge]="${BENCH_WORKERS_XLARGE:-1}"
     [fat-tree-k8]="${BENCH_WORKERS_FAT_TREE_K8:-1}"
     [fat-tree-k12]="${BENCH_WORKERS_FAT_TREE_K12:-1}"
+    [fat-tree-k18]="${BENCH_WORKERS_FAT_TREE_K18:-1}"
 )
 # Ordered list of scales to run (override with BENCH_SCALES="xs small")
 IFS=' ' read -ra SCALES <<< "${BENCH_SCALES:-xs small medium large}"
@@ -158,6 +159,7 @@ SUMMARY_CSV="${REPO_ROOT}/scenario_results/benchmark_summary_${TIMESTAMP}.csv"
 import json, sys, csv
 from pathlib import Path
 from datetime import datetime
+from netopsbench.models.profiles import supported_scales
 
 repo = Path(sys.argv[1])
 ts = sys.argv[2]
@@ -209,7 +211,7 @@ for rj in report_paths:
         if not sid:
             raw_ids = (data.get("raw") or {}).get("scenario_ids") or []
             sid = raw_ids[0] if raw_ids else ""
-        for sc in ("xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12"):
+        for sc in supported_scales():
             if f"_{sc}_" in sid:
                 scale = sc
                 break
@@ -245,7 +247,7 @@ if not reports:
     sys.exit(0)
 
 # Sort by vendor, scale
-scale_order = {"xs": 0, "small": 1, "medium": 2, "large": 3, "xlarge": 4, "fat-tree-k8": 5, "fat-tree-k12": 6}
+scale_order = {scale: index for index, scale in enumerate(supported_scales())}
 reports.sort(key=lambda r: (r["vendor"], scale_order.get(r["scale"], 99), r["started_at"]))
 
 # Write CSV

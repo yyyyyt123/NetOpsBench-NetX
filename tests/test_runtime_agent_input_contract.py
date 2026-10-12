@@ -237,3 +237,32 @@ def test_agent_cancellation_waits_for_resource_cleanup():
     with pytest.raises(RuntimeError, match="cancelled"):
         run_agent_diagnose(SimpleNamespace(diagnose=diagnose), None, cancelled)
     assert cleaned == [True]
+
+
+def test_scenario_cancellation_prevents_injection_and_allows_recovery_sleep(monkeypatch):
+    import threading
+
+    import pytest
+
+    from netopsbench.platform.scenario.executor import ScenarioExecutor
+    from netopsbench.platform.topology.clos_builder import build_clos_plan
+    from netopsbench.platform.topology.config import config_for_scale
+
+    slept = []
+    runner = ScenarioExecutor(
+        topology_metadata=build_clos_plan(config_for_scale("xs")).manifest,
+        sleep_fn=lambda seconds: slept.append(seconds),
+    )
+    runner._cancel_event = threading.Event()
+    runner._cancel_event.set()
+    monkeypatch.setattr(
+        "netopsbench.platform.scenario.executor._inject_fault_impl",
+        lambda *a: pytest.fail("cancelled scenario must not inject"),
+    )
+    with pytest.raises(RuntimeError, match="cancelled"):
+        runner._inject_fault(None)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        runner.sleep(1)
+    runner._recovering = True
+    runner.sleep(1)
+    assert slept == [1]

@@ -93,6 +93,31 @@ Generate current assets with `netopsbench benchmark prepare --scales xlarge,fat-
 
 This refactor requires topology/runtime schema v4, scale profiles v2 and client configuration v2. Recreate old runtimes and regenerate their topology/scenario assets; old formats are rejected. Client addresses now start at `192.168.1.0/24`, and Fat-tree ASNs are allocated consecutively by tier. The default local image is `netopsbench-client:pingmesh-v2`; `NETOPSBENCH_CLIENT_IMAGE` selects another image built from the current source.
 
+Run `PYTHONPATH=. python scripts/validate_pingmesh_scales.py` for sequential Xlarge/K18 acceptance. It measures XS resources, checks a 20% memory margin, runs native Codex XS smoke cases first, then evaluates DeepAgent (DeepSeek) and Codex sequentially on Xlarge/K18. It retains failed labs after fault recovery and tears down its own lab only after all requested cases and final health checks complete. Configure the DeepSeek API key and `codex login` before running; use `--agents deepagent` for DeepSeek alone. Coverage audits, capacity measurements and diagnosis reports are saved under `.netopsbench/validation-pingmesh-v2/`.
+
+Capacity estimates are updated with the measured peaks from each completed scale. K18 requires a representative switch sample with at least 18 data ports and adequate available host memory. To continue K18 with an existing peak sample, run:
+
+```bash
+PYTHONPATH=. python scripts/validate_pingmesh_scales.py \
+  --scales fat-tree-k18 \
+  --capacity-sample .netopsbench/validation-pingmesh-v2/final/capacity-sample.json \
+  --output .netopsbench/validation-pingmesh-v2/k18
+```
+
+For an explicitly monitored experiment, `--allow-tight-capacity` waives the
+20% memory margin. The report retains the failed margin check and the override;
+the measured peak estimate plus 8 GiB of available headroom, disk capacity, and
+representative switch samples are still required.
+
+To continue an interrupted acceptance on its existing runtime, use
+`--resume-runtime /absolute/path/to/runtime --scales fat-tree-k18 --output /absolute/path/to/acceptance`.
+The recorded vendor, runtime and plan must match. Valid completed cases are
+retained, including low diagnosis scores; incomplete cases are rerun. The
+attached runtime must pass health checks before execution resumes.
+Provider/API failures are excluded from model acceptance, including fallback
+`inconclusive` verdicts after an API error. Such cases must be rerun after the
+provider is available; ordinary model conclusions and scores are retained.
+
 Shared InfluxDB and Grafana containers are reused without automatic recreation during provisioning. Apply shared-service configuration upgrades explicitly when no active runtimes depend on them.
 
 ## Run one case
@@ -123,3 +148,5 @@ The run provisions an XS topology, starts observability, injects one generated f
 - Implement your own agent with [Custom Troubleshooting Agents](/docs/build-your-agent/custom-agents).
 - Run larger evaluations with [Running Benchmarks](/docs/run-benchmarks/run-scenario-vs-suite).
 - Use [Operations](/docs/debug-operate/observability) only when a runtime, Grafana dashboard, or cleanup path needs inspection.
+
+Acceptance resume requires the same selected scenario IDs and contents, profile, Pingmesh plan, client image and agent configuration. Valid zero-score diagnoses are completed cases; failed executions can be retried. Quarantined owned labs require `--rebuild-runtime`; external labs are never rebuilt or released by acceptance. SIGINT/SIGTERM request cancellation, recovery and an atomic checkpoint. Memory monitoring starts before deployment and protects the existing 12 GiB available-memory floor. Health checks share one elapsed-time deadline across all probes and retries.

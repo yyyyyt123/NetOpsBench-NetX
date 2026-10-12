@@ -1,7 +1,6 @@
 import inspect
 import json
 import tempfile
-from types import SimpleNamespace
 
 from netopsbench.models.topology import (
     Collector,
@@ -1086,7 +1085,10 @@ def test_scenario_observation_passes_current_topology_to_pingmesh_detector(monke
             }
 
     monkeypatch.setattr("netopsbench.platform.pingmesh.detector.AnomalyDetector", FakeDetector)
-    runner = SimpleNamespace(
+    from netopsbench.platform.scenario.executor import ScenarioExecutor
+
+    runner = ScenarioExecutor(
+        topology_dir=str(tmpdir),
         influxdb_url="http://influxdb:8086",
         influxdb_token="token",
         influxdb_org="org",
@@ -1102,4 +1104,4 @@ def test_scenario_observation_passes_current_topology_to_pingmesh_detector(monke
     )
 
     assert observations["data_source_status"] == "ok"
-    assert captured["topology_metadata"] == topology
+    assert captured["topology_metadata"] is runner.manifest

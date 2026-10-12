@@ -61,6 +61,18 @@ run = bench.sessions.run_suite(
 
 Use a small suite to check whether an agent generalizes beyond one selected case before paying the cost of a full generated corpus.
 
+## Baseline handoff between cases
+
+Within one suite, each worker keeps its topology and traffic running. A case can hand its verified healthy window to the next case on that same worker. Healthy cases offer their observation window only after it passes the absolute health gate; fault cases offer the post-recovery validation window. Cleanup and the full worker health check must succeed before either can be reused.
+
+The next case always captures its own full observation window. Reuse removes the two repeated reference/validation waits and the corresponding validation query. For the default 42-second K12 window, that avoids 84 seconds of fixed waiting on an eligible transition. This changes baseline selection; performance comparisons should use the same handoff policy and case ordering.
+
+Handoff is rejected if the window ended more than 120 seconds ago, is too short, or the runtime containers, generated configuration, scale policy, traffic profile, or verified traffic plan have changed. A new reference and validation are required after 600 seconds since the last fresh calibration. The worker owns one consumable candidate; a broken incident or failed cleanup clears it. This assumes exclusive ownership of the worker during the suite: do not edit live device configuration out of band while it runs.
+
+Only window timestamps are handed off. Telemetry is queried again, so late-arriving data remains visible. Baseline and observation queries overlap under a process-wide limit of four InfluxDB HTTP requests. Each raw case result records `baseline_preparation` (fresh/reused and reason) and `cleanup.baseline_handoff`.
+
+Use one `run_suite(...)` or `run_on_runtime_suite(...)` call for a batch. Separate `run_on_runtime_scenario(...)` calls create separate executors and do not share a baseline. No handoff survives the end of a suite.
+
 ## Full scale run
 
 ```bash
@@ -84,6 +96,8 @@ Scale choice changes both runtime cost and diagnosis difficulty:
 | `fat-tree-k8` | 80-switch, three-tier Fat-tree with 128 clients and 70 cases. |
 | `fat-tree-k12` | 180-switch, three-tier Fat-tree with 144 clients and 70 cases. |
 | `fat-tree-k18` | 405-switch, three-tier Fat-tree with 324 clients and 70 cases. |
+
+By default, the scale example uses 3 workers for xs/small, 2 for medium/large, and 1 for xlarge/Fat-tree, matching the batch shell script. An explicit `--workers` overrides this selection.
 
 Worker count controls concurrency. Each worker provisions its own lab resources. If Docker, Containerlab, or provider rate limits become unstable, reduce `--workers`.
 

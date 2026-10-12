@@ -38,6 +38,9 @@ def observe_episode(
             episode.duration_seconds,
             baseline_window=baseline_window,
         )
+        offer = getattr(executor, "_offer_healthy_window", None)
+        if offer is not None:
+            offer(observations)
         coverage = observations.pop("_coverage_audit", None)
         observations.pop("_baseline_health", None)
         result["observations"] = observations

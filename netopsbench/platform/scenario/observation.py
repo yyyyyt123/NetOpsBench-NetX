@@ -7,7 +7,6 @@ from datetime import UTC, datetime
 
 from netopsbench.config import config
 from netopsbench.logging_utils import get_logger
-from netopsbench.platform.topology.topology_utils import coerce_topology_manifest
 
 logger = get_logger(__name__)
 
@@ -21,7 +20,7 @@ def _utc_iso(dt: datetime) -> str:
 
 def complete_window_seconds(runner) -> int:
     """Return the topology-derived complete Pingmesh observation window."""
-    manifest = coerce_topology_manifest(runner.topology_metadata)
+    manifest = runner.current_manifest()
     return manifest.require_pingmesh_plan().settings.complete_window_seconds
 
 
@@ -149,14 +148,19 @@ def analyze_observation_windows(
     current_start = str(valid_windows[0]["start_time"])
     current_end = str(valid_windows[-1]["end_time"])
 
-    detector = AnomalyDetector(
-        influxdb_url=runner.influxdb_url or config.influxdb_url,
-        token=runner.influxdb_token or config.influxdb_token,
-        org=runner.influxdb_org or config.influxdb_org,
-        bucket=runner.influxdb_bucket or config.influxdb_bucket,
-        topology_metadata=runner.topology_metadata,
-        topology_id=runner.topology_id,
-    )
+    manifest = runner.current_manifest()
+    settings = {
+        "influxdb_url": runner.influxdb_url or config.influxdb_url,
+        "token": runner.influxdb_token or config.influxdb_token,
+        "org": runner.influxdb_org or config.influxdb_org,
+        "bucket": runner.influxdb_bucket or config.influxdb_bucket,
+        "topology_id": runner.topology_id,
+    }
+    scope = (manifest.topology_id, manifest.require_pingmesh_plan().settings.plan_id, *settings.values())
+    if runner._detector_scope != scope:
+        runner._detector = AnomalyDetector(topology_metadata=manifest, **settings)
+        runner._detector_scope = scope
+    detector = runner._detector
     report = detector.generate_windowed_anomaly_report(
         baseline_start=baseline_start,
         baseline_end=baseline_end,
