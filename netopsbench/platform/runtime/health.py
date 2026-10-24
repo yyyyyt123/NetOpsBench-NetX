@@ -356,10 +356,10 @@ def _check_worker_health(
 
     def network_state(device) -> tuple[str, int, int, int, int]:
         container = clab_container_name(lab_name, device.name)
-        node_snapshot = {} if route_snapshot is not None else None
-        if node_snapshot is None:
+        if route_snapshot is None:
             bgp, interfaces = _routing_state(container, control=control)
         else:
+            node_snapshot: dict = {}
             bgp, interfaces = _routing_state(container, control=control, route_snapshot=node_snapshot)
             from netopsbench.platform.observability.bgp_parser import parse_bgp_summary
 

@@ -237,9 +237,11 @@ class ScaleProfileDocument(BaseModel):
         defaults = {**default_experiment_profile().model_dump(), **supplied}
         payload["experiment_defaults"] = defaults
         payload["profiles"] = [
-            {**profile, "experiment": {**defaults, **profile.get("experiment", {})}}
-            if isinstance(profile, dict)
-            else profile
+            (
+                {**profile, "experiment": {**defaults, **profile.get("experiment", {})}}
+                if isinstance(profile, dict)
+                else profile
+            )
             for profile in payload.get("profiles", [])
         ]
         return payload

@@ -22,7 +22,10 @@ def install_release(archive: Path, output: Path) -> None:
         member = tar.getmember("containerlab")
         if not member.isfile():
             raise RuntimeError("Official archive has no regular Containerlab executable")
-        with tar.extractfile(member) as stream:
+        stream = tar.extractfile(member)
+        if stream is None:
+            raise RuntimeError("Official archive has no readable Containerlab executable")
+        with stream:
             data = stream.read()
     if hashlib.sha256(data).hexdigest() != spec["binary_sha256"]:
         raise RuntimeError("Official Containerlab executable checksum mismatch")

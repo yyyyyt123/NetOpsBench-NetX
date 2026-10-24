@@ -103,9 +103,11 @@ class NetworkFaultHandler:
             else:
                 apply += [f"neighbor {peer} route-map {route_map} {direction}"]
                 restore += [
-                    f"neighbor {peer} route-map {original} {direction}"
-                    if original
-                    else f"no neighbor {peer} route-map {route_map} {direction}"
+                    (
+                        f"neighbor {peer} route-map {original} {direction}"
+                        if original
+                        else f"no neighbor {peer} route-map {route_map} {direction}"
+                    )
                 ]
             restore += ["exit-address-family", "exit", f"no route-map {route_map}", f"no ip prefix-list {prefix_list}"]
             operation = self._frr_operation(apply, restore)

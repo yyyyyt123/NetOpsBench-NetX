@@ -129,8 +129,8 @@ def build_runtime_diagnosis_callback(
         except Exception as exc:
             trace_recorder.record_error(stage="agent", error=exc)
             ended_at = datetime.now(UTC)
-            failure_metadata = {}
-            cause = exc
+            failure_metadata: dict[str, Any] = {}
+            cause: BaseException | None = exc
             while cause is not None:
                 failure_metadata.update(getattr(cause, "agent_metadata", {}))
                 cause = cause.__cause__

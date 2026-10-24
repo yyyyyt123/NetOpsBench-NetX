@@ -33,7 +33,7 @@ def probe_pair_evidence(baseline_rows: list[dict], current_rows: list[dict], pai
     selected = {(pair["src"], pair["dst"]) for pair in pairs}
     evidence = {pair: {"src": pair[0], "dst": pair[1]} for pair in selected}
     for phase, rows in (("baseline", baseline_rows), ("fault", current_rows)):
-        grouped = {pair: [] for pair in selected}
+        grouped: dict[tuple[str, str], list[dict]] = {pair: [] for pair in selected}
         for row in rows:
             key = row.get("src_name"), row.get("dst_name")
             if key in grouped:

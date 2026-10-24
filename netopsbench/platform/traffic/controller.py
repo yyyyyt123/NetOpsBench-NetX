@@ -71,9 +71,11 @@ class TrafficController:
                 TRAFFIC_CONTROL_PORT,
                 operation,
                 payload,
-                timeout=current_operation_control().remaining(CONTROL_TIMEOUT_SECONDS)
-                if current_operation_control()
-                else CONTROL_TIMEOUT_SECONDS,
+                timeout=(
+                    current_operation_control().remaining(CONTROL_TIMEOUT_SECONDS)
+                    if current_operation_control()
+                    else CONTROL_TIMEOUT_SECONDS
+                ),
             )
         except RuntimeError as exc:
             raise RuntimeError(f"Traffic process on {client}: {exc}") from exc

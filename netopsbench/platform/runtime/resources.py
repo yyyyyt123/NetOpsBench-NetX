@@ -159,9 +159,7 @@ def resource_snapshot(lab_name: str, manifest, *, control: OperationControl | No
                     else (
                         "observability"
                         if row["Name"] in services
-                        else "client"
-                        if "-client" in row["Name"]
-                        else "switch"
+                        else "client" if "-client" in row["Name"] else "switch"
                     )
                 ),
                 data_ports=ports.get(row["Name"].removeprefix(f"clab-{lab_name}-"), 0),
