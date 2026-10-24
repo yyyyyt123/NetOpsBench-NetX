@@ -8,11 +8,13 @@ import time
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import copy_context
 from dataclasses import asdict, dataclass, field
 
 from netopsbench.logging_utils import get_logger
 from netopsbench.platform.client_agent.contract import HEARTBEAT_MAX_AGE_SECONDS, TRAFFIC_CONTROL_PORT
 from netopsbench.platform.client_agent.control import request_agent
+from netopsbench.platform.utils.control import OperationControl, current_operation_control, operation_scope
 
 logger = get_logger(__name__)
 
@@ -69,7 +71,9 @@ class TrafficController:
                 TRAFFIC_CONTROL_PORT,
                 operation,
                 payload,
-                timeout=CONTROL_TIMEOUT_SECONDS,
+                timeout=current_operation_control().remaining(CONTROL_TIMEOUT_SECONDS)
+                if current_operation_control()
+                else CONTROL_TIMEOUT_SECONDS,
             )
         except RuntimeError as exc:
             raise RuntimeError(f"Traffic process on {client}: {exc}") from exc
@@ -81,7 +85,8 @@ class TrafficController:
             except (OSError, json.JSONDecodeError):
                 if attempt == 1:
                     raise
-                time.sleep(0.1)
+                control = current_operation_control()
+                control.sleep(0.1) if control else time.sleep(0.1)
         raise AssertionError("unreachable")
 
     def _parallel_requests(self, requests: dict[str, tuple[str, dict]]) -> dict[str, dict]:
@@ -89,7 +94,7 @@ class TrafficController:
         failures: list[str] = []
         with ThreadPoolExecutor(max_workers=min(CONTROL_PARALLELISM, max(1, len(requests)))) as executor:
             futures = {
-                executor.submit(self._request_with_retry, client, operation, payload): client
+                executor.submit(copy_context().run, self._request_with_retry, client, operation, payload): client
                 for client, (operation, payload) in requests.items()
             }
             for future in as_completed(futures):
@@ -184,11 +189,12 @@ class TrafficController:
     def _status_all(self) -> dict[str, dict]:
         return self._parallel_requests({client: ("status", {}) for client in self.management_ips})
 
-    def verify_active_flows(self) -> bool:
+    def verify_active_flows(self, *, control: OperationControl | None = None) -> bool:
         if not self.active_flows or not self.generation:
             return False
         try:
-            statuses = self._status_all()
+            with operation_scope(control or OperationControl()):
+                statuses = self._status_all()
         except RuntimeError as exc:
             logger.warning("Native traffic health check failed: %s", exc)
             return False

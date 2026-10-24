@@ -2,6 +2,7 @@ import json
 import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -88,7 +89,8 @@ def test_fat_tree_sparse_expected_active_interface_counts():
 
 
 @pytest.mark.parametrize("budgeted", [False, True])
-def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, monkeypatch, budgeted):
+@pytest.mark.parametrize("fib_delay", [False, True])
+def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, monkeypatch, budgeted, fib_delay):
     from netopsbench.platform.observability import influxdb, validation
     from netopsbench.platform.topology.generator import generate_topology
 
@@ -102,11 +104,17 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
     monkeypatch.setattr(health, "_running_container_count", lambda _lab_name, **kw: 6)
 
     exec_calls = []
+    fib_polls = {}
 
     def fake_docker_exec(_container, *command, **_kwargs):
         exec_calls.append(command)
         joined = " ".join(command)
         if command[:2] == ("python3", "-c"):
+            fib_polls[_container] = fib_polls.get(_container, 0) + 1
+            hops = [{"gateway": "10.0.0.1"}]
+            if fib_polls[_container] > 1:
+                hops.append({"gateway": "10.0.0.2"})
+            fib = [{"dst": "192.168.12.0/30", "protocol": "bgp", "nexthops": hops}]
             output = json.dumps(
                 {
                     "version": 1,
@@ -119,6 +127,7 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
                             "returncode": 0,
                             "stdout": fake_docker_exec(_container, "bash", "-lc", "show interfaces status").stdout,
                         },
+                        "fib": {"returncode": 0, "stdout": json.dumps(fib)},
                     },
                 }
             )
@@ -163,11 +172,28 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
     )
 
     started = time.monotonic()
+    expected_routes = {
+        "nodes": {
+            device["name"]: {
+                "fib": [
+                    {
+                        "dst": "192.168.12.0/30",
+                        "protocol": "bgp",
+                        "nexthops": [{"gateway": "10.0.0.1"}, {"gateway": "10.0.0.2"}],
+                    }
+                ]
+            }
+            for device in metadata["devices"]
+            if device["role"] != "client"
+        }
+    }
     errors = health.check_worker_health(
         _runtime_identity(tmp_path, "health-xs"),
         health_retries=100 if budgeted else 2,
         health_delay=0.01 if budgeted else 0,
         deadline=started + 0.15 if budgeted else None,
+        route_snapshot={} if fib_delay else None,
+        expected_routes=expected_routes if fib_delay else None,
     )
 
     if budgeted:
@@ -176,13 +202,15 @@ def test_worker_health_retries_observability_until_collector_is_ready(tmp_path, 
         assert attempts
         return
     assert errors == []
+    if fib_delay:
+        assert all(polls >= 2 for polls in fib_polls.values())
     assert "logger -n" in " ".join(exec_calls[0])
-    assert sum(c == ("bash", "-lc", "show interfaces status") for c in exec_calls) == 3
+    assert sum(c == ("bash", "-lc", "show interfaces status") for c in exec_calls) == (6 if fib_delay else 3)
     assert sorted(attempts) == ["bgp", "interfaces", "pingmesh", "syslog", "syslog"]
 
 
 def test_network_probe_preserves_commands_order_and_deadlines():
-    from netopsbench.platform.runtime._network_probe import probe
+    from netopsbench.platform.observability._routing_probe import probe
 
     calls = []
 
@@ -194,6 +222,7 @@ def test_network_probe_preserves_commands_order_and_deadlines():
     assert [c[0] for c in calls] == [
         ["vtysh", "-c", "show ip bgp summary"],
         ["bash", "-lc", "show interfaces status"],
+        ["ip", "-j", "-4", "route", "show"],
     ]
     assert all(c[1]["timeout"] == 60 for c in calls)
     assert result["checks"]["bgp"]["stdout"] == "vtysh\n-c\nshow ip bgp summary"
@@ -201,7 +230,7 @@ def test_network_probe_preserves_commands_order_and_deadlines():
 
 @pytest.mark.parametrize("failure", [subprocess.TimeoutExpired("vtysh", 60), OSError("missing")])
 def test_network_probe_preserves_independent_check_after_failure(failure):
-    from netopsbench.platform.runtime._network_probe import probe
+    from netopsbench.platform.observability._routing_probe import probe
 
     def run(command, **kwargs):
         if command[0] == "vtysh":
@@ -301,3 +330,20 @@ def test_quarantine_accumulates_workers_without_duplicate_writes(tmp_path, monke
     assert runtime.state == "quarantined"
     assert runtime.metadata["quarantined_workers"] == ["worker-1", "worker-2"]
     assert len(writes) == 2
+
+
+def test_routing_probe_subcommands_share_one_deadline(monkeypatch):
+    import netopsbench.platform.observability._routing_probe as probe_module
+
+    clock = [0.0]
+    monkeypatch.setattr(probe_module.time, "monotonic", lambda: clock[0])
+    timeouts = []
+
+    def run(command, **kwargs):
+        timeouts.append(kwargs["timeout"])
+        clock[0] += 4
+        return SimpleNamespace(returncode=0, stdout="[]")
+
+    payload = probe_module.probe(run, budget_seconds=5)
+    assert timeouts == [5, 1]
+    assert payload["checks"]["fib"]["error"] == "deadline_exceeded"

@@ -325,7 +325,10 @@ class DiagnosticSession:
                 metrics=self._metrics(elapsed),
             )
         try:
-            result = self.incident.call_tool(action)
+            from netopsbench.platform.toolkit._core.control import tool_deadline_scope
+
+            with tool_deadline_scope(self.started_at + self.config.max_agent_seconds):
+                result = self.incident.call_tool(action)
         except Exception as exc:  # noqa: BLE001 - ordinary query errors are recoverable
             failure = ExecutionFailure(
                 domain=FailureDomain.TOOL_EXECUTION,
@@ -406,8 +409,10 @@ class DiagnosticSession:
         )
 
     def _limit_transition(self, elapsed: float) -> SessionTransition | None:
+        timings = getattr(self, "phase_timings", None)
+        cleanup_seconds = timings.phases.get("agent_cleanup", {}).get("actual_seconds", 0) if timings else 0
         message = None
-        if elapsed > self.config.max_agent_seconds:
+        if max(0.0, elapsed - cleanup_seconds) > self.config.max_agent_seconds:
             message = "max_agent_seconds exceeded"
         elif self.tool_calls >= self.config.max_tool_calls:
             message = "max_tool_calls exceeded"

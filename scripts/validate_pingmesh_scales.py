@@ -6,109 +6,37 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
-import re
 import subprocess
 from pathlib import Path
 
 from dotenv import dotenv_values
 
 from examples._common import agent_class
+from netopsbench.platform.faults.catalog import FAULT_MECHANISMS
 from netopsbench.platform.runtime.toolchain import runtime_tools
-from netopsbench.platform.scenario.parser import parse_scenario_file, save_scenario_file
+from netopsbench.platform.scenario.parser import parse_scenario_file
 from netopsbench.platform.session.acceptance import run_acceptance
-from netopsbench.platform.topology.config import DEFAULT_CLIENT_IMAGE
+from netopsbench.platform.topology.config import DEFAULT_CLIENT_IMAGE, DEFAULT_SONIC_VS_IMAGE
 from netopsbench.sdk import NetOpsBench
 
 
 def select_cases(paths: list[Path], include_faults: bool, manifest) -> list[Path]:
-    healthy, faults = [], {}
-    for path in paths:
-        scenario = parse_scenario_file(path)
-        if scenario.episode.is_healthy:
-            healthy.append(path)
-        elif scenario.episode.fault_type != "none":
-            faults.setdefault(scenario.episode.fault_type, []).append(path)
-    if not healthy or (include_faults and len(faults) != 12):
-        raise RuntimeError("Acceptance campaign must contain healthy samples and twelve fault types")
-    selected = [sorted(healthy)[0]]
-    if include_faults:
-        scenarios = {path: parse_scenario_file(path) for paths in faults.values() for path in paths}
-        chosen = {}
-        role_counts, pod_counts = {}, {}
-
-        def device(path):
-            return manifest.device(scenarios[path].episode.target_device)
-
-        def number(path):
-            return int(re.findall(r"\d+", device(path).name)[-1])
-
-        def choose(kind, path):
-            chosen[kind] = path
-            target = device(path)
-            role_counts[target.role] = role_counts.get(target.role, 0) + 1
-            pod = target.metadata.get("pod")
-            pod_counts[pod] = pod_counts.get(pod, 0) + 1
-
-        # Exercise the address-allocation boundary that previously capped racks.
-        high_edges = [path for path in scenarios if device(path).role.value == "edge" and number(path) > 155]
-        if manifest.facts.num_edges > 155:
-            if not high_edges:
-                raise RuntimeError("Acceptance campaign lacks an edge above the old 155-rack boundary")
-            path = max(high_edges, key=number)
-            choose(scenarios[path].episode.fault_type, path)
-        kinds = sorted(faults, key=lambda kind: (len({device(path).role for path in faults[kind]}), kind))
-        priority = {"core": 0, "agg": 1, "edge": 2}
-        for kind in kinds:
-            if kind in chosen:
-                continue
-            roles = {device(path).role for path in faults[kind]}
-            role = min(roles, key=lambda role: (role_counts.get(role, 0), priority[role.value]))
-            candidates = [path for path in faults[kind] if device(path).role == role]
-            path = max(
-                candidates, key=lambda path: (-pod_counts.get(device(path).metadata.get("pod"), 0), number(path))
-            )
-            choose(kind, path)
-        if set(role.value for role in role_counts) != {"core", "agg", "edge"}:
-            raise RuntimeError("Acceptance fault selection must exercise all three switch tiers")
-        selected.extend(chosen[kind] for kind in sorted(chosen))
-    return selected
+    """The catalog already contains one case per necessary coverage unit."""
+    cases = [parse_scenario_file(path) for path in paths]
+    if not any(case.episode.is_healthy for case in cases):
+        raise RuntimeError("Acceptance requires a healthy case")
+    if any(case.metadata.get("fault_catalog_version") != 2 for case in cases):
+        raise ValueError("Obsolete scenarios; regenerate fault catalog v2")
+    healthy = sorted(path for path, case in zip(paths, cases, strict=True) if case.episode.is_healthy)
+    return (
+        healthy + sorted(path for path, case in zip(paths, cases, strict=True) if not case.episode.is_healthy)
+        if include_faults
+        else healthy
+    )
 
 
 def smoke_cases(paths, manifest):
-    selected = {}
-    for path in sorted(paths):
-        kind = parse_scenario_file(path).episode.fault_type
-        if kind in {"none", "link_down", "device_down"}:
-            selected.setdefault(kind, path)
-    if len(selected) != 3:
-        raise RuntimeError("XS smoke requires healthy, link_down and device_down cases")
-    # Keep every source client able to send. Access-link/leaf outages can
-    # generate genuine local send errors, which are not complete observations.
-    switches = {device.name for device in manifest.switches()}
-    fabric = next(link for link in manifest.links if all(endpoint.device in switches for endpoint in link.endpoints))
-    leaf = next(endpoint for endpoint in fabric.endpoints if manifest.device(endpoint.device).role.value == "leaf")
-    spine = next(device for device in manifest.switches() if device.role.value == "spine")
-    directory = paths[0].parent / "codex-smoke"
-    cases = [selected["none"]]
-    for kind, device, interface in (("link_down", leaf.device, leaf.interface), ("device_down", spine.name, None)):
-        source = parse_scenario_file(selected[kind])
-        case = source.model_copy(
-            update={
-                "scenario_id": f"codex_smoke_{kind}_xs",
-                "episode": source.episode.model_copy(
-                    update={
-                        "target_device": device,
-                        "target_interface": interface,
-                        "description": "XS fabric lifecycle smoke",
-                    }
-                ),
-            }
-        )
-        path = directory / f"{case.id}.yaml"
-        if not path.exists():
-            save_scenario_file(case, path)
-        cases.append(path)
-    return cases
+    return select_cases(paths, True, manifest)
 
 
 def preflight_agents(backends, vendor, output, *, expected=None):
@@ -118,6 +46,7 @@ def preflight_agents(backends, vendor, output, *, expected=None):
     runtime_tools()
     image = os.environ.get("NETOPSBENCH_CLIENT_IMAGE", DEFAULT_CLIENT_IMAGE)
     subprocess.check_output(["docker", "image", "inspect", image, "--format", "{{.Id}}"], text=True)
+    subprocess.check_output(["docker", "image", "inspect", DEFAULT_SONIC_VS_IMAGE, "--format", "{{.Id}}"], text=True)
     for backend in backends:
         if backend == "deepagent":
             agent = agent_class(backend)(vendor=vendor)
@@ -172,22 +101,35 @@ def preflight_agents(backends, vendor, output, *, expected=None):
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--scales", default="xlarge,fat-tree-k18")
+    parser.add_argument("--scales", default="medium,large,fat-tree-k8,fat-tree-k12,xlarge,fat-tree-k18")
+    parser.add_argument("--mode", choices=["effects", "diagnose"], default="diagnose")
+    parser.add_argument("--fault-types", nargs="+", choices=["none", *FAULT_MECHANISMS])
     parser.add_argument("--vendor", default="deepseek")
-    parser.add_argument("--agents", nargs="+", choices=["deepagent", "codex"], default=["deepagent", "codex"])
+    parser.add_argument("--agents", nargs="+", choices=["deepagent", "codex"], default=["deepagent"])
     parser.add_argument("--output", type=Path, default=Path(".netopsbench/validation-pingmesh-v2"))
     parser.add_argument("--capacity-sample", type=Path)
     parser.add_argument("--allow-tight-capacity", action="store_true")
     parser.add_argument("--resume-runtime", type=Path)
     parser.add_argument("--rebuild-runtime", action="store_true")
     args = parser.parse_args()
+    if args.fault_types and args.mode != "diagnose":
+        parser.error("--fault-types selects diagnostic cases; effects requires the complete coverage set")
+
+    def requested_cases(paths, include_faults, manifest):
+        selected = select_cases(paths, include_faults, manifest)
+        if args.fault_types:
+            selected = [p for p in selected if parse_scenario_file(p).episode.fault_type in args.fault_types]
+            if not selected:
+                raise ValueError("No requested diagnostic types in this profile")
+        return selected
+
     return run_acceptance(
         args,
         bench_factory=NetOpsBench,
         agent_factory=agent_class,
         preflight=preflight_agents,
-        select_cases=select_cases,
-        smoke_cases=smoke_cases,
+        select_cases=requested_cases,
+        smoke_cases=lambda paths, manifest: requested_cases(paths, True, manifest),
     )
 
 

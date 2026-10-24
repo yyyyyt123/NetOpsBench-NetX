@@ -172,7 +172,7 @@ def test_topology_cli_help_includes_generate(capsys):
 def test_cli_scenario_generate_uses_existing_default_spec(tmp_path, monkeypatch, capsys):
     calls = {}
 
-    def fake_generate(workspace, *, scale, spec, topology_dir=None, out=None, seed=42):
+    def fake_generate(workspace, *, scale, spec, topology_dir=None, out=None, seed=42, scale_registry=None):
         calls.update(
             workspace=workspace,
             scale=scale,
@@ -210,14 +210,14 @@ def test_cli_topology_generate_uses_default_output_dir(tmp_path, monkeypatch, ca
 
     monkeypatch.setattr("netopsbench.cli.main._generate_topology", fake_generate)
     monkeypatch.setattr(
-        "sys.argv", ["netopsbench", "--workspace", str(tmp_path), "topology", "generate", "--scale", "small"]
+        "sys.argv", ["netopsbench", "--workspace", str(tmp_path), "topology", "generate", "--scale", "medium"]
     )
 
     assert main() == 0
     out = capsys.readouterr().out
     assert "generated topology" in out
     assert calls["workspace"].workspace == tmp_path
-    assert calls["scale"] == "small"
+    assert calls["scale"] == "medium"
     assert calls["output_dir"] is None
 
 
@@ -455,7 +455,7 @@ def test_cli_benchmark_prepare_runs_topology_then_scenario_generation(tmp_path, 
         print(f"topology:{scale}")
         return 0
 
-    def fake_generate_scenarios(workspace, *, scale, spec, topology_dir=None, out=None, seed=42):
+    def fake_generate_scenarios(workspace, *, scale, spec, topology_dir=None, out=None, seed=42, scale_registry=None):
         scenario_calls.append((workspace, scale, spec, topology_dir, out, seed))
         print(f"scenarios:{scale}")
         return 0

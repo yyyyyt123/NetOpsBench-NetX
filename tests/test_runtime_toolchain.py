@@ -207,3 +207,35 @@ def test_failed_destroy_is_reported_after_remaining_cleanup(monkeypatch, tmp_pat
         deployment.teardown_worker_lab(worker)
     assert ["docker", "network", "rm", "owned"] in calls
     assert len([c for c in calls if c[0] == "official"]) == 2
+
+
+def test_legacy_campaign_rejected_before_provider_or_docker(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from netopsbench.platform.session import acceptance
+
+    output = tmp_path / "campaign"
+    output.mkdir()
+    (output / "acceptance.json").write_text(
+        json.dumps({"mode": "effects", "fault_catalog_version": 2, "runtime_backend": {"provider": "custom"}})
+    )
+    monkeypatch.setattr(acceptance, "runtime_backend_identity", lambda: {"provider": "upstream"})
+    monkeypatch.setattr(acceptance.subprocess, "check_output", lambda *a, **kw: pytest.fail("Docker called"))
+    args = SimpleNamespace(
+        mode="effects",
+        agents=[],
+        scales="xs",
+        vendor="deepseek",
+        output=output,
+        resume_runtime=tmp_path / "runtime",
+        rebuild_runtime=False,
+    )
+    with pytest.raises(ValueError, match="Campaign runtime backend changed"):
+        acceptance.run_acceptance(
+            args,
+            bench_factory=None,
+            agent_factory=None,
+            preflight=lambda *a: pytest.fail("provider called"),
+            select_cases=None,
+            smoke_cases=None,
+        )

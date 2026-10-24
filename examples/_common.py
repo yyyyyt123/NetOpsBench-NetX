@@ -32,7 +32,7 @@ def require_scenarios(repo: Path, relative_paths: str | list[str], *, prepare_hi
     if not missing:
         return scenarios
 
-    hint = prepare_hint or "Generate benchmark assets first with `netopsbench benchmark prepare --scales xs`."
+    hint = prepare_hint or "Generate benchmark assets first with `netopsbench benchmark prepare --scales medium`."
     if len(scenarios) == 1:
         raise FileNotFoundError(f"Scenario not found: {scenarios[0]}. {hint}")
     raise FileNotFoundError(f"Scenario files missing: {missing}. {hint}")

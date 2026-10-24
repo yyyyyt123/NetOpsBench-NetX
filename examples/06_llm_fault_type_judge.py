@@ -3,7 +3,7 @@
 
 Same structure as ``01_run_scenario.py`` but enables the LLM judge so that
 free-form agent answers like ``"BGP peer AS mismatch"`` are semantically
-matched to the canonical ``bgp_neighbor_misconfig`` taxonomy instead of
+matched to the canonical ``bgp_as_mismatch`` taxonomy instead of
 failing a deterministic string compare.
 
 The judge is activated entirely via environment variables — no code change
@@ -35,8 +35,8 @@ from netopsbench.sdk import NetOpsBench
 
 # BGP neighbor misconfig is the scenario where the LLM judge adds the most value:
 # agents often describe the fault as "BGP peer AS mismatch" or "BGP session down"
-# which don't match the canonical "bgp_neighbor_misconfig" deterministically.
-_SCENARIO_REL = "scenarios/generated/xs/generated_bgp_neighbor_misconfig_xs_001.yaml"
+# which don't match the canonical "bgp_as_mismatch" deterministically.
+_SCENARIO_REL = "scenarios/generated/medium/generated_bgp_as_mismatch_medium_001.yaml"
 
 
 def main(
@@ -52,7 +52,7 @@ def main(
         repo,
         _SCENARIO_REL,
         prepare_hint=(
-            "Generate benchmark assets first with " "`netopsbench benchmark prepare --scales xs` from the repo root."
+            "Generate benchmark assets first with `netopsbench benchmark prepare --scales medium` from the repo root."
         ),
     )[0]
 

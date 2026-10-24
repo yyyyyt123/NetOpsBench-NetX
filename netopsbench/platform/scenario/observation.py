@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from netopsbench.config import config
 from netopsbench.logging_utils import get_logger
+from netopsbench.platform.utils.control import OperationControl, current_operation_control
 
 logger = get_logger(__name__)
 
@@ -29,23 +30,36 @@ def baseline_window_seconds(runner, minimum_seconds: int) -> int:
     return max(max(0, int(minimum_seconds)), complete_window_seconds(runner))
 
 
-def capture_observation_window(runner, duration: int, *, name: str = "window") -> dict:
+def capture_observation_window(runner, duration: int, *, name: str = "window", deadline: float | None = None) -> dict:
     """Record one observation interval without querying observability backends."""
     safe_duration = max(0, int(duration))
+    inherited = current_operation_control()
+    limits = [value for value in (deadline, inherited.deadline if inherited else None) if value is not None]
+    control = OperationControl(inherited.cancel_event if inherited else None, min(limits) if limits else None)
+    if control.deadline is not None and control.remaining() < safe_duration:
+        raise TimeoutError("Insufficient recovery budget for a complete observation window")
     logger.info(f"\n[Observation] Monitoring for {safe_duration} seconds...")
-    start_time = datetime.now(UTC).replace(microsecond=0)
+    started = time.monotonic()
+    stop = started + safe_duration
+    start_time = datetime.now(UTC)
     sleep_fn = getattr(runner, "sleep", time.sleep)
-    for index in range(safe_duration):
-        sleep_fn(1)
-        if (index + 1) % 10 == 0:
-            logger.info(f"  Observed {index + 1}/{safe_duration}s...")
-    end_time = datetime.now(UTC).replace(microsecond=0)
+    next_progress = 10
+    while (remaining := stop - time.monotonic()) > 0:
+        sleep_fn(control.remaining(min(1.0, remaining)))
+        control.remaining()
+        elapsed = time.monotonic() - started
+        if elapsed >= next_progress:
+            logger.info(f"  Observed {min(int(elapsed), safe_duration)}/{safe_duration}s...")
+            next_progress = (int(elapsed) // 10 + 1) * 10
+    actual = max(0.0, time.monotonic() - started)
     return {
         "name": name,
         "plan_id": runner.topology_metadata["pingmesh_plan"]["settings"]["plan_id"],
         "start_time": _utc_iso(start_time),
-        "end_time": _utc_iso(end_time),
+        "end_time": _utc_iso(start_time + timedelta(seconds=safe_duration)),
         "duration_seconds": safe_duration,
+        "actual_wait_seconds": actual,
+        "wake_overrun_seconds": max(0.0, actual - safe_duration),
     }
 
 
@@ -118,13 +132,36 @@ def _summary_for_window(anomalies: list[dict], window_name: str) -> dict:
     }
 
 
+def observation_detector(runner):
+    from netopsbench.platform.pingmesh.detector import AnomalyDetector
+
+    manifest = runner.current_manifest()
+    settings = {
+        "influxdb_url": runner.influxdb_url or config.influxdb_url,
+        "token": runner.influxdb_token or config.influxdb_token,
+        "org": runner.influxdb_org or config.influxdb_org,
+        "bucket": runner.influxdb_bucket or config.influxdb_bucket,
+        "topology_id": runner.topology_id,
+        "runtime_start_time": getattr(runner, "_pingmesh_runtime_start", None),
+    }
+    scope = (manifest.topology_id, manifest.require_pingmesh_plan().settings.plan_id, *settings.values())
+    if runner._detector_scope != scope:
+        runner._detector = AnomalyDetector(topology_metadata=manifest, **settings)
+        runner._detector_scope = scope
+    return runner._detector
+
+
 def analyze_observation_windows(
     runner,
     windows: list[dict],
     total_duration_seconds: int,
     baseline_window: dict,
+    deadline: float | None = None,
 ) -> dict:
     """Analyze captured intervals using one baseline and one current snapshot."""
+    control = current_operation_control()
+    if control is not None and control.deadline is not None:
+        deadline = min(deadline, control.deadline) if deadline is not None else control.deadline
     valid_windows = [window for window in windows if isinstance(window, dict) and window.get("start_time")]
     if not valid_windows:
         now = _utc_iso(datetime.now(UTC).replace(microsecond=0))
@@ -139,8 +176,6 @@ def analyze_observation_windows(
             "observation_windows": [],
         }
 
-    from netopsbench.platform.pingmesh.detector import AnomalyDetector
-
     baseline_start = str(baseline_window.get("start_time") or "")
     baseline_end = str(baseline_window.get("end_time") or "")
     if not baseline_start or not baseline_end:
@@ -148,19 +183,7 @@ def analyze_observation_windows(
     current_start = str(valid_windows[0]["start_time"])
     current_end = str(valid_windows[-1]["end_time"])
 
-    manifest = runner.current_manifest()
-    settings = {
-        "influxdb_url": runner.influxdb_url or config.influxdb_url,
-        "token": runner.influxdb_token or config.influxdb_token,
-        "org": runner.influxdb_org or config.influxdb_org,
-        "bucket": runner.influxdb_bucket or config.influxdb_bucket,
-        "topology_id": runner.topology_id,
-    }
-    scope = (manifest.topology_id, manifest.require_pingmesh_plan().settings.plan_id, *settings.values())
-    if runner._detector_scope != scope:
-        runner._detector = AnomalyDetector(topology_metadata=manifest, **settings)
-        runner._detector_scope = scope
-    detector = runner._detector
+    detector = observation_detector(runner)
     report = detector.generate_windowed_anomaly_report(
         baseline_start=baseline_start,
         baseline_end=baseline_end,
@@ -168,13 +191,18 @@ def analyze_observation_windows(
         current_end=current_end,
         windows=valid_windows,
         include_internal_health=True,
+        **({"deadline": deadline} if deadline is not None else {}),
+        **({"evidence_pairs": runner._case_probe_pairs} if getattr(runner, "_case_probe_pairs", None) else {}),
     )
     baseline_health = report.pop("_baseline_health", {})
     baseline_coverage = report.pop("_baseline_coverage", {})
+    probe_evidence = report.pop("_probe_evidence", [])
     query_status = report.get("query_status", {})
     query_ok = bool(query_status.get("ok"))
     anomalies = report.get("anomalies", []) or []
-    coverage = report.get("coverage", {}) or {}
+    coverage = dict(report.get("coverage", {}) or {})
+    for key in ("missing_tasks", "invalid_tasks", "invalid_rows", "observable_pairs", "unexpected_records"):
+        report.get("coverage", {}).pop(key, None)
     observation_windows = [
         {
             **window,
@@ -192,6 +220,7 @@ def analyze_observation_windows(
         "data_source_status": "ok" if query_ok else f"error: {query_status.get('error') or 'query_failed'}",
         "observation_windows": observation_windows,
         "_coverage_audit": coverage,
+        "_probe_evidence": probe_evidence,
         "_baseline_health": baseline_health,
         "_baseline_coverage": baseline_coverage,
     }
@@ -202,14 +231,16 @@ def wait_and_observe(
     duration: int,
     *,
     baseline_window: dict,
+    deadline: float | None = None,
 ) -> dict:
     """Capture and analyze one observation window."""
-    window = capture_observation_window(runner, duration, name="steady")
+    window = capture_observation_window(runner, duration, name="steady", deadline=deadline)
     return analyze_observation_windows(
         runner,
         [window],
         total_duration_seconds=duration,
         baseline_window=baseline_window,
+        deadline=deadline,
     )
 
 

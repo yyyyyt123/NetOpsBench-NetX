@@ -76,6 +76,38 @@ def test_changed_scope_rejects_handoff():
     assert h.take("changed", 60)[0] is None
 
 
+def test_scope_differences_identify_the_changed_component():
+    from netopsbench.platform.scenario.baseline import RuntimeScope, scope_changes
+
+    first = RuntimeScope({"plan": "p"}, {"frr/a": "old"}, {"a": ["id"]})
+    second = RuntimeScope({"plan": "p"}, {"frr/a": "new"}, {"a": ["id"]})
+    assert scope_changes(first, second) == ["configs:frr/a"]
+    assert first.digest != second.digest
+
+
+def test_frr_normalization_preserves_context_and_order():
+    from netopsbench.platform.scenario.baseline import normalized_frr
+
+    text = "frr version 10.3\nrouter bgp 65001\n neighbor 10.0.0.1 remote-as 65002\n!\nline vty\n"
+    assert normalized_frr(text) == normalized_frr(
+        "Building configuration...\nCurrent configuration:\n! saved now\n" + text + "end\n"
+    )
+    assert normalized_frr(text) != normalized_frr(text.replace(" neighbor", "neighbor"))
+    assert normalized_frr(text) != normalized_frr(text.replace("65002", "65003"))
+
+
+def test_only_proven_owned_rewrite_can_change_recovery_scope():
+    from netopsbench.platform.scenario.baseline import RuntimeScope, restored_scope_errors
+
+    before = RuntimeScope({"plan": "p"}, {"configs/frr/leaf1.conf": "old"}, {})
+    after = RuntimeScope({"plan": "p"}, {"configs/frr/leaf1.conf": "new"}, {})
+    case = scenario(fault="link_down")
+    assert restored_scope_errors(before, after, case, None)
+    assert not restored_scope_errors(before, after, case, {"restored": True})
+    after.identity["plan"] = "changed"
+    assert restored_scope_errors(before, after, case, {"restored": True}) == ["identity:plan"]
+
+
 @pytest.fixture
 def runner(tmp_path, monkeypatch):
     metadata = generate_topology("xs", str(tmp_path), name="test")["metadata"]
@@ -97,7 +129,9 @@ def runner(tmp_path, monkeypatch):
 
     monkeypatch.setattr(r, "_setup_traffic", setup)
     monkeypatch.setattr(r, "_capture_baseline_window", reference)
+    monkeypatch.setattr(r, "_capture_observation_window", lambda seconds, name: window(duration=seconds))
     monkeypatch.setattr(r, "_wait_and_observe", observe)
+    monkeypatch.setattr(r, "_merge_observation_windows", observe)
     monkeypatch.setattr(r, "_baseline_scope", lambda _: "scope")
     monkeypatch.setattr(r, "_cleanup_after_scenario", lambda *a, **k: {"success": True, "status": "clean"})
     return r
@@ -116,6 +150,7 @@ def test_two_healthy_cases_keep_independent_observations_and_share_verified_base
         "mode": "reused",
         "reason": "verified_previous_case",
         "source_scenario_id": "one",
+        "scope_changes": [],
     }
     assert runner.calls == ["traffic", "reference", "observe", "observe", "observe"]
     assert first["cleanup"]["baseline_handoff"] and second["cleanup"]["baseline_handoff"]
@@ -125,7 +160,7 @@ def test_failed_baseline_retains_window_coverage_and_health_without_diagnosis(ru
     validation = observation()
     validation["_baseline_health"]["absolute_network_mtu_paths"] = 1
     validation["_coverage_audit"] = {"plan_id": "current-plan", "coverage_status": "complete"}
-    monkeypatch.setattr(runner, "_wait_and_observe", lambda *a, **k: validation)
+    monkeypatch.setattr(runner, "_merge_observation_windows", lambda *a, **k: validation)
 
     result = run(runner, "failed-baseline")
 
@@ -137,7 +172,7 @@ def test_failed_baseline_retains_window_coverage_and_health_without_diagnosis(ru
 
 
 @pytest.mark.parametrize("invalid", ["scope", "expiry", "cleanup", "unhealthy", "incomplete", "missing_absolute"])
-def test_invalid_candidate_forces_next_case_to_collect_both_baselines(runner, monkeypatch, invalid):
+def test_invalid_candidate_forces_fresh_single_baseline(runner, monkeypatch, invalid):
     if invalid in {"unhealthy", "incomplete", "missing_absolute"}:
         runner._healthy_baseline_candidate = None
         candidate = observation(healthy=invalid != "unhealthy", complete=invalid != "incomplete")
@@ -163,7 +198,11 @@ def test_invalid_candidate_forces_next_case_to_collect_both_baselines(runner, mo
 def test_fault_recovery_window_is_handed_to_next_case(runner, monkeypatch, next_fault):
     monkeypatch.setattr(runner, "_inject_fault", lambda *a: {"success": True})
     monkeypatch.setattr(runner, "_capture_observation_window", lambda seconds, name: window(duration=seconds))
-    monkeypatch.setattr(runner, "_merge_observation_windows", lambda *a, **k: observation(healthy=False))
+    monkeypatch.setattr(
+        runner,
+        "_merge_observation_windows",
+        lambda windows, *a, **k: observation(healthy=all(w.get("name") == "baseline" for w in windows)),
+    )
     monkeypatch.setattr(
         runner, "_cleanup_after_scenario", lambda *a, **k: {"success": True, "validated_baseline": window()}
     )
@@ -171,6 +210,21 @@ def test_fault_recovery_window_is_handed_to_next_case(runner, monkeypatch, next_
     second = run(runner, "next", next_fault)
     assert first["case_valid"] and first["cleanup"]["baseline_handoff"]
     assert second["baseline_preparation"]["mode"] == "reused"
+
+
+def test_verified_recovery_window_is_bound_to_its_new_identity(runner, monkeypatch):
+    identities = iter(["before", "recovered", "recovered", "recovered"])
+    monkeypatch.setattr(runner, "_baseline_scope", lambda _: next(identities))
+    monkeypatch.setattr(
+        runner,
+        "_cleanup_after_scenario",
+        lambda *a, **k: {"success": True, "validated_baseline": window(), "validated_baseline_scope": "recovered"},
+    )
+    first = run(runner, "one")
+    second = run(runner, "two")
+    assert first["cleanup"]["baseline_handoff"]
+    assert second["baseline_preparation"]["mode"] == "reused"
+    assert second["baseline_preparation"]["scope_changes"] == []
 
 
 def test_runtime_scope_changes_on_restart_config_policy_and_traffic(tmp_path, monkeypatch):
@@ -188,6 +242,10 @@ def test_runtime_scope_changes_on_restart_config_policy_and_traffic(tmp_path, mo
     )
     a = runtime_scope(r, scenario())
     assert a
+    r.traffic_controller.plan_digests["client1"] = "other"
+    assert runtime_scope(r, scenario()) != a
+    r.traffic_controller.plan_digests["client1"] = "plan"
+    assert runtime_scope(r, scenario()) == a
     r.traffic_controller.generation = 2
     assert runtime_scope(r, scenario()) != a
     r.traffic_controller.generation = 1

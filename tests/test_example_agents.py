@@ -549,11 +549,11 @@ class _FakeAgent:
 
 def _prepare_basic_repo(tmp_path):
     repo = tmp_path / "repo"
-    scenario_root = repo / "scenarios" / "generated" / "xs"
+    scenario_root = repo / "scenarios" / "generated" / "medium"
     scenario_root.mkdir(parents=True)
-    (scenario_root / "generated_link_down_xs_001.yaml").write_text("scenario: link_down\n", encoding="utf-8")
-    (scenario_root / "generated_packet_loss_xs_001.yaml").write_text("scenario: packet_loss\n", encoding="utf-8")
-    (scenario_root / "generated_high_latency_xs_001.yaml").write_text("scenario: high_latency\n", encoding="utf-8")
+    (scenario_root / "generated_link_down_medium_001.yaml").write_text("scenario: link_down\n", encoding="utf-8")
+    (scenario_root / "generated_packet_loss_medium_001.yaml").write_text("scenario: packet_loss\n", encoding="utf-8")
+    (scenario_root / "generated_high_latency_medium_001.yaml").write_text("scenario: high_latency\n", encoding="utf-8")
     # Also create custom fault scenario for 03_custom_faults
     fault_dir = repo / "examples" / "faults" / "custom_fault_pack"
     fault_dir.mkdir(parents=True)
@@ -786,7 +786,7 @@ class MinimalDeepAgent:
 fake_sdk = types.ModuleType('netopsbench.sdk')
 fake_sdk.NetOpsBench = NetOpsBench
 fake_sdk.RunFailedError = RuntimeError
-fake_sdk.supported_scales = lambda: ('xs', 'small', 'medium', 'large', 'xlarge', 'fat-tree-k8', 'fat-tree-k12')
+fake_sdk.supported_scales = lambda: ('xs', 'medium', 'medium', 'large', 'xlarge', 'fat-tree-k8', 'fat-tree-k12')
 sys.modules['netopsbench.sdk'] = fake_sdk
 
 fake_examples_agents = types.ModuleType('examples.agents')

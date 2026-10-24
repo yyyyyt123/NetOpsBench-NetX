@@ -1,6 +1,7 @@
 import inspect
 import json
 import tempfile
+import time
 
 from netopsbench.models.topology import (
     Collector,
@@ -121,9 +122,10 @@ def _snapshot_sequence(monkeypatch, detector, responses):
 
     def query(start_time, end_time):
         calls.append((start_time, end_time))
-        return SnapshotQueryResult(status="ok", rows=next(pending))
+        rows = next(pending)
+        return SnapshotQueryResult(status="ok", rows=rows), detector.summarize_coverage(rows)
 
-    monkeypatch.setattr(detector, "_query_snapshot", query)
+    monkeypatch.setattr(detector, "_query_covered_snapshot", query)
     return calls
 
 
@@ -328,7 +330,7 @@ def test_df_only_loss_is_mtu_suspect():
     assert analysis.quality["absolute_network_mtu_paths"] == 1
 
 
-def test_df_loss_with_any_counted_small_probe_loss_is_not_mtu():
+def test_df_loss_with_any_counted_medium_probe_loss_is_not_mtu():
     detector = _coverage_detector(client_count=2)
 
     analysis = detector.analyze_snapshot_rows(
@@ -578,8 +580,11 @@ def test_snapshot_query_failure_is_not_reported_as_healthy(monkeypatch):
     detector = _coverage_detector(client_count=2)
     monkeypatch.setattr(
         detector,
-        "_query_snapshot",
-        lambda _start, _end: SnapshotQueryResult(status="error", rows=[], error="influx unavailable"),
+        "_query_covered_snapshot",
+        lambda _start, _end: (
+            SnapshotQueryResult(status="error", rows=[], error="influx unavailable"),
+            {"coverage_status": "error"},
+        ),
     )
 
     report = detector.generate_windowed_anomaly_report(
@@ -598,8 +603,8 @@ def test_snapshot_query_failure_without_error_text_is_still_an_error(monkeypatch
     detector = _coverage_detector(client_count=2)
     monkeypatch.setattr(
         detector,
-        "_query_snapshot",
-        lambda _start, _end: SnapshotQueryResult(status="error", rows=[]),
+        "_query_covered_snapshot",
+        lambda _start, _end: (SnapshotQueryResult(status="error", rows=[]), {"coverage_status": "error"}),
     )
 
     report = detector.generate_windowed_anomaly_report(
@@ -742,6 +747,8 @@ def test_coverage_rejects_incomplete_socket_pool():
 
     assert audit["coverage_status"] == "incomplete"
     assert audit["invalid_socket_rows"] == 1
+    assert audit["invalid_rows"][0]["local_probe_errors"] == 0
+    assert audit["invalid_rows"][0]["socket_batch_valid"] is False
 
 
 def test_coverage_accepts_smaller_final_port_batch():
@@ -804,6 +811,8 @@ def test_coverage_rejects_local_probe_errors():
 
     assert audit["coverage_status"] == "incomplete"
     assert audit["invalid_socket_rows"] == 1
+    assert audit["invalid_rows"][0]["local_probe_errors"] == 1
+    assert audit["invalid_rows"][0]["socket_batch_valid"] is True
 
 
 def test_coverage_rejects_df_send_error_even_with_strong_rtt_loss():
@@ -1077,6 +1086,7 @@ def test_scenario_observation_passes_current_topology_to_pingmesh_detector(monke
             captured.update(kwargs)
 
         def generate_windowed_anomaly_report(self, **_kwargs):
+            captured["query_deadline"] = _kwargs.get("deadline")
             return {
                 "summary": {"total_anomalies": 0},
                 "query_status": {"ok": True, "error": None},
@@ -1097,11 +1107,14 @@ def test_scenario_observation_passes_current_topology_to_pingmesh_detector(monke
         topology_metadata=topology,
     )
 
+    deadline = time.monotonic() + 10
     observations = wait_and_observe(
         runner,
         duration=0,
         baseline_window={"start_time": "2026-01-01T00:00:00Z", "end_time": "2026-01-01T00:01:00Z"},
+        deadline=deadline,
     )
 
     assert observations["data_source_status"] == "ok"
     assert captured["topology_metadata"] is runner.manifest
+    assert captured["query_deadline"] == deadline

@@ -28,6 +28,29 @@ def _as_float(value, default: float = 0.0) -> float:
         return default
 
 
+def probe_pair_evidence(baseline_rows: list[dict], current_rows: list[dict], pairs: list[dict]) -> list[dict]:
+    """Reuse queried snapshots for a bounded private effect audit, without extra reads."""
+    selected = {(pair["src"], pair["dst"]) for pair in pairs}
+    evidence = {pair: {"src": pair[0], "dst": pair[1]} for pair in selected}
+    for phase, rows in (("baseline", baseline_rows), ("fault", current_rows)):
+        grouped = {pair: [] for pair in selected}
+        for row in rows:
+            key = row.get("src_name"), row.get("dst_name")
+            if key in grouped:
+                grouped[key].append(row)
+        for pair, points in grouped.items():
+            rtts = [_as_float(row.get("rtt_avg")) for row in points if _as_float(row.get("rtt_avg")) > 0]
+            evidence[pair][phase] = {
+                "samples": len(points),
+                "rtt_median_ms": statistics.median(rtts) if rtts else None,
+                "rtt_max_ms": max((_as_float(row.get("rtt_max")) for row in points), default=None),
+                "local_probe_errors": sum(int(_as_float(row.get("local_probe_errors"))) for row in points),
+                "regular": _loss_stats(points),
+                "df": _loss_stats(points, prefix="df_"),
+            }
+    return [evidence[pair] for pair in sorted(evidence)]
+
+
 def _group_by_path(rows: list[dict]) -> dict[tuple[str, str], list[dict]]:
     paths: dict[tuple[str, str], list[dict]] = {}
     for row in rows:

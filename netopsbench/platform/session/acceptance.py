@@ -20,6 +20,7 @@ from netopsbench.config import config
 from netopsbench.evaluator.scorer import Evaluator
 from netopsbench.models.profiles import get_scale_profile
 from netopsbench.models.topology import TopologyManifest
+from netopsbench.platform.faults.catalog import FAULT_CATALOG_VERSION
 from netopsbench.platform.observability.bgp_collector import (
     DEFAULT_BGP_FULL_SNAPSHOT_INTERVAL_SECONDS,
     DEFAULT_BGP_POLL_INTERVAL_SECONDS,
@@ -33,6 +34,7 @@ from netopsbench.platform.runtime.resources import (
     require_capacity,
     storage_snapshot,
 )
+from netopsbench.platform.runtime.toolchain import runtime_backend_identity
 from netopsbench.platform.scenario.generator import generate, load_topology, load_yaml
 from netopsbench.platform.scenario.parser import parse_scenario_file
 from netopsbench.platform.session.dispatch import ExecutionControl
@@ -120,15 +122,39 @@ def bgp_observation(worker, manifest, output: Path, *, control: OperationControl
 
 
 def completed_case_ids(entry: dict) -> set[str]:
-    """Completed execution and recovery count even when the diagnosis scores zero."""
+    """Keep completed diagnoses, including zero scores and separately failed recovery."""
+
+    def diagnosis_completed(report, summary):
+        if report.get("mode") == "effects":
+            return False
+        if "diagnosis_complete" in report:
+            return report["diagnosis_complete"] is True
+        # Read original current-campaign evidence; never rewrite or rescore it.
+        path = summary.get("raw_result_path")
+        if not path:
+            return False
+        try:
+            raw = json.loads(Path(path).read_text())
+        except (OSError, ValueError):
+            return False
+        episode = raw.get("episode") or {}
+        execution = episode.get("execution") or {}
+        return (
+            (episode.get("diagnosis") or {}).get("success") is True
+            and execution.get("case_valid") is True
+            and execution.get("termination_reason") == "submitted"
+        )
+
     return {
         summary["scenario_id"]
         for report in entry.get("cases", [])
         if not report.get("acceptance_error")
         for summary in report.get("scenario_summaries", [])
         if summary.get("case_valid") is True
-        and not summary.get("cleanup_failed")
-        and summary.get("status", "completed") == "completed"
+        and (
+            (not summary.get("cleanup_failed") and summary.get("status", "completed") == "completed")
+            or diagnosis_completed(report, summary)
+        )
     }
 
 
@@ -166,6 +192,8 @@ def expected_identities(result, backends):
 
 def validate_campaign_cases(entry, scale, backends, output, runtime, select_cases, smoke_cases):
     """Reject changes before provider calls, warm, teardown or redeployment."""
+    if entry.get("runtime_backend") != runtime_backend_identity():
+        raise ValueError("Campaign runtime backend changed or is unrecorded; start a separate campaign")
     if entry.get("profile_sha256") != get_scale_profile(scale).digest:
         raise ValueError("Resumed campaign profile differs from the accepted cases")
     records = entry.get("agents", {})
@@ -195,13 +223,16 @@ def validate_campaign_cases(entry, scale, backends, output, runtime, select_case
     selected = (
         smoke_cases(paths, manifest)
         if scale == "xs" and entry.get("smoke_cases")
-        else select_cases(paths, scale == "fat-tree-k18", manifest)
+        else select_cases(paths, True, manifest)
     )
     for record in records.values():
         freeze_cases(record, selected)
 
 
 def validate_resume(entry, runtime, scale, *, allow_unplanned=False):
+    identity = runtime_backend_identity()
+    if entry.get("runtime_backend") != identity or runtime.metadata.get("runtime_backend") != identity:
+        raise ValueError("Resumed runtime backend changed or is unrecorded; start a separate campaign")
     if runtime.scale != scale or len(runtime.workers) != 1:
         raise ValueError("Resume runtime must match the scale and contain exactly one worker")
     digest = entry.get("profile_sha256")
@@ -261,28 +292,45 @@ def run_cases(bench, runtime, paths, *, backend, vendor, entry, identity, output
     pending = [case for case in cases if case.id not in completed]
     if not pending:
         return False
+    effects_only = backend == "effects"
     raw_agent = (
-        agent_factory(backend)(vendor=vendor)
-        if backend == "deepagent"
-        else agent_factory(backend)(artifacts_dir=output / "codex-traces" / runtime.scale)
+        None
+        if effects_only
+        else (
+            agent_factory(backend)(vendor=vendor)
+            if backend == "deepagent"
+            else agent_factory(backend)(artifacts_dir=output / "codex-traces" / runtime.scale)
+        )
     )
-    agent = bench.agents.wrap(raw_agent)
+    agent = None if effects_only else bench.agents.wrap(raw_agent)
 
     def on_case(summary, raw, evaluations):
-        aggregate = Evaluator().generate_report(evaluations, agent_name=agent.name, topology_scale=runtime.scale)
+        aggregate = (
+            {"mode": "effects", "effect_audit": (raw.get("episode") or {}).get("effect_audit")}
+            if effects_only
+            else Evaluator().generate_report(evaluations, agent_name=agent.name, topology_scale=runtime.scale)
+        )
+        if not effects_only:
+            episode = raw.get("episode") or {}
+            execution = episode.get("execution") or {}
+            aggregate["diagnosis_complete"] = (
+                (episode.get("diagnosis") or {}).get("success") is True
+                and execution.get("case_valid") is True
+                and execution.get("termination_reason") == "submitted"
+            )
         records["cases"].append({**aggregate, "scenario_summaries": [summary]})
         records["last_recovery"] = raw.get("cleanup")
         print(f"[{runtime.scale}/{backend}] {summary['scenario_id']}: {summary['status']}", flush=True)
         checkpoint(output, result)
 
     report = bench.sessions._executor._run_with_existing_runtime(
-        mode="suite",
+        mode="effects" if effects_only else "suite",
         scenarios=pending,
         runtime=runtime,
         agent=agent,
         artifacts_dir=output / "runs" / runtime.scale / backend,
         trace=True,
-        control=ExecutionControl(on_case=on_case, stop_on_failure=True, cancel_event=cancel),
+        control=ExecutionControl(on_case=on_case, stop_on_failure=True, cancel_event=cancel, effects_only=effects_only),
     ).wait()
     records.setdefault("suite_reports", []).append(report.artifact_paths["report"])
     checkpoint(output, result)
@@ -292,19 +340,32 @@ def run_cases(bench, runtime, paths, *, backend, vendor, entry, identity, output
 
 
 def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_cases, smoke_cases) -> int:
+    mode = getattr(args, "mode", "diagnose")
+    backends_requested = ["effects"] if mode == "effects" else args.agents
     scales = args.scales.split(",")
     if args.resume_runtime and len(scales) != 1:
         raise ValueError("--resume-runtime requires exactly one scale")
     if args.rebuild_runtime and not args.resume_runtime:
         raise ValueError("--rebuild-runtime requires --resume-runtime")
+    backend_identity = runtime_backend_identity()
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=True)
     result = (
         json.loads((output / "acceptance.json").read_text())
         if args.resume_runtime
-        else {"started": datetime.now(UTC).isoformat(), "vendor": args.vendor, "scales": {}}
+        else {
+            "started": datetime.now(UTC).isoformat(),
+            "vendor": args.vendor,
+            "scales": {},
+            "mode": mode,
+            "fault_catalog_version": FAULT_CATALOG_VERSION,
+        }
     )
     if args.resume_runtime:
+        if result.get("runtime_backend") != backend_identity:
+            raise ValueError("Campaign runtime backend changed or is unrecorded; start a separate campaign")
+        if result.get("mode") != mode or result.get("fault_catalog_version") != FAULT_CATALOG_VERSION:
+            raise ValueError("Campaign mode or fault catalog changed; start a separate campaign")
         if result["vendor"] != args.vendor:
             raise ValueError("Cannot change the diagnosis vendor when resuming acceptance")
         recorded = result["scales"].get(scales[0])
@@ -316,8 +377,14 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
                     {"time": datetime.now(UTC).isoformat(), "error": item.pop("error")}
                 )
         result.setdefault("resumptions", []).append(
-            {"time": datetime.now(UTC).isoformat(), "runtime": str(args.resume_runtime.resolve())}
+            {
+                "time": datetime.now(UTC).isoformat(),
+                "runtime": str(args.resume_runtime.resolve()),
+                "previous_status": result.get("status"),
+                "previous_finished": result.get("finished"),
+            }
         )
+    result["runtime_backend"] = backend_identity
     sample_path = args.capacity_sample or output / "capacity-sample.json"
     sample = json.loads(sample_path.read_text()) if sample_path.exists() else None
     docker_root = Path(subprocess.check_output(["docker", "info", "--format", "{{.DockerRootDir}}"], text=True).strip())
@@ -332,7 +399,7 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
             and not args.rebuild_runtime
         )
         for scale in scales:
-            capacity = capacity_check(sample, scale, docker_root, retaining)
+            capacity = capacity_check(sample, scale, docker_root, retaining, mode == "diagnose")
             require_capacity(capacity, args.allow_tight_capacity)
     cancel, emergency = threading.Event(), threading.Event()
     previous = {}
@@ -357,8 +424,19 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
                     if not recorded.get("runtime_owned", False):
                         raise ValueError("Cannot rebuild an externally owned runtime")
             if args.resume_runtime:
-                validate_campaign_cases(recorded, scales[0], args.agents, output, resumed, select_cases, smoke_cases)
-            identities = preflight(args.agents, args.vendor, output, expected=expected_identities(result, args.agents))
+                validate_campaign_cases(
+                    recorded, scales[0], backends_requested, output, resumed, select_cases, smoke_cases
+                )
+            if mode == "effects":
+                # An empty backend list validates images/toolchain without agents,
+                # credential writes or model requests.
+                preflight([], args.vendor, output)
+                control.remaining()
+            identities = (
+                {"effects": {"mode": mode, "fault_catalog_version": FAULT_CATALOG_VERSION}}
+                if mode == "effects"
+                else preflight(args.agents, args.vendor, output, expected=expected_identities(result, args.agents))
+            )
             control.remaining()
             for backend, identity in identities.items():
                 for scale in scales:
@@ -368,7 +446,7 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
             if args.rebuild_runtime and resumed is not None:
                 resumed.teardown()
                 resumed = None
-            needs_smoke = "codex" in args.agents and not result.get("codex_xs_smoke")
+            needs_smoke = "codex" in backends_requested and "xs" not in scales and not result.get("codex_xs_smoke")
             phases = (["xs"] if needs_smoke or sample is None or "xs" in scales else []) + [
                 scale for scale in scales if scale != "xs"
             ]
@@ -383,6 +461,7 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
                         scale,
                         docker_root,
                         resumed is not None and scale == scales[0] and resumed.state == "warm",
+                        mode == "diagnose",
                     )
                     require_capacity(entry["capacity"], args.allow_tight_capacity)
                     if entry["capacity"]["status"] != "passed":
@@ -413,7 +492,17 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
                 digest = runtime.scale_registry.get(scale).digest
                 if entry.get("profile_sha256", digest) != digest:
                     raise ValueError("Runtime profile differs from the accepted cases")
-                entry.update(status="running", profile_sha256=digest, runtime_spec=runtime.describe())
+                entry.update(
+                    status="running",
+                    runtime_disposition="active",
+                    profile_sha256=digest,
+                    runtime_spec=runtime.describe(),
+                    mode=mode,
+                    fault_catalog_version=FAULT_CATALOG_VERSION,
+                    runtime_backend=backend_identity,
+                )
+                result["status"] = "running"
+                result.pop("finished", None)
                 checkpoint(output, result)
                 worker = runtime.workers[0]
                 preflight_topology = output / "preflight-topology" / scale
@@ -433,14 +522,12 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
                     output / "scenarios" / scale,
                     seed=42,
                 )
-                if scale == "fat-tree-k18" and len(paths) != 70:
-                    raise RuntimeError(f"Expected 70 scenarios, got {len(paths)}")
                 selected = (
                     smoke_cases(paths, manifest)
                     if entry.get("smoke_cases", scale == "xs" and needs_smoke)
-                    else select_cases(paths, scale == "fat-tree-k18", manifest)
+                    else select_cases(paths, True, manifest)
                 )
-                backends = ["codex"] if scale == "xs" and needs_smoke else args.agents
+                backends = ["codex"] if scale == "xs" and needs_smoke else backends_requested
                 entry.setdefault("smoke_cases", bool(scale == "xs" and needs_smoke))
                 for backend in backends:
                     record = entry.setdefault("agents", {}).setdefault(
@@ -496,6 +583,9 @@ def run_acceptance(args, *, bench_factory, agent_factory, preflight, select_case
                         ),
                     )
                     entry.setdefault("storage_start", storage_snapshot())
+                    # Keep prepared identities durable even if the process exits
+                    # during the first case, before its completion callback.
+                    checkpoint(output, result)
 
                     for backend in backends:
                         control.remaining()

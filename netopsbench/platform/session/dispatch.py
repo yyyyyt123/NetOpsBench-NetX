@@ -16,6 +16,7 @@ from netopsbench.models.profiles import ScaleRegistry
 from netopsbench.models.runtime import RuntimeIdentity
 from netopsbench.models.scenario import ScenarioSpec
 from netopsbench.platform.runtime.manager import RuntimePool
+from netopsbench.platform.scenario.artifacts import persist_result
 from netopsbench.platform.scenario.executor import ScenarioExecutor
 from netopsbench.platform.scenario.validator import require_scenario_topology
 from netopsbench.platform.session.context import build_worker_execution_context
@@ -24,7 +25,6 @@ from netopsbench.platform.session.reporting import load_topology_metadata
 from netopsbench.platform.session.scoring import score_scenario_episode
 from netopsbench.platform.session.trace_store import TraceWriter
 from netopsbench.platform.session.types import WorkerExecutionContext
-from netopsbench.platform.utils.files import atomic_write_json
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +38,7 @@ class ExecutionControl:
     on_case: Callable[[dict[str, Any], dict[str, Any], list[Any]], None] | None = None
     stop_on_failure: bool = False
     cancel_event: Any = None
+    effects_only: bool = False
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,7 @@ def _build_scenario_executor(
     minimum_baseline_seconds: int,
     post_recovery_wait_seconds: int,
     scale_registry: ScaleRegistry,
+    effects_only: bool = False,
 ) -> ScenarioExecutor:
     runner = ScenarioExecutor(
         topology_dir=str(worker_context.topology_dir),
@@ -112,7 +114,7 @@ def _build_scenario_executor(
         topology_id=worker_context.topology_id,
         fault_registry=fault_registry,
         scale_registry=scale_registry,
-        evaluator=_create_evaluator(),
+        evaluator=Evaluator() if effects_only else _create_evaluator(),
         runtime_worker=worker,
     )
     return runner
@@ -149,6 +151,7 @@ def _run_worker(
         minimum_baseline_seconds=minimum_baseline_seconds,
         post_recovery_wait_seconds=post_recovery_wait_seconds,
         scale_registry=scale_registry,
+        **({"effects_only": True} if control and control.effects_only else {}),
     )
     evaluator = runner.evaluator
     if control:
@@ -164,23 +167,27 @@ def _run_worker(
             if control and control.cancel_event and control.cancel_event.is_set():
                 worker_success = False
                 break
-            callback = build_runtime_diagnosis_callback(
-                agent,
-                str(worker_context.topology_dir),
-                scenario.id,
-                worker_context,
-                trace_writer,
-                worker.worker_id,
-                runtime.id,
-                scenario.scale,
-                cancel_event=control.cancel_event if control else None,
+            callback = (
+                None
+                if control and control.effects_only
+                else build_runtime_diagnosis_callback(
+                    agent,
+                    str(worker_context.topology_dir),
+                    scenario.id,
+                    worker_context,
+                    trace_writer,
+                    worker.worker_id,
+                    runtime.id,
+                    scenario.scale,
+                    cancel_event=control.cancel_event if control else None,
+                )
             )
             scenario_result = runner.run_scenario(scenario, diagnosis_callback=callback)
             executed_count += 1
             raw_result_path = _persist_raw_scenario_result(worker_raw_dir, scenario.id, scenario_result)
             case_valid = bool(scenario_result.get("case_valid", scenario_result.get("success")))
             scored: list[Any] = []
-            if case_valid:
+            if case_valid and not (control and control.effects_only):
                 try:
                     scored = score_scenario_episode(
                         scenario,
@@ -229,6 +236,7 @@ def _run_worker(
                     "worker": worker.worker_id,
                     "raw_result_path": raw_result_path,
                     "cleanup_failed": not cleanup_success,
+                    "phase_timings": scenario_result.get("phase_timings", {}),
                     **({"failure_stage": failure_stage} if failure_stage else {}),
                 }
             )
@@ -274,7 +282,7 @@ def _persist_raw_scenario_result(
     safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in str(scenario_id))
     timestamp = datetime.now(UTC).strftime("%Y%m%d_%H%M%S_%f")
     result_path = worker_raw_dir / f"{safe_id}_{timestamp}.json"
-    atomic_write_json(result_path, scenario_result, default=str)
+    persist_result(result_path, scenario_result)
     scenario_result["result_file"] = str(result_path)
     return str(result_path)
 
@@ -287,7 +295,7 @@ def execute_on_runtime_pool(
     raw_dir: Path,
     trace_writer: TraceWriter | None = None,
     fault_registry: Any = None,
-    minimum_baseline_seconds: int = 60,
+    minimum_baseline_seconds: int | None = None,
     post_recovery_wait_seconds: int = 2,
     control: ExecutionControl | None = None,
 ) -> PoolDispatchResult:

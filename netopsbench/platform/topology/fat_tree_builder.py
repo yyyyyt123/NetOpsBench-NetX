@@ -302,6 +302,7 @@ def build_fat_tree_plan(config: FatTreeConfig) -> FabricPlan:
         topology_id=config.name,
         name=config.name,
         scale=scale_name,
+        purpose=config.purpose,
         family="fat-tree",
         management=Management(
             network=config.mgmt_network_name or f"clab-mgmt-{config.name}",

@@ -7,7 +7,7 @@ as a single suite with automatic provisioning and teardown.
 Usage::
 
     PYTHONPATH=. python examples/03_run_scale_benchmark.py
-    PYTHONPATH=. python examples/03_run_scale_benchmark.py --scale small
+    PYTHONPATH=. python examples/03_run_scale_benchmark.py --scale medium
     PYTHONPATH=. python examples/03_run_scale_benchmark.py --vendor kimi
     PYTHONPATH=. python examples/03_run_scale_benchmark.py --vendor zhipu
 """
@@ -26,11 +26,10 @@ from examples._common import (
 )
 from netopsbench.sdk import NetOpsBench, supported_scales
 
-DEFAULT_SCALE = "xs"
+DEFAULT_SCALE = "medium"
 SCALE_CHOICES = list(supported_scales())
 DEFAULT_WORKERS = {
     "xs": 3,
-    "small": 3,
     "medium": 2,
     "large": 2,
     "xlarge": 1,
@@ -90,7 +89,7 @@ if __name__ == "__main__":
         "--workers",
         type=int,
         default=None,
-        help="Concurrent runtime labs. Default: xs/small=3, medium/large=2, xlarge/fat-tree=1.",
+        help="Concurrent runtime labs. Default: xs=3, medium/large=2, xlarge/fat-tree=1.",
     )
     args = parser.parse_args()
     raise SystemExit(

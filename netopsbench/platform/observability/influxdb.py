@@ -1,5 +1,6 @@
 """Shared InfluxDB lifecycle and Flux query client."""
 
+import csv
 import http.client
 import json
 import socket
@@ -9,6 +10,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
+from io import StringIO
 from typing import Literal
 
 import requests
@@ -27,6 +29,21 @@ class FluxQueryResult:
     status: Literal["ok", "error"]
     text: str = ""
     error: str | None = None
+
+
+def iter_annotated_csv_rows(csv_text: str):
+    """Parse Flux CSV while honoring the repeated headers emitted by multiple yields."""
+    header: list[str] | None = None
+    for values in csv.reader(StringIO(csv_text)):
+        if not values or (values[0] and values[0].startswith("#")):
+            continue
+        if "result" in values and "table" in values:
+            header = values
+            continue
+        if header is None:
+            continue
+        padded = [*values, *([""] * max(0, len(header) - len(values)))]
+        yield dict(zip(header, padded[: len(header)], strict=False))
 
 
 def query_flux(

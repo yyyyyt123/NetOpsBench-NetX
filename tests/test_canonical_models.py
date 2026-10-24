@@ -331,7 +331,6 @@ def test_runtime_identity_schema_version_defaults_to_v4():
     ),
     [
         ("xs", "clos", 2, 2, None, 1, 24, None, 250, 1800, 2, 60),
-        ("small", "clos", 2, 4, None, 2, 24, None, 250, 1800, 2, 60),
         ("medium", "clos", 4, 8, None, 2, 24, None, 200, 1800, 2, 60),
         ("large", "clos", 4, 16, None, 4, 24, 16, 100, 2700, 1, 180),
         ("xlarge", "clos", 16, 128, None, 2, 23, 16, 50, 3600, 1, 240),
@@ -371,7 +370,6 @@ def test_scale_profiles_keep_exact_runtime_values(
 def test_scale_profile_registry_is_complete_and_rejects_unknown_scales():
     assert supported_scales() == (
         "xs",
-        "small",
         "medium",
         "large",
         "xlarge",
@@ -384,6 +382,6 @@ def test_scale_profile_registry_is_complete_and_rejects_unknown_scales():
 
 
 def test_fat_tree_profiles_use_bounded_containerlab_parallelism():
-    assert get_scale_profile("fat-tree-k8").containerlab_max_workers == 1
+    assert get_scale_profile("fat-tree-k8").containerlab_max_workers == 16
     assert get_scale_profile("fat-tree-k12").containerlab_max_workers == 16
     assert get_scale_profile("xlarge").containerlab_max_workers == 16

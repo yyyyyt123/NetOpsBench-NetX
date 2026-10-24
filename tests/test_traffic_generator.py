@@ -172,7 +172,6 @@ def test_fat_tree_profiles_are_bounded(tmp_path):
     ("scale", "expected_flows", "expected_incoming"),
     [
         ("xs", 2, 1),
-        ("small", 32, 4),
         ("medium", 64, 4),
         ("large", 256, 4),
         ("xlarge", 1024, 4),

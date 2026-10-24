@@ -110,7 +110,9 @@ def test_get_device_interfaces_summary_keeps_diagnostic_fields(monkeypatch):
 
     def fake_exec(container, cmd_args, timeout):
         command = " ".join(cmd_args)
-        if "status" in command:
+        if cmd_args[:3] == ["ip", "-j", "-4"]:
+            stdout = '[{"ifname":"Ethernet0", "addr_info":[{"local":"10.0.0.1", "prefixlen":30}]}]'
+        elif "status" in command:
             stdout = "Interface    Admin    Oper    Speed\nEthernet0    up       up      100G\nEthernet4    up       down    100G\n"
         else:
             stdout = "IFACE      RX_ERR    TX_ERR    RX_DRP    TX_DRP\nEthernet0  0         0         0         0\nEthernet4  5         0         2         0\n"

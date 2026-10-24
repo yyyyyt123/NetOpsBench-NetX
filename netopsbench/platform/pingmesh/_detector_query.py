@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import csv
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from io import StringIO
 
-from netopsbench.platform.observability.influxdb import query_flux
+from netopsbench.platform.observability.influxdb import iter_annotated_csv_rows, query_flux
 
 _SNAPSHOT_FIELDS = (
     "rtt_min",
@@ -52,11 +51,8 @@ class DetectorQueryMixin:
 
     @staticmethod
     def _parse_snapshot_csv(text: str) -> list[dict]:
-        data_lines = [line for line in text.splitlines() if line and not line.startswith("#")]
-        if not data_lines:
-            return []
         rows = []
-        for row in csv.DictReader(StringIO("\n".join(data_lines))):
+        for row in iter_annotated_csv_rows(text):
             if row.get("_time") in (None, "", "_time"):
                 continue
             parsed = {key: value for key, value in row.items() if key and value not in (None, "")}
@@ -75,11 +71,16 @@ class DetectorQueryMixin:
         start_time: str,
         end_time: str,
         source_names: list[str],
+        *,
+        deadline: float | None = None,
+        fields: tuple[str, ...] | None = None,
     ) -> SnapshotQueryResult:
+        if deadline is not None and time.monotonic() >= deadline:
+            return SnapshotQueryResult(status="error", rows=[], error="snapshot query deadline exceeded")
         bucket = self._safe_flux_string(self.bucket)
         start = self._safe_flux_string(start_time)
         end = self._safe_flux_string(end_time)
-        fields = " or ".join(f'r._field == "{field}"' for field in _SNAPSHOT_FIELDS)
+        field_filter = " or ".join(f'r._field == "{field}"' for field in (fields or _SNAPSHOT_FIELDS))
         source_filter = ""
         if source_names:
             predicates = " or ".join(f'r.src_name == "{self._safe_flux_string(source)}"' for source in source_names)
@@ -90,7 +91,7 @@ class DetectorQueryMixin:
             '  |> filter(fn: (r) => r._measurement == "pingmesh")\n'
             + self._topology_filter()
             + source_filter
-            + f"  |> filter(fn: (r) => {fields})\n"
+            + f"  |> filter(fn: (r) => {field_filter})\n"
             '  |> keep(columns: ["_time", "_field", "_value", "src_ip", "dst_ip", '
             '"src_name", "dst_name", "src_leaf", "dst_leaf", "path_type", "plan_id"])\n'
             '  |> pivot(rowKey: ["_time", "src_ip", "dst_ip", "src_name", "dst_name", '
@@ -102,29 +103,36 @@ class DetectorQueryMixin:
             self.org,
             query,
             timeout=_SNAPSHOT_QUERY_TIMEOUT_SECONDS,
+            **({"deadline": deadline} if deadline is not None else {}),
         )
         if result.status != "ok":
             return SnapshotQueryResult(status="error", rows=[], error=result.error)
         return SnapshotQueryResult(status="ok", rows=self._parse_snapshot_csv(result.text))
 
-    def _query_snapshot(self, start_time: str, end_time: str) -> SnapshotQueryResult:
+    def _query_snapshot(
+        self, start_time: str, end_time: str, *, deadline: float | None = None, fields: tuple[str, ...] | None = None
+    ) -> SnapshotQueryResult:
         sources = list(dict.fromkeys(self._pingmesh_clients))
         shards = [
             sources[index : index + _SNAPSHOT_SOURCE_SHARD_SIZE]
             for index in range(0, len(sources), _SNAPSHOT_SOURCE_SHARD_SIZE)
         ] or [[]]
 
+        def query(shard):
+            return self._query_snapshot_shard(
+                start_time,
+                end_time,
+                shard,
+                **({"deadline": deadline} if deadline is not None else {}),
+                **({"fields": fields} if fields is not None else {}),
+            )
+
         if len(shards) == 1:
-            results = [self._query_snapshot_shard(start_time, end_time, shards[0])]
+            results = [query(shards[0])]
         else:
             workers = min(_SNAPSHOT_QUERY_WORKERS, len(shards))
             with ThreadPoolExecutor(max_workers=workers) as executor:
-                results = list(
-                    executor.map(
-                        lambda shard: self._query_snapshot_shard(start_time, end_time, shard),
-                        shards,
-                    )
-                )
+                results = list(executor.map(query, shards))
 
         failures = [(index, result) for index, result in enumerate(results, start=1) if result.status != "ok"]
         if failures:

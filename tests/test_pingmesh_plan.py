@@ -15,7 +15,7 @@ from netopsbench.platform.topology.topology_utils import coerce_topology_manifes
 @pytest.fixture(scope="module")
 def manifests():
     result = {}
-    for scale in ("xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12", "fat-tree-k18"):
+    for scale in ("xs", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12", "fat-tree-k18"):
         config = config_for_scale(scale)
         builder = build_clos_plan if isinstance(config, TopologyConfig) else build_fat_tree_plan
         result[scale] = builder(config).manifest
@@ -26,7 +26,6 @@ def manifests():
     "scale,pairs,epoch,window",
     [
         ("xs", 2, 2, 7),
-        ("small", 32, 2, 7),
         ("medium", 128, 3, 8),
         ("large", 1152, 24, 30),
         ("xlarge", 16512, 60, 66),
@@ -66,7 +65,7 @@ def test_fixed_plans_cover_all_links_and_ports(manifests, scale, pairs, epoch, w
 
 
 def test_compilation_is_deterministic_and_old_or_stale_artifacts_fail(manifests):
-    manifest = manifests["small"]
+    manifest = manifests["medium"]
     assert compile_pingmesh_plan(manifest) == manifest.pingmesh_plan
     payload = manifest.model_dump(mode="json")
     payload["schema_version"] = "3"
@@ -100,7 +99,7 @@ def observation_rows(plan):
 
 
 def test_audit_requires_exact_peers_frames_and_current_plan(manifests):
-    manifest = manifests["small"]
+    manifest = manifests["medium"]
     detector = AnomalyDetector("http://localhost", "token", "org", "bucket", topology_metadata=manifest)
     rows = observation_rows(manifest.require_pingmesh_plan())
     assert detector.summarize_coverage(rows)["coverage_status"] == "complete"

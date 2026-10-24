@@ -18,7 +18,7 @@ def test_scenario_manager_can_create_and_roundtrip_yaml(tmp_path):
         id="scenario_x",
         name="Scenario X",
         description="desc",
-        scale="small",
+        scale="medium",
         episode={
             "episode_id": "diagnosis",
             "fault_type": "static_route_misconfig",
@@ -33,7 +33,7 @@ def test_scenario_manager_can_create_and_roundtrip_yaml(tmp_path):
 
     assert loaded == scenario
     assert loaded.id == "scenario_x"
-    assert loaded.scale == "small"
+    assert loaded.scale == "medium"
     assert loaded.episode.fault_type == "static_route_misconfig"
     assert scenario_from_dict(scenario.to_dict()) == scenario
 
@@ -88,7 +88,6 @@ def test_supported_scales_are_available_from_public_sdk():
 
     assert supported_scales() == (
         "xs",
-        "small",
         "medium",
         "large",
         "xlarge",

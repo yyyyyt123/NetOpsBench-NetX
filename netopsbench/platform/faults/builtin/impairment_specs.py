@@ -10,7 +10,7 @@ def _inject_mtu_mismatch_episode(injector, episode):
     return injector.inject_mtu_mismatch(
         episode.target_device,
         episode.target_interface,
-        mtu=episode.mtu or 1400,
+        mtu=episode_param(episode, "mtu", 1400),
     )
 
 

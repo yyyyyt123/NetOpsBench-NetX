@@ -13,51 +13,46 @@ from netopsbench.platform.runtime import resources
 from netopsbench.platform.scenario.parser import save_scenario_file
 from netopsbench.platform.session import acceptance
 from netopsbench.platform.topology.config import config_for_scale
-from netopsbench.platform.topology.fat_tree_builder import build_fat_tree_plan
 from scripts import validate_pingmesh_scales as cli
 
+BACKEND = {"provider": "upstream", "containerlab_version": "test"}
 
-def test_selects_current_healthy_episode_twelve_types_and_all_tiers(tmp_path):
-    manifest = build_fat_tree_plan(config_for_scale("fat-tree-k18")).manifest
-    types = [
-        "acl_misconfig",
-        "bgp_neighbor_misconfig",
-        "blackhole_route",
-        "device_down",
-        "high_latency",
-        "link_down",
-        "link_flapping",
-        "mtu_mismatch",
-        "packet_corruption",
-        "packet_loss",
-        "route_policy_misconfig",
-        "static_route_misconfig",
-    ]
-    paths = []
-    for fault in types:
-        for device in ("core81", "agg162", "edge162"):
-            case = ScenarioSpec(
-                scenario_id=f"{fault}-{device}",
-                name=fault,
-                topology_scale="fat-tree-k18",
-                episode=EpisodeSpec(episode_id="diagnosis", fault_type=fault, target_device=device),
-            )
-            paths.append(save_scenario_file(case, tmp_path / f"{case.id}.yaml"))
-    healthy = ScenarioSpec(
-        scenario_id="healthy",
-        name="healthy",
-        topology_scale="fat-tree-k18",
-        episode=EpisodeSpec(episode_id="diagnosis", fault_type="none"),
-    )
-    paths.append(save_scenario_file(healthy, tmp_path / "healthy.yaml"))
-    selected = cli.select_cases(paths, True, manifest)
-    cases = [cli.parse_scenario_file(path) for path in selected]
-    assert len(cases) == 13
-    assert cases[0].episode.is_healthy
-    assert {case.episode.fault_type for case in cases[1:]} == set(types)
-    assert {manifest.device(case.episode.target_device).role.value for case in cases[1:]} == {"core", "agg", "edge"}
-    assert any(case.episode.target_device == "edge162" for case in cases[1:])
-    assert cli.select_cases(paths, False, manifest) == [tmp_path / "healthy.yaml"]
+
+@pytest.fixture(autouse=True)
+def mock_runtime_backend(monkeypatch):
+    monkeypatch.setattr(acceptance, "runtime_backend_identity", lambda: dict(BACKEND))
+    monkeypatch.setattr(resources, "runtime_backend_identity", lambda: dict(BACKEND))
+
+
+@pytest.mark.parametrize("agents", [[], ["codex"], ["deepagent", "codex"]])
+def test_acceptance_defaults_to_deepseek_and_requires_explicit_codex(monkeypatch, agents):
+    arguments = ["acceptance", "--scales", "xs"]
+    if agents:
+        arguments.extend(["--agents", *agents])
+    monkeypatch.setattr(sys, "argv", arguments)
+    received = []
+
+    def run(args, **kwargs):
+        received.append((args.vendor, args.agents))
+        return 0
+
+    monkeypatch.setattr(cli, "run_acceptance", run)
+    assert cli.main() == 0
+    assert received == [("deepseek", agents or ["deepagent"])]
+
+
+def test_selection_preserves_every_coverage_unit(tmp_path):
+    from netopsbench.platform.scenario.generator import generate, load_topology
+    from netopsbench.platform.topology.generator import generate_topology
+
+    root = tmp_path / "topology"
+    generate_topology("medium", str(root))
+    topo = load_topology("medium", str(root))
+    paths = generate({"fault_catalog_version": 2}, topo, tmp_path / "cases", 42)
+    selected = cli.select_cases(paths, True, topo.manifest)
+    assert len(selected) == 64
+    assert all(cli.parse_scenario_file(p).episode.is_healthy for p in selected[:4])
+    assert len(cli.select_cases(paths, False, topo.manifest)) == 4
 
 
 def test_capacity_requires_twenty_percent_margin_and_disk_reserve(monkeypatch):
@@ -72,6 +67,7 @@ def test_capacity_requires_twenty_percent_margin_and_disk_reserve(monkeypatch):
     free = [1000 * resources.GIB]
     monkeypatch.setattr(acceptance.shutil, "disk_usage", lambda _: SimpleNamespace(free=free[0]))
     sample = {
+        "runtime_backend": BACKEND,
         "nodes": [
             {"name": "lab-edge1", "data_ports": 18, "memory_bytes": 100 * 1024**2, "writable_bytes": 10 * 1024**2},
             {"name": "lab-client1", "memory_bytes": 2 * 1024**2, "writable_bytes": 1024},
@@ -81,7 +77,7 @@ def test_capacity_requires_twenty_percent_margin_and_disk_reserve(monkeypatch):
                 "memory_bytes": 1000 * resources.GIB,
                 "writable_bytes": 1000 * resources.GIB,
             },
-        ]
+        ],
     }
     result = resources.capacity_check(sample, "fat-tree-k18", Path("/unused"))
     assert result["memory_margin"] == 1.2
@@ -96,6 +92,7 @@ def test_capacity_uses_peak_of_matching_port_capacity(monkeypatch):
     sample = resources.peak_sample(
         [
             {
+                "runtime_backend": BACKEND,
                 "nodes": [
                     {
                         "name": "lab-leaf1",
@@ -118,9 +115,10 @@ def test_capacity_uses_peak_of_matching_port_capacity(monkeypatch):
                         "memory_bytes": 2 * 1024**2,
                         "writable_bytes": 1024,
                     },
-                ]
+                ],
             },
             {
+                "runtime_backend": BACKEND,
                 "nodes": [
                     {
                         "name": "lab-leaf1",
@@ -129,7 +127,7 @@ def test_capacity_uses_peak_of_matching_port_capacity(monkeypatch):
                         "memory_bytes": 200 * 1024**2,
                         "writable_bytes": 2048,
                     }
-                ]
+                ],
             },
         ]
     )
@@ -140,6 +138,30 @@ def test_capacity_uses_peak_of_matching_port_capacity(monkeypatch):
         if row["role"] == "switch":
             row["data_ports"] = 8
     assert resources.capacity_check(sample, "fat-tree-k18", Path("/unused"))["status"] == "blocked"
+
+
+@pytest.mark.parametrize("retained", [False, True])
+def test_effects_capacity_excludes_absent_diagnostic_resources_only(monkeypatch, retained):
+    monkeypatch.setattr(Path, "read_text", lambda self: "MemAvailable: 400000000\n")
+    monkeypatch.setattr(resources.shutil, "disk_usage", lambda _: SimpleNamespace(free=1000 * resources.GIB))
+    sample = {
+        "runtime_backend": BACKEND,
+        "nodes": [
+            {"name": "lab-core1", "data_ports": 18, "memory_bytes": 500 * 1024**2, "writable_bytes": 1024},
+            {"name": "lab-client1", "memory_bytes": 20 * 1024**2, "writable_bytes": 1024},
+        ],
+    }
+    diagnose = resources.capacity_check(sample, "fat-tree-k18", Path("/unused"), retained)
+    effects = resources.capacity_check(sample, "fat-tree-k18", Path("/unused"), retained, False)
+    assert diagnose["diagnostic_memory_reserve_bytes"] == int(2.25 * resources.GIB)
+    assert effects["diagnostic_memory_reserve_bytes"] == 0
+    assert diagnose["estimated_memory_bytes"] - effects["estimated_memory_bytes"] == pytest.approx(
+        2.7 * resources.GIB, abs=1
+    )
+    assert diagnose["estimated_disk_bytes"] == effects["estimated_disk_bytes"]
+    assert diagnose["switch_costs"] == effects["switch_costs"]
+    assert effects["memory_margin"] == 1.2
+    assert resources.EMERGENCY_MEMORY_BYTES == 12 * resources.GIB
 
 
 def test_docker_memory_units_are_converted():
@@ -228,9 +250,11 @@ def test_model_inconclusive_without_execution_error_remains_valid():
 
 @pytest.mark.parametrize("mismatch", ["scale", "plan"])
 def test_resume_identity_mismatch_is_rejected_before_health_or_mutation(monkeypatch, tmp_path, mismatch):
-    entry = {"plan": {"plan_id": "original"}}
+    entry = {"runtime_backend": BACKEND, "plan": {"plan_id": "original"}}
     runtime = SimpleNamespace(
-        scale="xs" if mismatch == "scale" else "fat-tree-k18", workers=[SimpleNamespace(topology_dir=tmp_path)]
+        scale="xs" if mismatch == "scale" else "fat-tree-k18",
+        workers=[SimpleNamespace(topology_dir=tmp_path)],
+        metadata={"runtime_backend": BACKEND},
     )
     monkeypatch.setattr(
         acceptance,
@@ -248,6 +272,7 @@ def test_resume_identity_mismatch_is_rejected_before_health_or_mutation(monkeypa
     [
         (False, 194, 100, False, "Capacity check failed"),
         (True, 194, 100, False, "deployment reached"),
+        (True, 191, 100, False, "Capacity check failed"),
         (True, 180, 100, False, "Capacity check failed"),
         (True, 194, 20, False, "Capacity check failed"),
         (True, 194, 100, True, "Capacity check failed"),
@@ -257,7 +282,7 @@ def test_explicit_margin_waiver_keeps_memory_disk_and_sample_guards(
     monkeypatch, tmp_path, allow, memory_gib, disk_gib, extrapolated, expected
 ):
     sample = tmp_path / "sample.json"
-    sample.write_text(json.dumps({"nodes": []}))
+    sample.write_text(json.dumps({"runtime_backend": BACKEND, "nodes": []}))
     argv = ["acceptance", "--scales", "fat-tree-k18", "--capacity-sample", str(sample), "--output", str(tmp_path)]
     if allow:
         argv.append("--allow-tight-capacity")
@@ -361,35 +386,19 @@ def test_checkpoint_is_atomic_and_preserves_failed_attempts(tmp_path):
     assert len(list(tmp_path.iterdir())) == 1
 
 
-def test_xs_smoke_uses_redundant_fabric_and_keeps_clients_running(tmp_path):
-    from netopsbench.platform.topology.clos_builder import build_clos_plan
+def test_xs_smoke_has_four_current_validation_cases(tmp_path):
+    from netopsbench.platform.scenario.generator import generate, load_topology
+    from netopsbench.platform.topology.generator import generate_topology
 
-    manifest = build_clos_plan(config_for_scale("xs")).manifest
-    paths = []
-    for fault in ("none", "link_down", "device_down"):
-        case = ScenarioSpec(
-            scenario_id=f"case-{fault}",
-            name=fault,
-            topology_scale="xs",
-            episode=EpisodeSpec(
-                episode_id="diagnosis",
-                fault_type=fault,
-                target_device="leaf1" if fault != "none" else None,
-                target_interface="Ethernet8" if fault == "link_down" else None,
-            ),
-        )
-        paths.append(save_scenario_file(case, tmp_path / f"{case.id}.yaml"))
-    selected = cli.smoke_cases(paths, manifest)
-    link = cli.parse_scenario_file(selected[1])
-    device = cli.parse_scenario_file(selected[2])
-    endpoint = (link.episode.target_device, link.episode.target_interface)
-    assert any(
-        endpoint in [(e.device, e.interface) for e in row.endpoints]
-        and all(manifest.device(e.device).role.value != "client" for e in row.endpoints)
-        for row in manifest.links
-    )
-    assert manifest.device(device.episode.target_device).role.value == "spine"
-    assert selected == cli.smoke_cases(paths, manifest)
+    root = tmp_path / "topology"
+    generate_topology("xs", str(root))
+    topo = load_topology("xs", str(root))
+    paths = generate({"fault_catalog_version": 2}, topo, tmp_path / "cases", 42)
+    selected = cli.smoke_cases(paths, topo.manifest)
+    cases = {cli.parse_scenario_file(path).episode.fault_type: cli.parse_scenario_file(path) for path in selected}
+    assert set(cases) == {"none", "link_down", "device_down", "bgp_auth_mismatch"}
+    assert topo.manifest.device(cases["device_down"].episode.target_device).role.value == "spine"
+    assert cases["link_down"].metadata["coverage_unit"].endswith("leaf-spine")
 
 
 def test_owned_failed_partial_deployment_is_retained_and_quarantined(tmp_path):
@@ -426,16 +435,19 @@ def test_owned_failed_partial_deployment_is_retained_and_quarantined(tmp_path):
 
 
 def test_explicit_rebuild_can_validate_an_incomplete_owned_runtime_without_a_plan(tmp_path):
-    runtime = SimpleNamespace(scale="xs", workers=[SimpleNamespace(topology_dir=tmp_path)])
-    assert acceptance.validate_resume({}, runtime, "xs", allow_unplanned=True) is None
+    runtime = SimpleNamespace(
+        scale="xs", workers=[SimpleNamespace(topology_dir=tmp_path)], metadata={"runtime_backend": BACKEND}
+    )
+    assert acceptance.validate_resume({"runtime_backend": BACKEND}, runtime, "xs", allow_unplanned=True) is None
     with pytest.raises((FileNotFoundError, ValueError)):
-        acceptance.validate_resume({}, runtime, "xs")
+        acceptance.validate_resume({"runtime_backend": BACKEND}, runtime, "xs")
 
 
 def test_retained_lab_capacity_does_not_charge_for_another_deployment(monkeypatch):
     monkeypatch.setattr(Path, "read_text", lambda *a: "MemAvailable: 110000000\n")
     monkeypatch.setattr(acceptance.shutil, "disk_usage", lambda _: SimpleNamespace(free=1000 * resources.GIB))
     sample = {
+        "runtime_backend": BACKEND,
         "nodes": [
             {
                 "name": "lab-core1",
@@ -445,7 +457,7 @@ def test_retained_lab_capacity_does_not_charge_for_another_deployment(monkeypatc
                 "writable_bytes": 1024,
             },
             {"name": "lab-client1", "role": "client", "memory_bytes": 20 * 1024**2, "writable_bytes": 1024},
-        ]
+        ],
     }
     fresh = resources.capacity_check(sample, "fat-tree-k18", Path("/unused"))
     retained = resources.capacity_check(sample, "fat-tree-k18", Path("/unused"), True)
@@ -516,6 +528,133 @@ def test_preflight_interrupt_prevents_runtime_creation(monkeypatch, tmp_path):
     assert checkpoint["memory_samples"]
 
 
+def test_resumed_campaign_exposes_current_resource_state_before_deployment(monkeypatch, tmp_path):
+    from netopsbench.platform.runtime.manager import RuntimePool
+    from netopsbench.sdk import NetOpsBench
+
+    workspace = tmp_path / "workspace"
+    output = tmp_path / "campaign"
+    output.mkdir()
+    runtime_dir = workspace / ".netopsbench" / "runtimes" / "historical"
+    recorded = {
+        "runtime_backend": BACKEND,
+        "vendor": "deepseek",
+        "mode": "effects",
+        "fault_catalog_version": 2,
+        "status": "failed_retained",
+        "finished": "2026-10-12T00:00:00Z",
+        "scales": {
+            "xs": {
+                "runtime": str(runtime_dir),
+                "runtime_owned": True,
+                "runtime_disposition": "quarantined",
+                "resource_samples": [],
+            }
+        },
+    }
+    acceptance.checkpoint(output, recorded)
+    sample = tmp_path / "capacity.json"
+    sample.write_text(json.dumps({"runtime_backend": BACKEND, "nodes": []}))
+    args = SimpleNamespace(
+        mode="effects",
+        agents=[],
+        scales="xs",
+        vendor="deepseek",
+        output=output,
+        resume_runtime=runtime_dir,
+        rebuild_runtime=False,
+        capacity_sample=sample,
+        allow_tight_capacity=False,
+    )
+    monkeypatch.setattr(acceptance.subprocess, "check_output", lambda *a, **kw: str(tmp_path))
+    monkeypatch.setattr(acceptance, "capacity_check", lambda *a: {"status": "passed"})
+    monkeypatch.setattr(acceptance, "validate_campaign_cases", lambda *a: None)
+    monkeypatch.setattr(resources.ResourceMonitor, "watch", lambda *a: None)
+
+    def deploy(runtime):
+        current = json.loads((output / "acceptance.json").read_text())
+        assert current["status"] == "running"
+        assert "finished" not in current
+        assert current["scales"]["xs"]["runtime_disposition"] == "active"
+        assert current["resumptions"][-1]["previous_finished"] == recorded["finished"]
+        raise RuntimeError("deployment reached")
+
+    monkeypatch.setattr(RuntimePool, "deploy", deploy)
+    with pytest.raises(RuntimeError, match="deployment reached"):
+        acceptance.run_acceptance(
+            args,
+            bench_factory=lambda **kw: NetOpsBench(workspace=str(workspace)),
+            agent_factory=None,
+            preflight=lambda *a, **kw: {},
+            select_cases=cli.select_cases,
+            smoke_cases=cli.smoke_cases,
+        )
+
+
+def test_prepared_identity_is_durable_before_the_first_case(monkeypatch, tmp_path):
+    from netopsbench.models.profiles import default_scale_registry
+    from netopsbench.platform.topology.generator import generate_topology
+
+    output, topology = tmp_path / "campaign", tmp_path / "runtime" / "worker-1"
+    generated = generate_topology("xs", str(topology), name="checkpoint-xs")
+    worker = SimpleNamespace(
+        lab_name="checkpoint-xs", topology_dir=topology, mgmt_subnet="172.31.100.0/24", mgmt_network="checkpoint-mgmt"
+    )
+    runtime = SimpleNamespace(
+        state="warm",
+        root_dir=topology.parent,
+        workers=[worker],
+        scale_registry=default_scale_registry(),
+        metadata={},
+        stage_results={},
+        describe=lambda: {},
+    )
+    bench = SimpleNamespace(runtimes=SimpleNamespace(create=lambda **kw: SimpleNamespace(_runtime=runtime)))
+    sample = tmp_path / "capacity.json"
+    sample.write_text(json.dumps({"runtime_backend": BACKEND, "nodes": []}))
+    args = SimpleNamespace(
+        mode="effects",
+        agents=[],
+        scales="xs",
+        vendor="deepseek",
+        output=output,
+        resume_runtime=None,
+        rebuild_runtime=False,
+        capacity_sample=sample,
+        allow_tight_capacity=False,
+    )
+    monkeypatch.setattr(
+        acceptance.subprocess, "check_output", lambda cmd, **kw: "sha256:test" if "inspect" in cmd else str(tmp_path)
+    )
+    monkeypatch.setattr(resources.ResourceMonitor, "start", lambda *a: None)
+    monkeypatch.setattr(resources.ResourceMonitor, "watch", lambda *a: None)
+    monkeypatch.setattr(acceptance, "require_full_health", lambda *a: {"status": "passed"})
+    monkeypatch.setattr(acceptance, "capacity_check", lambda *a: {"status": "passed"})
+    monkeypatch.setattr(acceptance, "ingestion_latency", lambda *a: {"query_visible_seconds": 0.1})
+    monkeypatch.setattr(acceptance, "bgp_observation", lambda *a, **kw: {"established": 8})
+    monkeypatch.setattr(acceptance, "storage_snapshot", lambda: {})
+
+    def first_case(*a, **kw):
+        saved = json.loads((output / "acceptance.json").read_text())["scales"]["xs"]
+        assert saved["plan"]["plan_id"] == generated["metadata"]["pingmesh_plan"]["settings"]["plan_id"]
+        assert saved["client_images"] == ["sha256:test"]
+        assert saved["start_health"]["status"] == "passed"
+        assert saved["ingestion_latency"]["query_visible_seconds"] == 0.1
+        raise RuntimeError("first case interrupted")
+
+    monkeypatch.setattr(acceptance, "run_cases", first_case)
+    with pytest.raises(RuntimeError, match="first case interrupted"):
+        acceptance.run_acceptance(
+            args,
+            bench_factory=lambda **kw: nullcontext(bench),
+            agent_factory=None,
+            preflight=lambda *a, **kw: {},
+            select_cases=cli.select_cases,
+            smoke_cases=cli.smoke_cases,
+        )
+    assert json.loads((output / "acceptance.json").read_text())["status"] == "failed_retained"
+
+
 def test_checkpoint_remains_parseable_during_resource_sampling(tmp_path):
     import threading
 
@@ -559,3 +698,46 @@ def test_codex_resume_identity_checked_before_credentials_or_container_preflight
     monkeypatch.setattr(cli.subprocess, "check_output", lambda *args, **kwargs: "image-digest\n")
     with pytest.raises(ValueError, match="configuration"):
         cli.preflight_agents(["codex"], "deepseek", tmp_path, expected={"codex": expected})
+
+
+def test_resume_keeps_completed_zero_score_diagnosis_when_recovery_requires_rebuild(tmp_path):
+    raw = tmp_path / "case.json"
+    raw.write_text(
+        json.dumps(
+            {
+                "episode": {
+                    "diagnosis": {"success": True},
+                    "execution": {"case_valid": True, "termination_reason": "submitted"},
+                }
+            }
+        )
+    )
+    report = {
+        "summary": {"average_score": 0},
+        "scenario_summaries": [
+            {
+                "scenario_id": "valid-zero",
+                "case_valid": True,
+                "status": "failed",
+                "cleanup_failed": True,
+                "raw_result_path": str(raw),
+            }
+        ],
+    }
+    before = raw.read_bytes()
+    assert acceptance.completed_case_ids({"cases": [report]}) == {"valid-zero"}
+    assert raw.read_bytes() == before
+    raw.write_text(
+        json.dumps(
+            {
+                "episode": {
+                    "diagnosis": {"success": False},
+                    "execution": {"case_valid": True, "termination_reason": "agent_failed"},
+                }
+            }
+        )
+    )
+    assert acceptance.completed_case_ids({"cases": [report]}) == set()
+    report["mode"] = "effects"
+    report["diagnosis_complete"] = True
+    assert acceptance.completed_case_ids({"cases": [report]}) == set()

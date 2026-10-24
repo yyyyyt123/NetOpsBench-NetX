@@ -100,7 +100,7 @@ def _install_real_runtime_mocks(monkeypatch):
                         },
                         "observations": {"start_time": "2026-01-01T00:00:00Z", "end_time": "2026-01-01T00:01:00Z"},
                     },
-                    diagnostic_session=SimpleNamespace(),
+                    diagnostic_session=SimpleNamespace(config=SimpleNamespace(max_agent_seconds=600)),
                     diagnostic_payload={
                         "case_id": "case-test",
                         "topology": {"devices": {}, "links": []},
@@ -356,7 +356,7 @@ def test_mixed_scale_suite_fails_before_runtime_provision(tmp_path, monkeypatch)
     bench = NetOpsBench(workspace=str(tmp_path))
     scenarios = [
         _make_scenario(scenario_id="xs-case"),
-        _make_scenario(scenario_id="small-case").model_copy(update={"topology_scale": "small"}),
+        _make_scenario(scenario_id="small-case").model_copy(update={"topology_scale": "medium"}),
     ]
     provisioned = []
     monkeypatch.setattr(

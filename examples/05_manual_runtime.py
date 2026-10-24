@@ -37,9 +37,9 @@ def main(
     repo = resolve_repo_root(repo_root)
     scenario = require_scenarios(
         repo,
-        "scenarios/generated/xs/generated_link_down_xs_001.yaml",
+        "scenarios/generated/medium/generated_link_down_medium_001.yaml",
         prepare_hint=(
-            "Generate benchmark assets first with " "`netopsbench benchmark prepare --scales xs` from the repo root."
+            "Generate benchmark assets first with `netopsbench benchmark prepare --scales medium` from the repo root."
         ),
     )[0]
 
@@ -54,7 +54,7 @@ def main(
         raw_agent, agent = build_wrapped_agent(bench, agent_cls, vendor=vendor, backend=backend)
         print_agent_banner("agent", vendor, raw_agent)
         try:
-            runtime = bench.runtimes.provision(scale="xs", workers=1, name=runtime_name)
+            runtime = bench.runtimes.provision(scale="medium", workers=1, name=runtime_name)
             run = bench.sessions.run_on_runtime_scenario(
                 scenario=scenario,
                 runtime=runtime,

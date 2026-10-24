@@ -52,6 +52,16 @@ class ImpairmentHandler:
             and math.isclose(float(match.group(1)), float(expected_value), rel_tol=0.0, abs_tol=0.001)
         )
 
+    def _require_default_qdisc(self, container: str, interface: str) -> None:
+        result = self._cmd.docker_exec(container, ["tc", "-j", "qdisc", "show", "dev", interface])
+        import json
+
+        if result.returncode:
+            raise RuntimeError("Cannot inspect existing qdisc")
+        rows = json.loads(result.stdout)
+        if any(row.get("kind") not in {"noqueue", "pfifo_fast", "mq"} for row in rows):
+            raise RuntimeError("Non-default qdisc exists; refusing to overwrite unowned state")
+
     def _has_netem_qdisc(self, container: str, linux_if: str) -> bool | None:
         result = self._cmd.docker_exec(container, ["tc", "qdisc", "show", "dev", linux_if])
         if result.returncode != 0:
@@ -181,9 +191,9 @@ class ImpairmentHandler:
         recovered = result.returncode == 0 and effective_mtu == target_mtu
         if recovered:
             self._tracker.remove_faults(
-                lambda fault: fault["type"] == "mtu_mismatch"
-                and fault["device"] == device
-                and fault["interface"] == sonic_if
+                lambda fault: (
+                    fault["type"] == "mtu_mismatch" and fault["device"] == device and fault["interface"] == sonic_if
+                )
             )
 
         return {
@@ -208,6 +218,7 @@ class ImpairmentHandler:
             raise ValueError(f"Unknown device: {device}")
 
         linux_if = self._iface.resolve_linux(interface)
+        self._require_default_qdisc(container, linux_if)
         result = self._cmd.docker_exec(
             container,
             ["tc", "qdisc", "replace", "dev", linux_if, "root", "netem", "corrupt", f"{corruption_pct}%"],
@@ -235,6 +246,7 @@ class ImpairmentHandler:
             raise ValueError(f"Unknown device: {device}")
 
         linux_if = self._iface.resolve_linux(interface)
+        self._require_default_qdisc(container, linux_if)
         result = self._cmd.docker_exec(
             container,
             ["tc", "qdisc", "replace", "dev", linux_if, "root", "netem", "loss", f"{loss_pct}%"],
@@ -262,6 +274,7 @@ class ImpairmentHandler:
             raise ValueError(f"Unknown device: {device}")
 
         linux_if = self._iface.resolve_linux(interface)
+        self._require_default_qdisc(container, linux_if)
         result = self._cmd.docker_exec(
             container,
             ["tc", "qdisc", "replace", "dev", linux_if, "root", "netem", "delay", f"{latency_ms}ms"],
@@ -289,9 +302,11 @@ class ImpairmentHandler:
 
         if recovered:
             self._tracker.remove_faults(
-                lambda fault: fault["device"] == device
-                and fault.get("interface") == linux_if
-                and fault["type"] in ["packet_corruption", "packet_loss", "high_latency"]
+                lambda fault: (
+                    fault["device"] == device
+                    and fault.get("interface") == linux_if
+                    and fault["type"] in ["packet_corruption", "packet_loss", "high_latency"]
+                )
             )
 
         return {

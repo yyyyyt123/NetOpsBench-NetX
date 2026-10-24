@@ -41,7 +41,9 @@ logger = get_logger(__name__)
 
 HEALTH_POLL_INTERVAL_SECONDS = 5
 ACTIVE_INTERFACE_COVERAGE_MIN_RATIO = 0.5
-_NETWORK_PROBE_SOURCE = Path(__file__).with_name("_network_probe.py").read_text(encoding="utf-8")
+_NETWORK_PROBE_SOURCE = (Path(__file__).parent.parent / "observability" / "_routing_probe.py").read_text(
+    encoding="utf-8"
+)
 
 
 def _docker_exec(
@@ -63,10 +65,20 @@ def _docker_exec(
     )
 
 
-def _routing_state(container: str, control: OperationControl | None = None) -> tuple[str, str]:
-    # Retain the two original commands and their individual 60-second limits.
-    # One transport covers both, with five seconds for Python/exec overhead.
-    result = _docker_exec(container, "python3", "-c", _NETWORK_PROBE_SOURCE, timeout=125, control=control)
+def _routing_state(
+    container: str, control: OperationControl | None = None, route_snapshot: dict | None = None
+) -> tuple[str, str]:
+    budget = control.remaining(125) if control is not None else 125
+    result = _docker_exec(
+        container,
+        "python3",
+        "-c",
+        _NETWORK_PROBE_SOURCE,
+        "--budget-seconds",
+        str(budget),
+        timeout=budget,
+        control=control,
+    )
     if result.returncode != 0:
         return "", ""
     try:
@@ -74,6 +86,16 @@ def _routing_state(container: str, control: OperationControl | None = None) -> t
         if payload["version"] != 1:
             return "", ""
         checks = payload["checks"]
+        if route_snapshot is not None:
+            fib = checks.get("fib", {})
+            route_snapshot.update(
+                packet_counters=payload.get("packet_counters", {"error": "Not collected"}),
+                fib=json.loads(fib["stdout"]) if fib.get("returncode") == 0 else [],
+                bgp_collection_ok=checks.get("bgp", {}).get("returncode") == 0,
+                collected_at=time.time(),
+            )
+            if fib.get("returncode") != 0:
+                route_snapshot["error"] = "FIB collection failed"
         outputs = []
         for name in ("bgp", "interfaces"):
             check = checks[name]
@@ -176,6 +198,8 @@ def check_worker_health(
     *,
     deadline: float | None = None,
     cancel_event=None,
+    route_snapshot: dict | None = None,
+    expected_routes: dict | None = None,
 ) -> list[str]:
     """Check health within one elapsed-time budget, including all retries."""
     started = time.monotonic()
@@ -196,6 +220,8 @@ def check_worker_health(
             all_routing_devices,
             topology=topo,
             control=control,
+            route_snapshot=route_snapshot,
+            expected_routes=expected_routes,
         )
     except (TimeoutError, subprocess.TimeoutExpired):
         return ["Worker health check deadline exceeded"]
@@ -234,6 +260,8 @@ def _check_worker_health(
     *,
     topology: TopologyManifest,
     control: OperationControl,
+    route_snapshot: dict | None = None,
+    expected_routes: dict | None = None,
 ) -> list[str]:
     """Run all health checks and return a list of error messages (empty = healthy).
 
@@ -324,9 +352,26 @@ def _check_worker_health(
         len(convergence_targets),
     )
 
+    route_errors = {}
+
     def network_state(device) -> tuple[str, int, int, int, int]:
         container = clab_container_name(lab_name, device.name)
-        bgp, interfaces = _routing_state(container, control=control)
+        node_snapshot = {} if route_snapshot is not None else None
+        if node_snapshot is None:
+            bgp, interfaces = _routing_state(container, control=control)
+        else:
+            bgp, interfaces = _routing_state(container, control=control, route_snapshot=node_snapshot)
+            from netopsbench.platform.observability.bgp_parser import parse_bgp_summary
+
+            node_snapshot.update(bgp=parse_bgp_summary(bgp), interfaces=interfaces)
+            route_snapshot.setdefault("nodes", {})[device.name] = node_snapshot
+            if expected_routes is not None:
+                from netopsbench.platform.observability.routes import verify_route_recovery
+
+                route_errors[device.name] = verify_route_recovery(
+                    {"nodes": {device.name: expected_routes["nodes"].get(device.name, {})}},
+                    {"nodes": {device.name: node_snapshot}},
+                )
         network_interfaces[device.name] = _parse_active_interfaces(interfaces)
         return (
             device.name,
@@ -343,7 +388,7 @@ def _check_worker_health(
         pending = {
             device: (established, expected_bgp, active, expected_active)
             for device, established, expected_bgp, active, expected_active in network_states
-            if established < expected_bgp or active < expected_active
+            if established < expected_bgp or active < expected_active or route_errors.get(device)
         }
         if not pending:
             break
@@ -356,6 +401,7 @@ def _check_worker_health(
             for device, state in sorted(pending.items())[:12]
         )
         errors.append(f"network not converged on {len(pending)} routing devices: {details}")
+        errors.extend(error for name in pending for error in route_errors.get(name, []))
         return errors
 
     # [4/5] Client connectivity + native Pingmesh process

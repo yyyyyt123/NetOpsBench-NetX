@@ -108,6 +108,7 @@ class ClientAddressing:
 
 def client_commands(client_ip: str, gateway: str) -> tuple[str, ...]:
     commands = (
+        "sysctl -w net.ipv4.ip_forward=0",
         "ip link set dev eth1 mtu 9232",
         f"ip addr add {shlex.quote(client_ip + '/30')} dev eth1",
         f"ip route add 192.168.0.0/16 via {shlex.quote(gateway)}",

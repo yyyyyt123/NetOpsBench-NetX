@@ -11,7 +11,7 @@ import time
 from collections.abc import Sequence
 from pathlib import Path
 
-from .control import OperationControl
+from .control import OperationControl, current_operation_control
 
 logger = logging.getLogger(__name__)
 
@@ -136,6 +136,7 @@ def safe_run(
             input=input,
         )
     try:
+        control = control or current_operation_control()
         if control is not None:
             return _controlled_run(cmd_list, run_kwargs, control)
         return subprocess.run(cmd_list, **run_kwargs)

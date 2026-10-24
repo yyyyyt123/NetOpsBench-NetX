@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
+from typing import Literal
 
 from netopsbench.models.profiles import ScaleProfile, ScaleRegistry, get_scale_profile
 from netopsbench.models.topology import PingmeshPolicy
@@ -53,6 +54,7 @@ class TopologyConfig:
     collector_ip: str | None = None
     spine_asn: int = 65001
     leaf_asn_start: int = 65011
+    purpose: Literal["benchmark", "validation"] = "benchmark"
     scale_name: str | None = None
     pingmesh_policy: PingmeshPolicy | None = None
 
@@ -71,6 +73,7 @@ class FatTreeConfig:
     collector_ip: str | None = None
     asn_base: int = 65001
     clients_per_edge: int | None = None
+    purpose: Literal["benchmark", "validation"] = "benchmark"
     scale_name: str | None = None
     pingmesh_policy: PingmeshPolicy | None = None
 
@@ -122,6 +125,7 @@ def _clos_config_from_profile(profile: ScaleProfile) -> TopologyConfig:
         clients_per_leaf=profile.clients_per_attached_switch,
         mgmt_ipv4_subnet=_topology_mgmt_subnet(profile),
         scale_name=profile.name,
+        purpose=profile.purpose,
         pingmesh_policy=pingmesh_policy_for_profile(profile),
     )
 
@@ -132,6 +136,7 @@ def _fat_tree_config_from_profile(profile: ScaleProfile) -> FatTreeConfig:
         clients_per_edge=profile.clients_per_attached_switch,
         mgmt_ipv4_subnet=_topology_mgmt_subnet(profile),
         scale_name=profile.name,
+        purpose=profile.purpose,
         pingmesh_policy=pingmesh_policy_for_profile(profile),
     )
 

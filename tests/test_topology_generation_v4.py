@@ -24,7 +24,7 @@ _SONIC_PID1_COMMAND = "-c \"trap 'exit 0' TERM INT; sleep infinity & wait $!\""
 
 @pytest.mark.parametrize(
     "scale",
-    ["xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12"],
+    ["xs", "medium", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12"],
 )
 def test_every_builtin_scale_uses_terminable_sonic_pid1(tmp_path, scale):
     result = generate_topology(scale, str(tmp_path / scale))
@@ -66,7 +66,7 @@ def test_renderer_persists_only_canonical_schema_v4_devices(tmp_path, scale, rol
 
 def test_renderer_atomically_removes_stale_device_artifacts(tmp_path):
     output = tmp_path / "topology"
-    generate_topology("small", str(output))
+    generate_topology("medium", str(output))
     assert (output / "configs" / "sonic" / "leaf4").is_dir()
 
     generate_topology("xs", str(output))

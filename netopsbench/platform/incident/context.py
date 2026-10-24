@@ -60,7 +60,7 @@ def _bounded_observations(observations: dict[str, Any]) -> dict[str, Any]:
     consumer.  It must not silently alter ``DiagnosticContext.symptoms`` for
     third-party benchmark agents.
     """
-    return copy.deepcopy(observations)
+    return copy.deepcopy({key: value for key, value in observations.items() if not key.startswith("_")})
 
 
 def _compact_model_observations(observations: dict[str, Any]) -> dict[str, Any]:

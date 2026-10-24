@@ -11,9 +11,9 @@ pip install -e '.[codex]'
 # Install the native Codex 0.159.2 standalone package, including
 # codex-code-mode-host beside the codex executable, then sign in:
 codex login
-netopsbench benchmark prepare --scales xs
+netopsbench benchmark prepare --scales medium
 PYTHONPATH=. python examples/01_run_scenario.py --agent codex \
-  --scenario scenarios/generated/xs/generated_healthy_network_xs_001.yaml
+  --scenario scenarios/generated/medium/generated_healthy_network_medium_001.yaml
 ```
 
 The first run builds `netopsbench-codex:0.159.2` from the installed native
@@ -27,7 +27,7 @@ from netopsbench.sdk import NetOpsBench
 with NetOpsBench(workspace=".") as bench:
     agent = bench.agents.wrap(CodexAgent())
     report = bench.sessions.run_scenario(
-        scenario="scenarios/generated/xs/generated_healthy_network_xs_001.yaml",
+        scenario="scenarios/generated/medium/generated_healthy_network_medium_001.yaml",
         agent=agent,
     ).wait(raise_on_failure=True)
 ```
@@ -60,7 +60,8 @@ count, so the adapter does not invent one. Nonzero exit, failed turns, timeout,
 missing output and invalid JSON produce `success=False` and remain execution
 failures rather than completed diagnoses.
 
-For real scale acceptance:
+Acceptance defaults to DeepAgent with the DeepSeek preset. To explicitly run
+both agents for real scale acceptance:
 
 ```bash
 PYTHONPATH=. python scripts/validate_pingmesh_scales.py \

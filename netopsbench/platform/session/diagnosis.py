@@ -17,18 +17,27 @@ from netopsbench.platform.incident.context import (
     extract_episode_pingmesh_query_window,
 )
 from netopsbench.platform.incident.engine import DiagnosticSession, SessionToolGateway
+from netopsbench.platform.scenario.timing import timing_scope
 from netopsbench.platform.session.trace_store import TraceWriter
 from netopsbench.platform.session.types import WorkerExecutionContext
+from netopsbench.platform.toolkit._core.control import diagnosis_budget_scope
 from netopsbench.platform.utils.files import atomic_write_json
 
 logger = get_logger(__name__)
 
 
-def run_agent_diagnose(handle: Any, context: DiagnosticContext, cancel_event=None):
+def run_agent_diagnose(
+    handle: Any, context: DiagnosticContext, cancel_event=None, *, timeout_seconds=None, timings=None
+):
     """Execute a sync or async diagnosis handle from a synchronous session."""
 
     async def invoke():
-        task = asyncio.create_task(handle.diagnose(context))
+        async def bounded():
+            with timing_scope(timings):
+                async with diagnosis_budget_scope(timeout_seconds):
+                    return await handle.diagnose(context)
+
+        task = asyncio.create_task(bounded())
         try:
             while not task.done():
                 if cancel_event is not None and cancel_event.is_set():
@@ -109,15 +118,27 @@ def build_runtime_diagnosis_callback(
             metadata=metadata,
         )
         try:
-            diagnosis = run_agent_diagnose(handle, context, cancel_event)
+            limit = diagnostic_session.config.max_agent_seconds
+            diagnosis = run_agent_diagnose(
+                handle,
+                context,
+                cancel_event,
+                timeout_seconds=limit,
+                timings=getattr(diagnostic_session, "phase_timings", None),
+            )
         except Exception as exc:
             trace_recorder.record_error(stage="agent", error=exc)
             ended_at = datetime.now(UTC)
+            failure_metadata = {}
+            cause = exc
+            while cause is not None:
+                failure_metadata.update(getattr(cause, "agent_metadata", {}))
+                cause = cause.__cause__
             diagnosis_payload: dict[str, Any] = {
                 "error": str(exc),
                 "success": False,
                 "time_taken_seconds": max(0.0, (ended_at - start_time).total_seconds()),
-                "metadata": {"agent_failure_stage": "diagnose", "error_type": type(exc).__name__},
+                "metadata": {**failure_metadata, "agent_failure_stage": "diagnose", "error_type": type(exc).__name__},
             }
             if trace_writer is not None:
                 try:

@@ -165,7 +165,7 @@ def test_execute_on_runtime_pool_rejects_scenario_scale_mismatch(tmp_path):
     runtime = RuntimePool(
         id="runtime-1",
         name="runtime-1",
-        scale="small",
+        scale="medium",
         root_dir=tmp_path / "runtime",
         workers=[_worker(tmp_path, 1)],
         state="warm",

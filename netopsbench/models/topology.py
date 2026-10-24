@@ -112,6 +112,7 @@ class TopologyManifest(_PersistedModel):
     topology_id: str
     name: str
     scale: str
+    purpose: Literal["benchmark", "validation"] = "benchmark"
     family: Literal["clos", "fat-tree"]
     management: Management
     collector: Collector

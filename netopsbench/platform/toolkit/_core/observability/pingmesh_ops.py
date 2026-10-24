@@ -23,6 +23,8 @@ class PingmeshOpsMixin:
         time_range_minutes: int = 10,
         start_time: str | None = None,
         end_time: str | None = None,
+        src_client: str | None = None,
+        dst_client: str | None = None,
     ) -> ToolResult:
         try:
             time_scope = self._resolve_pingmesh_time_scope(
@@ -31,6 +33,14 @@ class PingmeshOpsMixin:
                 end_time=end_time,
             )
             topology_filter = self._pingmesh_plan_filter()
+            for tag, client in (("src_name", src_client), ("dst_name", dst_client)):
+                if client:
+                    self._validate_device_name(client)
+                    node = self.manifest.device(client)
+                    if node is None or node.role.value != "client":
+                        raise ValueError(f"Unknown client: {client}")
+                    topology_filter += f'  |> filter(fn: (r) => r.{tag} == "{client}")\n'
+
             query = f"""
 from(bucket: "{self.influxdb_bucket}")
 {time_scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "pingmesh")

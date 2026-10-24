@@ -1,8 +1,6 @@
 """Schema regression tests for normalized scenario parameters."""
 
-import ipaddress
 import json
-import random
 
 import pytest
 import yaml
@@ -39,7 +37,6 @@ def test_all_diagnostic_observation_durations_use_complete_pingmesh_window():
     "scale,expected_window",
     [
         ("xs", 7),
-        ("small", 7),
         ("medium", 8),
         ("large", 30),
         ("xlarge", 66),
@@ -354,118 +351,21 @@ def test_validate_scenario_topology_rejects_legacy_grouped_topology(tmp_path):
         validate_scenario_topology(scenario, str(topology_dir))
 
 
-def test_scenario_generator_supports_fat_tree_roles_with_structured_artifacts(tmp_path):
+def test_scenario_generator_rejects_nonstandard_traffic_profile(tmp_path):
     topology_dir = tmp_path / "topology"
-    generate_topology("fat-tree-k8", str(topology_dir))
-    topo = scenario_generator.load_topology("fat-tree-k8", str(topology_dir))
-
-    assert topo.cores[0] == "core1"
-    assert topo.aggs[0] == "agg1"
-    assert topo.edges[0] == "edge1"
-    assert "Ethernet0" in topo.device_interfaces["agg1"]
-
-    spec = {
-        "defaults": {"count_per_fault": 1, "seed": 1},
-        "fault_templates": [
-            {
-                "name": "link_flapping_agg",
-                "fault_type": "link_flapping",
-                "device_role": "agg",
-                "interface_role": "uplink",
-            }
-        ],
-    }
-    generated = scenario_generator.generate(spec, topo, tmp_path / "scenarios", seed=1)
-
-    scenario = parse_scenario_file(str(generated[0]))
-    assert scenario.topology_scale == "fat-tree-k8"
-    assert scenario.episode.target_device.startswith("agg")
-    assert validate_scenario(scenario) == []
+    generate_topology("medium", str(topology_dir))
+    topo = scenario_generator.load_topology("medium", str(topology_dir))
+    with pytest.raises(ValueError, match="Only standard traffic"):
+        scenario_generator.generate(
+            {"fault_catalog_version": 2, "defaults": {"traffic_profile": "stress"}},
+            topo,
+            tmp_path / "scenarios",
+            seed=1,
+        )
 
 
-@pytest.mark.parametrize("location", ["defaults", "template"])
-def test_scenario_generator_rejects_nonstandard_traffic_profile(tmp_path, location):
-    topology_dir = tmp_path / "topology"
-    generate_topology("xs", str(topology_dir))
-    topo = scenario_generator.load_topology("xs", str(topology_dir))
-    spec = {
-        "defaults": {"count_per_fault": 1},
-        "fault_templates": [{"name": "healthy", "fault_type": "none"}],
-    }
-    if location == "defaults":
-        spec["defaults"]["traffic_profile"] = "stress"
-    else:
-        spec["fault_templates"][0]["traffic_profile"] = "light"
-
-    with pytest.raises(ValueError, match="Only the standard traffic profile is supported"):
-        scenario_generator.generate(spec, topo, tmp_path / "scenarios", seed=1)
-
-
-def _xlarge_topology_context(tmp_path):
-    topology_dir = tmp_path / "topology"
-    generate_topology("xlarge", str(topology_dir))
-    return scenario_generator.load_topology("xlarge", str(topology_dir))
-
-
-def _pingmesh_destination_names(topo, src_leaf: str) -> set[str]:
-    sources = {client.name for client in topo.manifest.clients() if client.attached_switch == src_leaf}
-    return {
-        destination
-        for client in topo.manifest.require_pingmesh_plan().clients
-        if client.name in sources
-        for destination in client.targets
-    }
-
-
-def _client_for_prefix(topo, prefix: str) -> dict:
-    network = ipaddress.ip_network(prefix, strict=False)
-    return next(client for client in topo.clients if ipaddress.ip_address(client["data_ip"]) in network)
-
-
-def _client_for_host_route(topo, host_route: str) -> dict:
-    host_ip = host_route.split("/", 1)[0]
-    return next(client for client in topo.clients if client["data_ip"] == host_ip)
-
-
-def test_xlarge_blackhole_route_targets_pingmesh_observable_destination(tmp_path):
-    topo = _xlarge_topology_context(tmp_path)
-
-    scenario = scenario_generator.build_fault_instance(
-        "blackhole_route",
-        "medium",
-        topo,
-        random.Random(1),
-        {"seed": 1},
-        {"name": "blackhole_route_leaf", "fault_type": "blackhole_route", "device_role": "leaf"},
-        1,
-    )
-
-    fault = scenario["episode"]
-    target_client = _client_for_prefix(topo, fault["target_prefix"])
-
-    assert target_client["name"] in _pingmesh_destination_names(topo, fault["target_device"])
-
-
-def test_xlarge_static_route_targets_pingmesh_observable_destination(tmp_path):
-    topo = _xlarge_topology_context(tmp_path)
-
-    scenario = scenario_generator.build_fault_instance(
-        "static_route_misconfig",
-        "medium",
-        topo,
-        random.Random(1),
-        {"seed": 1},
-        {"name": "static_route_misconfig", "fault_type": "static_route_misconfig", "device_role": "leaf"},
-        1,
-    )
-
-    fault = scenario["episode"]
-    target_client = _client_for_host_route(topo, fault["metadata"]["target_ip"])
-
-    assert target_client["name"] in _pingmesh_destination_names(topo, fault["target_device"])
-
-
-def test_scenario_runner_prefers_parameters_over_metadata(monkeypatch):
+@pytest.mark.parametrize("parameters", [{"target_ip": "new", "wrong_nexthop": "new-hop"}, {}])
+def test_builtin_faults_read_only_parameters_not_descriptive_metadata(monkeypatch, parameters):
     runner = ScenarioExecutor(
         topology_dir="lab-topology",
         topology_metadata=_minimal_canonical_topology(),
@@ -486,7 +386,7 @@ def test_scenario_runner_prefers_parameters_over_metadata(monkeypatch):
         fault_type="static_route_misconfig",
         target_device="leaf1",
         metadata={"target_ip": "old", "wrong_nexthop": "old-hop"},
-        parameters={"target_ip": "new", "wrong_nexthop": "new-hop"},
+        parameters=parameters,
     )
 
     result = runner._inject_fault(episode)
@@ -494,9 +394,28 @@ def test_scenario_runner_prefers_parameters_over_metadata(monkeypatch):
     assert result["success"] is True
     assert captured == {
         "device": "leaf1",
-        "target_ip": "new",
-        "wrong_nexthop": "new-hop",
+        "target_ip": parameters.get("target_ip"),
+        "wrong_nexthop": parameters.get("wrong_nexthop"),
     }
+
+
+def test_mtu_injection_reads_the_canonical_episode_parameters(monkeypatch):
+    runner = ScenarioExecutor(topology_dir="lab-topology", topology_metadata=_minimal_canonical_topology())
+    captured = []
+    monkeypatch.setattr(
+        runner.injector, "inject_mtu_mismatch", lambda device, interface, mtu: captured.append(mtu) or {"success": True}
+    )
+    result = runner._inject_fault(
+        EpisodeSpec(
+            episode_id="mtu",
+            fault_type="mtu_mismatch",
+            target_device="leaf1",
+            target_interface="Ethernet0",
+            parameters={"mtu": 1450},
+        )
+    )
+    assert result["success"]
+    assert captured == [1450]
 
 
 def test_scenario_executor_returns_result_for_session_persistence(monkeypatch):
@@ -518,7 +437,7 @@ def test_scenario_executor_returns_result_for_session_persistence(monkeypatch):
         events.append("baseline_captured")
         return baseline
 
-    def observe(duration, *, baseline_window):
+    def observe(windows, total_duration_seconds, *, baseline_window):
         is_validation = len([event for event in events if event.endswith("_observed")]) == 0
         events.append("validation_observed" if is_validation else "current_observed")
         assert baseline_window == (
@@ -534,7 +453,7 @@ def test_scenario_executor_returns_result_for_session_persistence(monkeypatch):
         return {
             "start_time": "current-start",
             "end_time": "current-end",
-            "duration_seconds": duration,
+            "duration_seconds": total_duration_seconds,
             "pingmesh_metrics": {
                 "summary": {
                     "total_anomalies": 0,
@@ -555,7 +474,16 @@ def test_scenario_executor_returns_result_for_session_persistence(monkeypatch):
 
     monkeypatch.setattr(runner, "_setup_traffic", setup_traffic)
     monkeypatch.setattr(runner, "_capture_baseline_window", capture_baseline)
-    monkeypatch.setattr(runner, "_wait_and_observe", observe)
+    monkeypatch.setattr(
+        runner,
+        "_capture_observation_window",
+        lambda duration, name: {
+            "start_time": "2026-01-01T00:00:00Z",
+            "end_time": "2026-01-01T00:00:15Z",
+            "duration_seconds": duration,
+        },
+    )
+    monkeypatch.setattr(runner, "_merge_observation_windows", observe)
     monkeypatch.setattr(runner, "_stop_traffic", lambda: None)
     monkeypatch.setattr(runner, "_recover_fault", lambda: {"success": True})
 
@@ -582,6 +510,11 @@ def test_fault_observation_stabilization_is_inside_total_duration_budget():
     calls = []
 
     class Executor:
+        from netopsbench.platform.scenario.timing import PhaseTimings
+
+        timings = PhaseTimings()
+        observation_timeout_seconds = 60
+
         def _inject_fault(self, _episode):
             return {"success": True}
 
@@ -589,8 +522,8 @@ def test_fault_observation_stabilization_is_inside_total_duration_budget():
             calls.append((name, duration))
             return {
                 "name": name,
-                "start_time": f"{name}-start",
-                "end_time": f"{name}-end",
+                "start_time": "2026-10-24T00:00:00Z",
+                "end_time": "2026-10-24T00:01:54Z",
                 "duration_seconds": duration,
             }
 
@@ -633,8 +566,6 @@ def test_fault_observation_stabilization_is_inside_total_duration_budget():
     )
 
     assert calls == [
-        ("early", 20),
-        ("stabilization", 5),
-        ("steady", 89),
+        ("full", 114),
         ("merge", 114, 2),
     ]

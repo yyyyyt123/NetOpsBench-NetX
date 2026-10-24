@@ -6,10 +6,9 @@ import csv
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from io import StringIO
 from typing import Any, Literal
 
-from netopsbench.platform.observability.influxdb import query_flux
+from netopsbench.platform.observability.influxdb import iter_annotated_csv_rows, query_flux
 
 
 def parse_influx_timestamp(value: str | None) -> datetime | None:
@@ -147,27 +146,16 @@ class InfluxQueryError(RuntimeError):
     """Raised when a structured InfluxDB query result reports failure."""
 
 
-def _iter_annotated_csv_rows(csv_text: str):
-    """Parse Flux CSV while honoring the repeated headers emitted by multiple yields."""
-    header: list[str] | None = None
-    for values in csv.reader(StringIO(csv_text)):
-        if not values or (values[0] and values[0].startswith("#")):
-            continue
-        if "result" in values and "table" in values:
-            header = values
-            continue
-        if header is None:
-            continue
-        padded = [*values, *([""] * max(0, len(header) - len(values)))]
-        yield dict(zip(header, padded[: len(header)], strict=False))
-
-
 def query_influx(toolkit, query: str, require_value: bool = True) -> InfluxQueryResult:
-    result = query_flux(toolkit.influxdb_url, toolkit.influxdb_token, toolkit.influxdb_org, query)
+    from ..control import current_tool_control
+
+    control = current_tool_control()
+    kwargs = {"timeout": control.remaining(60), "deadline": control.deadline} if control else {}
+    result = query_flux(toolkit.influxdb_url, toolkit.influxdb_token, toolkit.influxdb_org, query, **kwargs)
     if result.status != "ok":
         return InfluxQueryResult(status="error", error=result.error)
     rows: list[dict[str, Any]] = []
-    for row in _iter_annotated_csv_rows(result.text):
+    for row in iter_annotated_csv_rows(result.text):
         if row.get("result", "") == "result":
             continue
         if require_value and row.get("_value") in (None, ""):

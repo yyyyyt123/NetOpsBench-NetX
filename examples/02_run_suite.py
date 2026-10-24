@@ -36,12 +36,12 @@ def main(
     scenarios = require_scenarios(
         repo,
         [
-            "scenarios/generated/xs/generated_link_down_xs_001.yaml",
-            "scenarios/generated/xs/generated_packet_loss_xs_001.yaml",
-            "scenarios/generated/xs/generated_high_latency_xs_001.yaml",
+            "scenarios/generated/medium/generated_link_down_medium_001.yaml",
+            "scenarios/generated/medium/generated_packet_loss_medium_001.yaml",
+            "scenarios/generated/medium/generated_high_latency_medium_001.yaml",
         ],
         prepare_hint=(
-            "Generate benchmark assets first with " "`netopsbench benchmark prepare --scales xs` from the repo root."
+            "Generate benchmark assets first with `netopsbench benchmark prepare --scales medium` from the repo root."
         ),
     )
 
@@ -55,7 +55,7 @@ def main(
             run = bench.sessions.run_suite(
                 scenarios=scenarios,
                 agent=agent,
-                scale="xs",
+                scale="medium",
                 workers=3,
             )
             return wait_and_print_run(run, raise_on_failure=True)

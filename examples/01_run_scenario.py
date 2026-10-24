@@ -38,9 +38,11 @@ def main(
     repo = resolve_repo_root(repo_root)
     scenario = require_scenarios(
         repo,
-        str(scenario_path) if scenario_path is not None else "scenarios/generated/xs/generated_link_down_xs_001.yaml",
+        str(scenario_path)
+        if scenario_path is not None
+        else "scenarios/generated/medium/generated_link_down_medium_001.yaml",
         prepare_hint=(
-            "Generate benchmark assets first with " "`netopsbench benchmark prepare --scales xs` from the repo root."
+            "Generate benchmark assets first with `netopsbench benchmark prepare --scales medium` from the repo root."
         ),
     )[0]
 

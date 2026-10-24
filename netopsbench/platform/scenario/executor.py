@@ -28,13 +28,15 @@ from netopsbench.platform.topology.topology_utils import coerce_topology_manifes
 from netopsbench.platform.traffic.controller import TrafficController
 from netopsbench.platform.traffic.scenario_execution import setup_traffic as _setup_traffic_impl
 from netopsbench.platform.traffic.scenario_execution import stop_traffic as _stop_traffic_impl
+from netopsbench.platform.utils.control import OperationControl, operation_scope
 
-from .baseline import BaselineHandoff, runtime_scope
+from .baseline import BaselineHandoff, frr_snapshot, restored_scope_errors, runtime_scope, scope_changes
 from .incident_backend import ExecutorIncidentBackend
 from .observation import analyze_observation_windows as _analyze_observation_windows_impl
 from .observation import capture_baseline_window as _capture_baseline_window_impl
 from .observation import capture_observation_window as _capture_observation_window_impl
 from .observation import wait_and_observe as _wait_and_observe_impl
+from .timing import PhaseTimings
 
 logger = get_logger(__name__)
 
@@ -61,7 +63,7 @@ class ScenarioExecutor:
         self,
         topology_dir: str = "clab-topology",
         topology_metadata: dict | None = None,
-        minimum_baseline_seconds: int = 60,
+        minimum_baseline_seconds: int | None = None,
         post_recovery_wait_seconds: int = 2,
         influxdb_url: str | None = None,
         influxdb_token: str | None = None,
@@ -95,12 +97,13 @@ class ScenarioExecutor:
         self._detector_scope = None
         self.fault_registry = fault_registry or create_fault_registry()
         self.scale_registry = scale_registry or default_scale_registry()
-        self.scale_registry.get(manifest.scale)
+        self.experiment = self.scale_registry.get(manifest.scale).experiment
         self.topology_metadata = manifest.model_dump(mode="json")
         self.injector = FaultInjector(
             clab_dir=topology_dir,
             topology_metadata=self.topology_metadata,
             fault_registry=self.fault_registry,
+            experiment=self.experiment,
         )
         self.traffic_controller: TrafficController | None = None
         self.topology_id = topology_id or manifest.topology_id
@@ -108,7 +111,13 @@ class ScenarioExecutor:
         self.influxdb_token = influxdb_token
         self.influxdb_org = influxdb_org
         self.influxdb_bucket = influxdb_bucket
-        self.minimum_baseline_seconds = max(0, int(minimum_baseline_seconds))
+        self.observation_timeout_seconds = self.scale_registry.get(manifest.scale).health_timeout_seconds
+        self.minimum_baseline_seconds = (
+            self.experiment.observation_seconds
+            if minimum_baseline_seconds is None
+            else max(0, int(minimum_baseline_seconds))
+        )
+        self.timings = PhaseTimings()
         self.post_recovery_wait_seconds = max(
             0,
             int(post_recovery_wait_seconds),
@@ -121,6 +130,9 @@ class ScenarioExecutor:
         self.runtime_worker = runtime_worker
         self._baseline_handoff = BaselineHandoff()
         self._healthy_baseline_candidate: dict | None = None
+        self._candidate_paths = None
+        self._candidate_scope = None
+        self._case_affected_pairs = []
 
     def _topology_file_stamp(self):
         path = Path(self.topology_dir) / "topology.json"
@@ -184,6 +196,13 @@ class ScenarioExecutor:
 
     def _inject_fault(self, episode: EpisodeSpec) -> dict:
         self._check_cancelled()
+        self._case_frr_before = None
+        if self.runtime_worker is not None and (
+            episode.fault_type.startswith(("bgp_", "route_"))
+            or episode.fault_type
+            in {"ecmp_misconfig", "routing_loop", "static_route_misconfig", "blackhole_route", "device_down"}
+        ):
+            self._case_frr_before = frr_snapshot(self, episode.target_device)
         return _inject_fault_impl(self, episode)
 
     def _wait_and_observe(
@@ -191,8 +210,9 @@ class ScenarioExecutor:
         duration: int,
         *,
         baseline_window: dict,
+        deadline: float | None = None,
     ) -> dict:
-        return _wait_and_observe_impl(self, duration, baseline_window=baseline_window)
+        return _wait_and_observe_impl(self, duration, baseline_window=baseline_window, deadline=deadline)
 
     def _capture_baseline_window(self) -> dict:
         return _capture_baseline_window_impl(self, self.minimum_baseline_seconds)
@@ -226,7 +246,7 @@ class ScenarioExecutor:
         """Recover the fault while runtime-owned background traffic remains active."""
         started = monotonic()
         profile = self.scale_registry.get(scenario.topology_scale)
-        timeout_seconds = float(profile.health_timeout_seconds)
+        timeout_seconds = float(profile.experiment.recovery_timeout_seconds)
         deadline = started + timeout_seconds
         attempts = 0
         errors: list[str] = []
@@ -246,7 +266,8 @@ class ScenarioExecutor:
             if not recovery_complete:
                 try:
                     recovery_attempted = True
-                    recovery_results = self._recover_fault()
+                    with operation_scope(OperationControl(deadline=deadline)):
+                        recovery_results = self._recover_fault()
                     active_faults = list(getattr(self.injector, "active_faults", []) or [])
                     recovery_complete = self._recovery_results_succeeded(recovery_results) and not active_faults
                     if not recovery_complete:
@@ -267,17 +288,21 @@ class ScenarioExecutor:
                 convergence_errors: list[str] = []
                 controller = getattr(self, "traffic_controller", None)
                 if controller is not None and (
-                    not bool(controller.active_flows) or not controller.verify_active_flows()
+                    not bool(controller.active_flows)
+                    or not controller.verify_active_flows(control=OperationControl(deadline=deadline))
                 ):
                     convergence_errors.append("background traffic is not fully ready")
                 runtime_worker = getattr(self, "runtime_worker", None)
                 if runtime_worker is not None:
+                    route_snapshot = {"nodes": {}}
                     convergence_errors.extend(
                         check_worker_health(
                             runtime_worker,
                             scale_registry=self.scale_registry,
                             all_routing_devices=True,
                             deadline=deadline,
+                            route_snapshot=route_snapshot,
+                            expected_routes=getattr(self, "_case_routes", None),
                         )
                     )
                 if convergence_errors:
@@ -289,11 +314,58 @@ class ScenarioExecutor:
                     self.sleep(min(float(HEALTH_POLL_INTERVAL_SECONDS), remaining))
                     continue
                 validated_baseline = None
+                verified_scope = None
+                config_proof = None
                 if recovery_attempted and baseline_window is not None:
-                    validation = self._wait_and_observe(
-                        int(baseline_window["duration_seconds"]),
-                        baseline_window=baseline_window,
-                    )
+                    try:
+                        if getattr(self, "_case_frr_before", None) is not None:
+                            before = self._case_frr_before
+                            after = frr_snapshot(self, before["device"])
+                            restored = before["running"] == after["running"] and (
+                                before["saved_bytes"] == after["saved_bytes"] or after["saved"] == after["running"]
+                            )
+                            config_proof = {"before": before, "after": after, "restored": restored}
+                            if not restored:
+                                return {
+                                    "success": False,
+                                    "status": "configuration_recovery_failed",
+                                    "configuration_recovery": config_proof,
+                                }
+                        window_scope = self._baseline_scope(scenario) if runtime_worker is not None else None
+                        if runtime_worker is not None and getattr(self, "_case_initial_scope", None) is not None:
+                            changed = restored_scope_errors(
+                                getattr(self, "_case_initial_scope", None), window_scope, scenario, config_proof
+                            )
+                            if changed:
+                                return {
+                                    "success": False,
+                                    "status": "recovery_identity_changed",
+                                    "scope_changes": changed,
+                                }
+                        validation = self._wait_and_observe(
+                            int(baseline_window["duration_seconds"]),
+                            baseline_window=baseline_window,
+                            deadline=deadline,
+                        )
+                        if monotonic() >= deadline:
+                            raise TimeoutError("Recovery deadline exceeded during observation validation")
+                        if runtime_worker is not None and window_scope is not None:
+                            verified_scope = self._baseline_scope(scenario)
+                            if verified_scope is None or scope_changes(window_scope, verified_scope):
+                                return {
+                                    "success": False,
+                                    "status": "recovery_identity_changed",
+                                    "scope_changes": scope_changes(window_scope, verified_scope),
+                                }
+                    except TimeoutError as exc:
+                        errors.append(f"post_recovery_baseline: {exc}")
+                        return {
+                            "success": False,
+                            "status": "recovery_timeout",
+                            "attempts": attempts,
+                            "duration_seconds": max(0.0, monotonic() - started),
+                            "errors": list(dict.fromkeys(errors)),
+                        }
                     from .observation import baseline_gate_errors
 
                     baseline_errors = baseline_gate_errors(validation)
@@ -312,6 +384,9 @@ class ScenarioExecutor:
                         "end_time": validation["end_time"],
                         "duration_seconds": validation["duration_seconds"],
                     }
+                if monotonic() >= deadline:
+                    errors.append("Recovery deadline exceeded")
+                    break
                 result: dict[str, Any] = {
                     "success": True,
                     "status": "clean" if attempts == 1 else "recovered_after_retry",
@@ -319,10 +394,21 @@ class ScenarioExecutor:
                     "duration_seconds": max(0.0, monotonic() - started),
                     "errors": list(dict.fromkeys(errors)),
                 }
+                if runtime_worker is not None:
+                    from netopsbench.platform.observability.routes import verify_route_recovery
+
+                    route_errors = verify_route_recovery(getattr(self, "_case_routes", None), route_snapshot)
+                    if route_errors:
+                        return {"success": False, "status": "route_recovery_failed", "errors": route_errors}
+                    result["route_recovery"] = route_snapshot
                 if recovery_results is not None:
                     result["recovery"] = recovery_results
                 if validated_baseline is not None:
                     result["validated_baseline"] = validated_baseline
+                    if verified_scope is not None:
+                        result["validated_baseline_scope"] = verified_scope
+                if config_proof is not None:
+                    result["configuration_recovery"] = config_proof
                 return result
 
             if terminal_recovery_failure:
@@ -383,7 +469,11 @@ class ScenarioExecutor:
         logger.info("# Episode: 1")
         logger.info(f"{'#' * 70}")
 
+        self.timings = PhaseTimings()
+        self._case_frr_before = None
+        case_started = monotonic()
         scenario_result: dict[str, Any] = {
+            "fault_catalog_version": scenario.metadata.get("fault_catalog_version"),
             "scenario_id": scenario.scenario_id,
             "name": scenario.name,
             "start_time": datetime.now(UTC).isoformat(),
@@ -392,6 +482,7 @@ class ScenarioExecutor:
             "episode": None,
             "case_valid": False,
             "success": False,
+            "phase_timings": self.timings.phases,
         }
 
         incident = None
@@ -425,22 +516,26 @@ class ScenarioExecutor:
                     session = incident.open_session(
                         SimulatorConfig(
                             max_tool_calls=1_000,
-                            max_agent_seconds=86_400,
+                            max_agent_seconds=self.experiment.diagnosis_timeout_seconds,
                             max_tool_result_bytes=64 * 1024 * 1024,
-                            orphan_lease_ttl_seconds=86_700,
+                            orphan_lease_ttl_seconds=self.experiment.diagnosis_timeout_seconds + 300,
                         )
                     )
+                    session.phase_timings = self.timings
                     try:
-                        diagnosis = diagnosis_callback(
-                            episode_result,
-                            diagnostic_session=session,
-                            diagnostic_payload={
-                                "case_id": incident.case_id,
-                                "topology": backend.topology,
-                                "symptoms": backend.symptoms,
-                                "canonical_observation": incident.observation,
-                            },
-                        )
+                        with self.timings.measure(
+                            "diagnosis", timeout_seconds=self.experiment.diagnosis_timeout_seconds
+                        ):
+                            diagnosis = diagnosis_callback(
+                                episode_result,
+                                diagnostic_session=session,
+                                diagnostic_payload={
+                                    "case_id": incident.case_id,
+                                    "topology": backend.topology,
+                                    "symptoms": backend.symptoms,
+                                    "canonical_observation": incident.observation,
+                                },
+                            )
                     except Exception as exc:  # noqa: BLE001 - agent errors are scored outcomes
                         diagnosis = {
                             "error": str(exc),
@@ -450,8 +545,13 @@ class ScenarioExecutor:
                                 "error_type": type(exc).__name__,
                             },
                         }
+                    cleanup_time = self.timings.phases.get("agent_cleanup", {}).get("actual_seconds", 0)
+                    self.timings.phases["diagnosis"]["actual_seconds"] = max(
+                        0, self.timings.phases["diagnosis"]["actual_seconds"] - cleanup_time
+                    )
                     episode_result["diagnosis"] = diagnosis
                     if not diagnosis or diagnosis.get("error") or diagnosis.get("success") is False:
+                        self.timings.phases["diagnosis"]["status"] = "failed"
                         transition = session.terminate_failure(
                             domain=FailureDomain.AGENT,
                             message=(diagnosis or {}).get("error") or "diagnosis unavailable",
@@ -495,6 +595,8 @@ class ScenarioExecutor:
                 episode_result["success"] = execution_success
                 episode_result["state"] = "terminal"
                 scenario_result["success"] = execution_success
+                if diagnosis_callback is None:
+                    self.timings.skip("diagnosis", "effects mode")
         except Exception as e:  # noqa: BLE001 - scenario result records infrastructure failures
             logger.info(f"\n✗ Scenario failed: {e}")
             scenario_result["error"] = str(e)
@@ -519,6 +621,25 @@ class ScenarioExecutor:
                     scenario_result["cleanup_failed"] = True
 
             scenario_result["end_time"] = datetime.now(UTC).isoformat()
+            for phase in (
+                "baseline",
+                "baseline_query",
+                "baseline_routes",
+                "traffic_readiness",
+                "injection",
+                "observation",
+                "observation_query",
+                "effect_validation",
+                "diagnosis",
+                "agent_cleanup",
+                "recovery",
+            ):
+                if phase not in self.timings.phases:
+                    self.timings.skip(phase, "not reached or not applicable")
+            self.timings.phases["total"] = {
+                "status": "completed" if scenario_result["success"] else "failed",
+                "actual_seconds": monotonic() - case_started,
+            }
 
         logger.info(f"\n{'#' * 70}")
         logger.info("# Scenario Complete")

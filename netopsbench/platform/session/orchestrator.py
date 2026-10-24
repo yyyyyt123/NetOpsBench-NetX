@@ -273,6 +273,8 @@ class SessionOrchestrator:
             if dispatched.evaluations
             else {"summary": {"total_cases": 0, "average_score": 0.0}, "detailed_results": []}
         )
+        if control and control.effects_only:
+            aggregate_report = {"summary": {"execution_mode": "effects"}, "detailed_results": []}
         completed_at = self._timestamp()
         traces_dir = trace_writer.root_dir if trace_writer is not None else None
         report_payload = create_run_report(

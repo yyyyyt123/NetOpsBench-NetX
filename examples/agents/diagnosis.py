@@ -5,6 +5,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+from netopsbench.platform.faults.specs import get_supported_scenario_faults
 from netopsbench.sdk import build_canonical_observation
 from netopsbench.sdk.agents import DiagnosisResult
 
@@ -28,7 +29,9 @@ class DiagnosisOutput(BaseModel):
             "Do NOT invent other values such as 'fault', 'fault_found', or 'fault_confirmed'."
         )
     )
-    fault_type: str | None = None
+    fault_type: str | None = Field(
+        default=None, description="Canonical scored category: " + ", ".join(get_supported_scenario_faults())
+    )
     location: DiagnosisLocation = Field(default_factory=DiagnosisLocation)
     evidence: list[str] = Field(default_factory=list)
     confidence: float = Field(default=0.5, ge=0.0, le=1.0)
@@ -44,7 +47,9 @@ SYSTEM_GUIDANCE = (
     "Do NOT use synonyms such as 'fault', 'fault_found', 'fault_confirmed', or 'fault_resolved' — "
     "any of those will be scored as wrong. "
     "If evidence is insufficient, return verdict='inconclusive' with an empty location. "
-    "Prefer Pingmesh and topology tools first, then validate with interface, routing, and log evidence. "
+    "Use Pingmesh, topology and the uniformly collected route observations to choose evidence. "
+    "Healthy latency/loss can coexist with missing routes or fewer FIB next hops. "
+    "Validate the route RIB, advertisements and kernel FIB, and distinguish the supported fault categories. "
     "Be efficient: avoid redundant tool calls and do not repeat the same query. "
     "You have a limited tool-call budget — focus on the most informative tools first. "
 )

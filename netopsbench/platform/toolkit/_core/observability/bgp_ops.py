@@ -37,10 +37,13 @@ class BgpOpsMixin:
         role: str | None = None,
         state: str = "non_established",
         limit: int = 100,
+        event_type: str = "session",
     ) -> ToolResult:
         """Find BGP session transitions without logging in to every router."""
         try:
-            if state not in _VALID_STATES:
+            if event_type not in {"session", "prefix_count"}:
+                raise ValueError("event_type must be session or prefix_count")
+            if event_type == "session" and state not in _VALID_STATES:
                 raise ValueError(f"Invalid state: {state}. Expected one of {sorted(_VALID_STATES)}")
             safe_device = self._validate_device_name(device) if device else None
             safe_peer = self._validate_ip_address(peer, "peer") if peer else None
@@ -60,6 +63,51 @@ class BgpOpsMixin:
                 if (not safe_device or name == safe_device) and (not role or device_role == role)
             }
             role_filter = self._bgp_source_filter(selected_devices) if role and not safe_device else ""
+            if event_type == "prefix_count":
+                query = f"""
+from(bucket: "{self.influxdb_bucket}")
+{scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "bgp_prefix_events")
+  |> filter(fn: (r) => r.topology_id == "{self._flux_string(self.topology_id)}")
+{filters + role_filter}  |> pivot(rowKey: ["_time", "source", "neighbor_address"], columnKey: ["_field"], valueColumn: "_value")
+  |> group() |> sort(columns: ["_time"], desc: true) |> limit(n: {safe_limit + 1})
+"""
+                rows = self._query_influx_rows(query, require_value=False)
+                index_rows = self._query_bgp_event_index(scope, device_filter + role_filter)
+                index_complete = self._bgp_event_index_covers_scope(index_rows, scope, selected_devices)
+                collection_query = f"""
+from(bucket: "{self.influxdb_bucket}")
+{scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "bgp_collection")
+  |> filter(fn: (r) => r.topology_id == "{self._flux_string(self.topology_id)}")
+{device_filter + role_filter}  |> pivot(rowKey: ["_time", "source"], columnKey: ["_field"], valueColumn: "_value")
+  |> filter(fn: (r) => not r.collection_ok)
+  |> group() |> sort(columns: ["_time"], desc: true) |> limit(n: {safe_limit})
+"""
+                gaps = self._query_influx_rows(collection_query, require_value=False)
+                events = [
+                    {
+                        "device": row.get("source"),
+                        "peer": row.get("neighbor_address"),
+                        "role": roles.get(row.get("source")),
+                        "event_type": "prefix_count",
+                        "prefixes_before": row.get("prefixes_before"),
+                        "prefixes_after": row.get("prefixes_after"),
+                        "timestamp": row.get("_time"),
+                    }
+                    for row in rows
+                ]
+                return ToolResult(
+                    success=True,
+                    data={
+                        "status": "ok" if index_complete and not gaps else "incomplete",
+                        "collection_errors": gaps,
+                        "event_type": event_type,
+                        "time_scope": {k: v for k, v in scope.items() if k != "range_clause"},
+                        "events": events[:safe_limit],
+                        "returned_events": min(len(events), safe_limit),
+                        "truncated": len(events) > safe_limit,
+                        "data_freshness_seconds": self._bgp_freshness_seconds(index_rows, scope),
+                    },
+                )
             index_rows = self._query_bgp_event_index(scope, device_filter + role_filter)
             if self._bgp_event_index_covers_scope(index_rows, scope, selected_devices):
                 rows = self._query_bgp_event_fast_rows(

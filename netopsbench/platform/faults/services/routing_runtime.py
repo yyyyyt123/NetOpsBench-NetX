@@ -99,28 +99,6 @@ class RoutingRuntime:
             return int(snapshot["local_as"])
         return None
 
-    @staticmethod
-    def normalize_bgp_neighbor_kind(misconfig_kind: str | None) -> str:
-        normalized = str(misconfig_kind or "peer_as_mismatch").strip().lower().replace("-", "_")
-        aliases = {
-            "peer_as": "peer_as_mismatch",
-            "remote_as_mismatch": "peer_as_mismatch",
-            "auth_mismatch": "password_mismatch",
-            "md5_mismatch": "password_mismatch",
-            "update_source": "update_source_mismatch",
-        }
-        return aliases.get(normalized, normalized)
-
-    @staticmethod
-    def normalize_route_policy_kind(misconfig_kind: str | None) -> str:
-        normalized = str(misconfig_kind or "network_statement_missing").strip().lower().replace("-", "_")
-        aliases = {
-            "route_origination_missing": "network_statement_missing",
-            "outbound_prefix_filter": "route_map_deny_prefix",
-            "prefix_filter_misconfig": "route_map_deny_prefix",
-        }
-        return aliases.get(normalized, normalized)
-
     def pick_bgp_neighbor(self, device: str, peer_ip: str | None = None) -> dict[str, Any] | None:
         snapshot = self.get_bgp_config_snapshot(device)
         neighbors = list(snapshot.get("neighbors") or [])

@@ -7,12 +7,11 @@ Supports various fault types for DCN troubleshooting benchmark.
 from pathlib import Path
 from typing import Any
 
+from netopsbench.models.profiles import ExperimentProfile, default_experiment_profile
 from netopsbench.platform.faults.context import FaultRuntimeContext
-from netopsbench.platform.faults.handlers.acl import AclHandler
 from netopsbench.platform.faults.handlers.impairment import ImpairmentHandler
 from netopsbench.platform.faults.handlers.link import LinkHandler
-from netopsbench.platform.faults.handlers.routing_bgp import BgpHandler
-from netopsbench.platform.faults.handlers.routing_policy import RoutePolicyHandler
+from netopsbench.platform.faults.handlers.network import NetworkFaultHandler
 from netopsbench.platform.faults.handlers.routing_static import StaticRouteHandler
 from netopsbench.platform.faults.handlers.system import SystemHandler
 from netopsbench.platform.faults.services.command_runner import CommandRunner
@@ -40,6 +39,7 @@ class FaultInjector:
         clab_dir: str | None = None,
         topology_metadata: dict[str, Any] | None = None,
         fault_registry: FaultSpecRegistry | None = None,
+        experiment: ExperimentProfile | None = None,
     ):
         self.fault_registry = fault_registry or create_fault_registry()
         resolved_clab_dir = Path(clab_dir or ".").resolve()
@@ -53,7 +53,9 @@ class FaultInjector:
                     "Pass topology_metadata or a generated topology directory."
                 )
             manifest = load_topology_manifest(metadata_file)
-        self._ctx = FaultRuntimeContext(manifest=manifest, topology_dir=resolved_clab_dir)
+        self._ctx = FaultRuntimeContext(
+            manifest=manifest, topology_dir=resolved_clab_dir, experiment=experiment or default_experiment_profile()
+        )
 
         # Build services (order matters — each layer depends on previous ones)
         self._cmd = CommandRunner()
@@ -65,11 +67,11 @@ class FaultInjector:
         # Build handlers
         self._link = LinkHandler(self._cmd, self._sonic, self._iface, self._tracker, self._ctx)
         self._impairment = ImpairmentHandler(self._cmd, self._sonic, self._iface, self._tracker, self._ctx)
-        self._bgp = BgpHandler(self._sonic, self._routing, self._tracker, self._ctx)
         self._static_route = StaticRouteHandler(self._sonic, self._tracker, self._ctx)
-        self._route_policy = RoutePolicyHandler(self._sonic, self._routing, self._tracker, self._ctx)
+        self._network = NetworkFaultHandler(
+            self._cmd, self._sonic, self._iface, self._routing, self._tracker, self._ctx
+        )
         self._system = SystemHandler(self._cmd, self._sonic, self._tracker, self._ctx)
-        self._acl = AclHandler(self._cmd, self._sonic, self._routing, self._tracker, self._ctx)
 
     @property
     def container_names(self) -> dict[str, str]:
@@ -126,18 +128,6 @@ class FaultInjector:
         return self._impairment.recover_tc_rules(device, interface)
 
     # ------------------------------------------------------------------
-    # BGP fault delegation
-    # ------------------------------------------------------------------
-
-    def inject_bgp_neighbor_misconfig(self, device: str, **kwargs) -> dict[str, Any]:
-        return self._bgp.inject_bgp_neighbor_misconfig(device, **kwargs)
-
-    def recover_bgp_neighbor_misconfig(
-        self, device: str, peer_ip: str, misconfig_kind: str, **kwargs
-    ) -> dict[str, Any]:
-        return self._bgp.recover_bgp_neighbor_misconfig(device, peer_ip, misconfig_kind, **kwargs)
-
-    # ------------------------------------------------------------------
     # Static route fault delegation
     # ------------------------------------------------------------------
 
@@ -159,40 +149,11 @@ class FaultInjector:
     ) -> dict[str, Any]:
         return self._static_route.recover_static_route_misconfig(device, target_ip, wrong_nexthop=wrong_nexthop)
 
-    # ------------------------------------------------------------------
-    # Route policy fault delegation
-    # ------------------------------------------------------------------
+    def inject_network_fault(self, episode) -> dict[str, Any]:
+        return self._network.inject(episode)
 
-    def inject_route_policy_misconfig(self, device: str, **kwargs) -> dict[str, Any]:
-        return self._route_policy.inject_route_policy_misconfig(device, **kwargs)
-
-    def recover_route_policy_misconfig(
-        self, device: str, target_prefix: str, misconfig_kind: str, **kwargs
-    ) -> dict[str, Any]:
-        return self._route_policy.recover_route_policy_misconfig(device, target_prefix, misconfig_kind, **kwargs)
-
-    # ------------------------------------------------------------------
-    # ACL fault delegation
-    # ------------------------------------------------------------------
-
-    def inject_acl_misconfig(
-        self, device: str, target_prefix: str | None = None, interface: str | None = None, direction: str = "in"
-    ) -> dict[str, Any]:
-        return self._acl.inject_acl_misconfig(
-            device, target_prefix=target_prefix, interface=interface, direction=direction
-        )
-
-    def recover_acl_misconfig(
-        self,
-        device: str,
-        target_prefix: str,
-        interface: str | None = None,
-        direction: str = "in",
-        acl_name: str | None = None,
-    ) -> dict[str, Any]:
-        return self._acl.recover_acl_misconfig(
-            device, target_prefix, interface=interface, direction=direction, acl_name=acl_name
-        )
+    def recover_network_fault(self, fault) -> dict[str, Any]:
+        return self._network.recover(fault)
 
     # ------------------------------------------------------------------
     # System fault delegation

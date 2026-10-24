@@ -1,0 +1,45 @@
+---
+title: Diagnostic Tools
+description: The shared diagnostic surface for DeepAgent, native Codex and custom agents.
+---
+
+All agents use the same 16-entry registry, parameter validation, episode window,
+budget and tracing. Native Codex receives it through authenticated per-case MCP
+HTTP; public stdio MCP remains available. The registry exposes ordinary device
+and telemetry observations. Pingmesh task/batch completeness is private runtime
+validation; there is no `get_pingmesh_flows` tool.
+
+Existing required parameters and default views retain their meanings. The
+following additions are optional:
+
+| Tool | Optional capability |
+|---|---|
+| `get_device_status(device)` | New entry: actual node running/accessibility, supported bgpd/zebra service states and collection time. Unavailable service data is reported explicitly, without an inferred fault label. |
+| `get_route_table(device, view="kernel", prefix=...)` | Actual kernel IPv4 FIB, including multipath next hops. The default `view="frr"` remains the FRR route table. |
+| `get_bgp_neighbor(device, peer, view="advertised_routes", prefix=...)` | Live advertised routes for one peer; optional exact-prefix filter. The default `view="detail"` retains session details. |
+| `get_device_interfaces(device, interface=..., include_tc=True)` | Actual IPv4 address/mask and tc/qdisc on the specified data interface, with its mapped Linux interface. `include_tc` requires an interface. |
+| `get_device_acl(device)` | SONiC table/rule match fields, port/stage attachment and iptables FORWARD counters, including input/output interfaces. |
+| `query_bgp_events(event_type="prefix_count")` | Prefix-count changes from the existing BGP collector. Default session mode is unchanged; prefix mode does not apply the session-state filter. Collection gaps are explicit, and failed collection never becomes prefix count zero. |
+| `get_pingmesh_summary(src_client=..., dst_client=...)` | Optional client filters over the existing aggregated output. |
+| `traceroute(src, dst_ip, max_hops=...)` | Default 8, maximum 32 hops, bounded by the diagnostic session deadline. |
+
+A count decrease is a clue. Confirm the specific prefix through RIB, advertised
+routes and kernel FIB. A missing container, a stopped bgpd and a down BGP peer
+are separate observations; avoid treating collection failure as routing failure.
+
+Pingmesh query times retain this precedence: explicit `start_time`/`end_time`,
+current toolkit episode window, context file, environment times, rolling
+fallback. `get_pingmesh_hotspots` remains aggregated by leaf/edge pair. Filtering
+summary clients does not change the hotspot granularity.
+
+All cases receive the same rules for public route observations: missing client
+prefixes, neighbor prefix-count changes and fewer actual FIB next hops compared
+with the healthy phase, plus changed host routes overriding a normal client
+prefix. These facts are computed from collected state, without
+injection parameters. ECMP can lose next hops while RTT/loss remain normal.
+
+Only anonymous case identifiers, normal topology/configuration intent and
+public observations reach an agent. Injection targets, mechanisms, recovery
+journals, private effect audits and grading answers stay outside prompts and
+tool output. Agents return the existing diagnosis schema; mechanism is not a
+new output field or scoring KPI.

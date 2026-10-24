@@ -45,7 +45,12 @@ def test_cancel_reaps_descendant_process_group(tmp_path):
         thread.join()
     child = int(pidfile.read_text())
     status = Path(f"/proc/{child}/stat")
-    assert not status.exists() or status.read_text().split()[2] == "Z"
+    try:
+        state = status.read_text().split()[2]
+    except (FileNotFoundError, ProcessLookupError):
+        # procfs can report ESRCH when the process exits between open and read.
+        state = "gone"
+    assert state in {"gone", "Z"}
 
 
 def test_controlled_process_preserves_input_output_and_exit_errors():

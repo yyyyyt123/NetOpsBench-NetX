@@ -2,15 +2,17 @@
 
 from __future__ import annotations
 
+import csv
 from collections.abc import Iterable, Sequence
 from datetime import UTC, datetime
+from io import StringIO
 from pathlib import Path
 from typing import Any
 
 from netopsbench.logging_utils import get_logger
 from netopsbench.models.scenario import ScenarioSpec
 from netopsbench.platform.topology.topology_utils import load_topology_manifest
-from netopsbench.platform.utils.files import atomic_write_json
+from netopsbench.platform.utils.files import atomic_write_json, atomic_write_text
 
 logger = get_logger(__name__)
 
@@ -54,7 +56,7 @@ def reserve_run_id(artifact_root: Path, *, started_at: datetime | None = None) -
 
 def resolve_scale(scenarios: Iterable[ScenarioSpec]) -> str:
     scenario_list = list(scenarios)
-    return scenario_list[0].scale if scenario_list else "xs"
+    return scenario_list[0].scale if scenario_list else "medium"
 
 
 def create_run_report(
@@ -82,7 +84,9 @@ def create_run_report(
     overall_success = all(summary.get("success", False) for summary in worker_summaries) if worker_summaries else True
     status = "completed" if overall_success else "failed"
     reported_agent_name = str(
-        aggregate_report.get("agent_name") or getattr(agent, "name", agent.__class__.__name__) or "unknown"
+        aggregate_report.get("agent_name")
+        or ("effects" if agent is None else getattr(agent, "name", agent.__class__.__name__))
+        or "unknown"
     )
     reported_topology_scale = str(
         aggregate_report.get("topology_scale")
@@ -92,6 +96,7 @@ def create_run_report(
     )
     profile = runtime.scale_registry.get(reported_topology_scale)
     scale_profile = profile.model_dump(mode="json")
+    included_in_benchmark = profile.purpose == "benchmark" and mode != "effects"
     artifact_paths = {
         "report": str(report_path),
         "metadata": str(metadata_path),
@@ -104,7 +109,36 @@ def create_run_report(
     if trace_results_path is not None:
         artifact_paths["trace_results"] = str(trace_results_path)
 
+    timing_path = artifact_dir / "phase-timings.csv"
+    timing_csv = StringIO()
+    writer = csv.DictWriter(
+        timing_csv,
+        fieldnames=[
+            "scenario_id",
+            "scale",
+            "phase",
+            "status",
+            "planned_seconds",
+            "timeout_seconds",
+            "actual_seconds",
+            "reason",
+        ],
+    )
+    writer.writeheader()
+    for scenario in scenario_summaries:
+        for phase, measurement in scenario.get("phase_timings", {}).items():
+            writer.writerow(
+                {"scenario_id": scenario["scenario_id"], "scale": scenario.get("scale"), "phase": phase, **measurement}
+            )
+    atomic_write_text(timing_path, timing_csv.getvalue())
+    artifact_paths["phase_timings"] = str(timing_path)
+
+    from netopsbench.platform.faults.catalog import FAULT_CATALOG_VERSION
+
     return {
+        "fault_catalog_version": FAULT_CATALOG_VERSION,
+        "purpose": profile.purpose,
+        "included_in_benchmark": included_in_benchmark,
         "id": f"run:{run_id}",
         "run_id": run_id,
         "agent_name": reported_agent_name,
@@ -117,6 +151,9 @@ def create_run_report(
         "resolved_scale_profile": scale_profile,
         "summary": {
             **dict(aggregate_report.get("summary") or {}),
+            "fault_catalog_version": FAULT_CATALOG_VERSION,
+            "purpose": profile.purpose,
+            "included_in_benchmark": included_in_benchmark,
             "agent_name": reported_agent_name,
             "mode": mode,
             "status": status,
@@ -132,6 +169,9 @@ def create_run_report(
         "detailed_results": list(aggregate_report.get("detailed_results") or []),
         "artifact_paths": artifact_paths,
         "raw": {
+            "fault_catalog_version": FAULT_CATALOG_VERSION,
+            "purpose": profile.purpose,
+            "included_in_benchmark": included_in_benchmark,
             "status": status,
             "mode": mode,
             "runtime_id": runtime.id,

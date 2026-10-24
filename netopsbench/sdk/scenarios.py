@@ -26,13 +26,13 @@ class ScenarioManager:
         name: str,
         episode: EpisodeSpec | dict[str, Any],
         description: str = "",
-        scale: str = "xs",
+        scale: str = "medium",
         traffic_profile: str = "standard",
         metadata: dict[str, Any] | None = None,
         parameters: dict[str, Any] | None = None,
     ) -> ScenarioSpec:
         try:
-            self.scale_registry.get(scale)
+            profile = self.scale_registry.get(scale)
         except (KeyError, ValueError) as exc:
             raise ScenarioValidationError(str(exc)) from exc
         if traffic_profile != "standard":
@@ -46,7 +46,7 @@ class ScenarioManager:
                 topology_scale=scale,
                 traffic_profile="standard",
                 episode=episode_spec,
-                metadata=dict(metadata or {}),
+                metadata={"fault_catalog_version": 2, "purpose": profile.purpose, **(metadata or {})},
                 parameters=dict(parameters or {}),
             )
         except ValueError as exc:

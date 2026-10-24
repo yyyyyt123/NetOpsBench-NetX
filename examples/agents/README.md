@@ -21,7 +21,7 @@ On a fresh clone, generate the XS benchmark assets before using the example
 scenario path below:
 
 ```bash
-netopsbench benchmark prepare --scales xs
+netopsbench benchmark prepare --scales medium
 ```
 
 If you are building against the public SDK API:
@@ -37,7 +37,7 @@ from netopsbench.sdk import NetOpsBench
 with NetOpsBench(workspace=".") as bench:
     agent = bench.agents.wrap(MinimalDeepAgent(vendor="openai"))
     run = bench.sessions.run_scenario(
-        scenario="scenarios/generated/xs/generated_link_down_xs_001.yaml",
+        scenario="scenarios/generated/medium/generated_link_down_medium_001.yaml",
         agent=agent,
     )
     report = run.wait(raise_on_failure=True)
@@ -62,6 +62,6 @@ For `examples/01_run_scenario.py`, choose provider via CLI argument:
 
 - `PYTHONPATH=. python examples/01_run_scenario.py --vendor openai`
 - `PYTHONPATH=. python examples/01_run_scenario.py --vendor minimax`
-- `PYTHONPATH=. python examples/01_run_scenario.py --agent codex --scenario scenarios/generated/xs/generated_healthy_network_xs_001.yaml` (install `.[codex]` and sign in with the pinned native CLI)
+- `PYTHONPATH=. python examples/01_run_scenario.py --agent codex --scenario scenarios/generated/medium/generated_healthy_network_medium_001.yaml` (install `.[codex]` and sign in with the pinned native CLI)
 
 These examples are references for application code, not required internal platform machinery.

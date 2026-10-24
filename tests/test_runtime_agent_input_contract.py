@@ -208,7 +208,7 @@ def test_agent_success_false_survives_runtime_callback(tmp_path):
     )
     result = callback(
         {},
-        diagnostic_session=SimpleNamespace(),
+        diagnostic_session=SimpleNamespace(config=SimpleNamespace(max_agent_seconds=600)),
         diagnostic_payload={"case_id": "anonymous", "topology": {}, "symptoms": {}, "canonical_observation": {}},
     )
     assert result["success"] is False

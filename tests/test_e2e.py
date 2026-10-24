@@ -398,8 +398,8 @@ class TestFaultInjector:
             "link_down",
             "link_flapping",
             "device_down",
-            "bgp_neighbor_misconfig",
-            "route_policy_misconfig",
+            "bgp_as_mismatch",
+            "route_origination_misconfig",
             "mtu_mismatch",
             "packet_corruption",
             "packet_loss",
@@ -704,19 +704,19 @@ class TestEvaluator:
         assert summary["device_accuracy"] == 0.0
         assert summary["interface_localization_rate"] == 0.0
 
-    def test_evaluate_route_policy_alias_as_correct_fault_type(self):
-        """Route-origination style answers should normalize to route_policy_misconfig."""
+    def test_evaluate_route_origination_as_correct_fault_type(self):
+        """The explicit catalog type is scored independently of its mechanism."""
         evaluator = Evaluator()
 
         agent_output = AgentOutput(
             verdict="fault_detected",
-            fault_type="route_origination_missing",
+            fault_type="route_origination_misconfig",
             location={"device": "leaf1"},
             confidence=0.9,
         )
 
         ground_truth = {
-            "fault_type": "route_policy_misconfig",
+            "fault_type": "route_origination_misconfig",
             "location": {"device": "leaf1"},
         }
 
@@ -795,7 +795,7 @@ episode:
         scenario = parse_scenario_file(_generated_scenario_path("generated_link_down_xs_001.yaml"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_topology("small", tmpdir)
+            generate_topology("medium", tmpdir)
 
             result = validate_scenario_topology(
                 scenario=scenario,
@@ -804,7 +804,7 @@ episode:
 
             assert result["status"] == "fail"
             assert result["declared_scale"] == scenario.topology_scale
-            assert result["actual_scale"] == "small"
+            assert result["actual_scale"] == "medium"
 
     def test_topology_guard_accepts_e_style_interface_aliases(self):
         """e1-1 style interface labels should map to SONiC Ethernet ports."""
@@ -824,10 +824,10 @@ episode:
 
     def test_topology_guard_accepts_vendor_style_interface_aliases(self):
         """Vendor-style ethernet-1/1 labels should also map to SONiC Ethernet ports."""
-        scenario = parse_scenario_file(_generated_scenario_path("generated_link_down_small_001.yaml"))
+        scenario = parse_scenario_file(_generated_scenario_path("generated_link_down_medium_001.yaml"))
 
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_topology("small", tmpdir)
+            generate_topology("medium", tmpdir)
 
             _write_config_db(tmpdir, "spine1", {"Ethernet0": []})
             _write_config_db(tmpdir, "spine2", {"Ethernet4": []})
@@ -842,14 +842,14 @@ episode:
     def test_configdb_payload_interfaces_are_used_by_runtime_helpers(self):
         """Runtime helpers read interface metadata from generated ConfigDB artifacts."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            generate_topology("small", tmpdir)
+            generate_topology("medium", tmpdir)
             spine_config = _write_config_db(tmpdir, "spine1", {"Ethernet4": ["10.0.0.2/30"]})
             _write_config_db(tmpdir, "leaf1", {"Ethernet4": ["10.0.0.1/30"]})
 
             scenario = ScenarioSpec(
                 scenario_id="configdb_interface_case",
                 name="ConfigDB interface case",
-                topology_scale="small",
+                topology_scale="medium",
                 metadata={"difficulty": "easy"},
                 episode=EpisodeSpec(
                     episode_id="diagnosis",

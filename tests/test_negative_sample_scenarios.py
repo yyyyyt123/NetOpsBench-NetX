@@ -4,11 +4,22 @@ from __future__ import annotations
 
 import tempfile
 
+import pytest
+
 from netopsbench.evaluator.scorer import AgentOutput, Evaluator
 from netopsbench.models.scenario import EpisodeSpec, ScenarioSpec
 from netopsbench.platform.scenario.executor import ScenarioExecutor
 from netopsbench.platform.session.scoring import score_scenario_episode
 from netopsbench.platform.topology.generator import generate_topology
+
+
+@pytest.fixture(autouse=True)
+def observation_clock(monkeypatch):
+    # These are diagnosis/scoring contracts; actual waiting is tested separately.
+    def capture(_runner, duration, **kwargs):
+        return {**_healthy_observation(duration), "name": kwargs.get("name", "window")}
+
+    monkeypatch.setattr("netopsbench.platform.scenario.observation.capture_observation_window", capture)
 
 
 def _metadata() -> dict:
@@ -64,8 +75,8 @@ def test_healthy_scenario_observes_and_diagnoses(monkeypatch):
     monkeypatch.setattr(runner, "_recover_fault", lambda: [])
     monkeypatch.setattr(
         runner,
-        "_wait_and_observe",
-        lambda duration, **_kwargs: _healthy_observation(duration),
+        "_merge_observation_windows",
+        lambda windows, total_duration_seconds, **_kwargs: _healthy_observation(total_duration_seconds),
     )
     calls = []
 
@@ -90,8 +101,8 @@ def test_agent_exception_is_zero_outcome_not_infrastructure_failure(monkeypatch)
     monkeypatch.setattr(runner, "_recover_fault", lambda: [])
     monkeypatch.setattr(
         runner,
-        "_wait_and_observe",
-        lambda duration, **_kwargs: _healthy_observation(duration),
+        "_merge_observation_windows",
+        lambda windows, total_duration_seconds, **_kwargs: _healthy_observation(total_duration_seconds),
     )
 
     def fail(_payload, **_kwargs):
@@ -116,8 +127,8 @@ def test_invalid_diagnosis_schema_is_protocol_outcome_zero(monkeypatch):
     monkeypatch.setattr(runner, "_recover_fault", lambda: [])
     monkeypatch.setattr(
         runner,
-        "_wait_and_observe",
-        lambda duration, **_kwargs: _healthy_observation(duration),
+        "_merge_observation_windows",
+        lambda windows, total_duration_seconds, **_kwargs: _healthy_observation(total_duration_seconds),
     )
 
     result = runner.run_scenario(

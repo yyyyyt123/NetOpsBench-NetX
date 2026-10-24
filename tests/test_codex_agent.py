@@ -126,6 +126,30 @@ async def test_episode_mcp_requires_token_uses_gateway_and_enforces_budget():
     assert signal.getsignal(signal.SIGTERM) == original_handler
 
 
+@pytest.mark.asyncio
+async def test_episode_http_tools_inherit_the_agent_deadline():
+    import time
+
+    from fastmcp import Client
+
+    from netopsbench.platform.toolkit._core.control import current_tool_control, tool_deadline_scope
+
+    deadline = time.monotonic() + 20
+    context = DiagnosticContext(
+        "case-anonymous",
+        {},
+        {},
+        tools=SimpleNamespace(
+            get_topology=lambda **kw: ToolResult(True, {"deadline": current_tool_control().deadline})
+        ),
+    )
+    with tool_deadline_scope(deadline):
+        async with session_mcp(context) as endpoint:
+            async with Client(endpoint["url"], auth=endpoint["token"]) as client:
+                result = await client.call_tool("get_topology", {})
+                assert result.data["data"]["deadline"] == deadline
+
+
 @pytest.mark.real
 @pytest.mark.asyncio
 async def test_real_diagnostic_container_blocks_host_files_privileges_and_network(tmp_path):
@@ -185,9 +209,10 @@ print('isolation and authenticated MCP passed')
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["nonzero", "invalid", "timeout", "cancel"])
+@pytest.mark.parametrize("failure", ["nonzero", "invalid", "timeout", "startup_timeout", "cancel"])
 async def test_native_process_failures_always_release_resources(monkeypatch, tmp_path, failure):
     import sys
+    import time
     from contextlib import asynccontextmanager, nullcontext
 
     import examples.agents.codex_agent.agent as module
@@ -209,6 +234,8 @@ async def test_native_process_failures_always_release_resources(monkeypatch, tmp
             self.gateway = "127.0.0.1"
 
         def open(self):
+            if failure == "startup_timeout":
+                time.sleep(0.08)
             return self
 
         def command(self, *a, **kw):
@@ -227,6 +254,12 @@ async def test_native_process_failures_always_release_resources(monkeypatch, tmp
     monkeypatch.setattr(module, "DiagnosticContainer", Container)
     monkeypatch.setattr(module, "session_mcp", endpoint)
     monkeypatch.setattr(module, "openai_proxy", lambda *a: nullcontext(1))
+    if failure == "startup_timeout":
+        monkeypatch.setattr(
+            module.asyncio,
+            "create_subprocess_exec",
+            lambda *a, **kw: pytest.fail("Expired startup must not launch CLI"),
+        )
     agent = CodexAgent(auth_store=store, artifacts_dir=tmp_path / "traces", timeout_seconds=0.05)
     agent._image_id = "pinned-image"
     context = DiagnosticContext("anonymous", {}, {}, tools=None)
@@ -240,6 +273,8 @@ async def test_native_process_failures_always_release_resources(monkeypatch, tmp
         result = await task
         assert result.success is False
         assert result.metadata["agent_failure_stage"] == "diagnose"
+        if failure == "startup_timeout":
+            assert result.metadata["error_type"] == "TimeoutError"
     assert releases == [True]
     assert not agent._containers
     assert list(store.iterdir()) == [store / "auth.json"]

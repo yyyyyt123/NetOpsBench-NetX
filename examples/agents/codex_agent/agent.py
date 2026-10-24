@@ -5,13 +5,18 @@ import json
 import re
 import shutil
 import tempfile
+import time
 import uuid
 from dataclasses import replace
 from pathlib import Path
 
 from examples.agents.diagnosis import SYSTEM_GUIDANCE, DiagnosisOutput, build_result, build_user_prompt
+from netopsbench.models.profiles import default_experiment_profile
+from netopsbench.platform.scenario.timing import agent_cleanup_timing
+from netopsbench.platform.toolkit._core.control import current_tool_control, diagnosis_budget_scope
 from netopsbench.platform.toolkit.mcp.registry import tool_schemas
 from netopsbench.platform.toolkit.mcp.session_server import session_mcp
+from netopsbench.platform.utils.control import finish_cleanup
 from netopsbench.sdk.agents import DiagnosisResult
 
 from .proxy import openai_proxy
@@ -108,14 +113,17 @@ class CodexAgent:
         reasoning_effort="xhigh",
         cli_version=CLI_VERSION,
         image=DEFAULT_IMAGE,
-        timeout_seconds=600,
+        timeout_seconds=None,
         max_tool_calls=40,
         auth_store=None,
         artifacts_dir=None,
     ):
         self.name, self.model, self.reasoning_effort = name, model, reasoning_effort
         self.cli_version, self.image = cli_version, image
-        self.timeout_seconds, self.max_tool_calls = timeout_seconds, max_tool_calls
+        self.timeout_seconds = (
+            default_experiment_profile().diagnosis_timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
+        self.max_tool_calls = max_tool_calls
         self.auth_store = Path(auth_store or ".netopsbench/private/codex-auth").resolve()
         self._refresh_from_host = auth_store is None
         self.artifacts_dir = Path(artifacts_dir or ".netopsbench/codex-traces").resolve()
@@ -185,7 +193,22 @@ class CodexAgent:
         return [*args, "-"]
 
     async def diagnose(self, context):
-        return await self._execute(context, build_user_prompt(context, fenced_output=False))
+        try:
+            async with diagnosis_budget_scope(self.timeout_seconds):
+                return await self._execute(context, build_user_prompt(context, fenced_output=False))
+        except TimeoutError as exc:
+            return DiagnosisResult(
+                agent_name=self.name,
+                verdict="inconclusive",
+                success=False,
+                reasoning="Total diagnosis timeout exceeded",
+                metadata={
+                    **getattr(exc.__cause__, "agent_metadata", {}),
+                    "error_type": "TimeoutError",
+                    "agent_failure_stage": "diagnose",
+                    "timeout_seconds": self.timeout_seconds,
+                },
+            )
 
     async def check_connection(self):
         from types import SimpleNamespace
@@ -278,6 +301,9 @@ class CodexAgent:
                             token=endpoint["token"],
                             cli_args=self.cli_args(endpoint),
                         )
+                        control = current_tool_control()
+                        if control is not None:
+                            control.remaining()
                         process = await asyncio.create_subprocess_exec(
                             *command,
                             stdin=asyncio.subprocess.PIPE,
@@ -302,9 +328,12 @@ class CodexAgent:
                                 while line := await process.stderr.readline():
                                     output.write(redact(line.decode(errors="replace"), secrets))
 
+                        cli_timeout = (
+                            control.remaining(self.timeout_seconds) if control is not None else self.timeout_seconds
+                        )
                         await asyncio.wait_for(
                             asyncio.gather(collect_stdout(), collect_stderr(), process.wait()),
-                            timeout=self.timeout_seconds,
+                            timeout=cli_timeout,
                         )
                         metadata.update(events.usage, **events.counts(), exit_code=process.returncode)
                         if metadata["mcp_calls"] > self.max_tool_calls:
@@ -312,6 +341,10 @@ class CodexAgent:
                         output = events.result(process.returncode)
                         metadata["tool_calls"] = context.trace.tool_calls() if context.trace else []
                         result = build_result(self.name, output, metadata=metadata)
+        except asyncio.CancelledError as exc:
+            metadata.update(events.usage, **events.counts(), agent_failure_stage="diagnose")
+            exc.agent_metadata = metadata
+            raise
         except Exception as exc:
             metadata.update(
                 events.usage, **events.counts(), error_type=type(exc).__name__, agent_failure_stage="diagnose"
@@ -324,37 +357,36 @@ class CodexAgent:
                 agent_name=self.name, verdict="inconclusive", success=False, reasoning=error, metadata=metadata
             )
         finally:
-            cleanup = asyncio.create_task(self._cleanup(container, process, auth_temporary, open_task))
-            cancelled = False
-            while not cleanup.done():
-                try:
-                    await asyncio.shield(cleanup)
-                except asyncio.CancelledError:
-                    cancelled = True
-            errors = redact(cleanup.result(), secrets)
-            metadata["cleanup_errors"] = json.loads(errors)
-            if container in self._containers:
-                metadata["retained_resources"] = {
-                    "container": getattr(container, "name", None),
-                    "network": getattr(container, "network", None),
-                }
-            if metadata["cleanup_errors"] and result is not None:
-                result = replace(
-                    result, success=False, reasoning=result.reasoning + "; diagnostic resource cleanup failed"
+            with agent_cleanup_timing():
+                cleanup_started = time.monotonic()
+                cleanup_result, cancelled = await finish_cleanup(
+                    self._cleanup(container, process, auth_temporary, open_task)
                 )
-            if result is not None:
-                result.metadata.update(metadata)
-            (directory / "cleanup.json").write_text(
-                json.dumps(
-                    {
-                        "errors": metadata["cleanup_errors"],
-                        "retained_resources": metadata.get("retained_resources", {}),
-                    },
-                    indent=2,
+                errors = redact(cleanup_result, secrets)
+                metadata["agent_cleanup_seconds"] = time.monotonic() - cleanup_started
+                metadata["cleanup_errors"] = json.loads(errors)
+                if container in self._containers:
+                    metadata["retained_resources"] = {
+                        "container": getattr(container, "name", None),
+                        "network": getattr(container, "network", None),
+                    }
+                if metadata["cleanup_errors"] and result is not None:
+                    result = replace(
+                        result, success=False, reasoning=result.reasoning + "; diagnostic resource cleanup failed"
+                    )
+                if result is not None:
+                    result.metadata.update(metadata)
+                (directory / "cleanup.json").write_text(
+                    json.dumps(
+                        {
+                            "errors": metadata["cleanup_errors"],
+                            "retained_resources": metadata.get("retained_resources", {}),
+                        },
+                        indent=2,
+                    )
                 )
-            )
-            if cancelled:
-                raise asyncio.CancelledError
+                if cancelled:
+                    raise asyncio.CancelledError
         return result
 
     async def _cleanup(self, container, process, auth_temporary, open_task):

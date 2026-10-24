@@ -27,8 +27,27 @@ class DetectorCoverageMixin:
         settings = plan.settings
         expected = self._expected_combinations
         valid = []
+        invalid_rows = []
+        invalid_tasks = set()
         invalid_socket_rows = unexpected_rows = 0
+        incomplete_record_rows = 0
+        unexpected_records = []
         for row in rows:
+            if any(
+                row.get(key) in (None, "")
+                for key in (
+                    "plan_id",
+                    "src_name",
+                    "dst_name",
+                    "probe_cycle",
+                    "destination_batch_index",
+                    "port_batch_index",
+                    "rtt_ports_active",
+                    "rtt_ports_total",
+                    "local_probe_errors",
+                )
+            ):
+                incomplete_record_rows += 1
             cycle = _field_int(row, "probe_cycle")
             source, destination = row.get("src_name"), row.get("dst_name")
             frame = (
@@ -44,6 +63,21 @@ class DetectorCoverageMixin:
                 or destination not in frame[2]
             ):
                 unexpected_rows += 1
+                if len(unexpected_records) < 20:
+                    unexpected_records.append(
+                        {
+                            key: row.get(key)
+                            for key in (
+                                "_time",
+                                "src_name",
+                                "dst_name",
+                                "plan_id",
+                                "probe_cycle",
+                                "destination_batch_index",
+                                "port_batch_index",
+                            )
+                        }
+                    )
                 continue
             if not _has_valid_socket_batch(
                 row,
@@ -51,6 +85,20 @@ class DetectorCoverageMixin:
                 port_batches=settings.port_batches,
             ):
                 invalid_socket_rows += 1
+                invalid_tasks.add((source, destination, frame[1]))
+                invalid_rows.append(
+                    {
+                        "src": source,
+                        "dst": destination,
+                        "port_batch_index": frame[1],
+                        "probe_cycle": cycle,
+                        "time": str(row.get("_time") or row.get("time") or ""),
+                        "local_probe_errors": _field_int(row, "local_probe_errors"),
+                        "socket_batch_valid": _has_expected_socket_batch(
+                            row, source_ports=settings.source_ports, port_batches=settings.port_batches
+                        ),
+                    }
+                )
                 continue
             valid.append(row)
         combinations = Counter((row["src_name"], row["dst_name"], int(row["port_batch_index"])) for row in valid)
@@ -80,6 +128,10 @@ class DetectorCoverageMixin:
             "pair_port_combinations_observed": len(combinations),
             "expected_pair_port_combinations": len(expected),
             "missing_pair_port_combinations": len(missing),
+            "missing_tasks": sorted(missing),
+            "invalid_tasks": sorted(invalid_tasks),
+            "invalid_rows": invalid_rows,
+            "observable_pairs": sorted(pairs),
             "min_samples_per_pair": min(pairs.values(), default=0),
             "port_batches_observed": sorted(ports),
             "destination_batches_observed": sorted(destinations),
@@ -88,6 +140,8 @@ class DetectorCoverageMixin:
             "missing_source_clients": len(plan.clients) - len(sources),
             "invalid_socket_rows": invalid_socket_rows,
             "unexpected_rows": unexpected_rows,
+            "incomplete_record_rows": incomplete_record_rows,
+            "unexpected_records": unexpected_records,
         }
 
 
@@ -99,13 +153,17 @@ def _field_int(row: dict, field: str) -> int | None:
 
 
 def _has_valid_socket_batch(row, *, source_ports, port_batches) -> bool:
+    return _has_expected_socket_batch(row, source_ports=source_ports, port_batches=port_batches) and (
+        _field_int(row, "local_probe_errors") == 0
+    )
+
+
+def _has_expected_socket_batch(row, *, source_ports, port_batches) -> bool:
     port_batch = _field_int(row, "port_batch_index")
     if port_batch is None or not 0 <= port_batch < len(port_batches):
         return False
-    return (
-        _field_int(row, "rtt_ports_total") == len(source_ports)
-        and _field_int(row, "rtt_ports_active") == len(port_batches[port_batch])
-        and _field_int(row, "local_probe_errors") == 0
+    return _field_int(row, "rtt_ports_total") == len(source_ports) and _field_int(row, "rtt_ports_active") == len(
+        port_batches[port_batch]
     )
 
 

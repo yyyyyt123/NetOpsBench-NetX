@@ -175,6 +175,7 @@ def build_clos_plan(config: TopologyConfig) -> FabricPlan:
         topology_id=config.name,
         name=config.name,
         scale=scale_name,
+        purpose=config.purpose,
         family="clos",
         management=Management(
             network=config.mgmt_network_name or f"clab-mgmt-{config.name}",
