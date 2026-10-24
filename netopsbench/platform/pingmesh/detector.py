@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 
@@ -11,6 +11,7 @@ from netopsbench.platform.topology.topology_utils import coerce_topology_manifes
 
 from ._detector_analysis import DetectorAnalysisMixin
 from ._detector_coverage import DetectorCoverageMixin
+from ._detector_ingestion import DetectorIngestionMixin
 from ._detector_query import DetectorQueryMixin
 
 
@@ -35,7 +36,7 @@ class Anomaly:
     persistence: str | None = None
 
 
-class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysisMixin):
+class AnomalyDetector(DetectorIngestionMixin, DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysisMixin):
     """Detect anomalies in Pingmesh data using statistical methods."""
 
     _anomaly_type = Anomaly
@@ -50,36 +51,31 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
         topology_id: str | None = None,
         loss_pct_threshold: float = 5.0,
         loss_pct_delta: float = 5.0,
+        runtime_start_time: str | None = None,
     ):
+        self.runtime_start_time = runtime_start_time
         self.influxdb_url = influxdb_url
         self.token = token
         self.org = org
         self.bucket = bucket
         self.client_to_leaf: dict[str, str] = {}
-        self.leaf_to_spines: dict[str, list[str]] = {}
         self.loss_pct_threshold = float(loss_pct_threshold)
         self.loss_pct_delta = float(loss_pct_delta)
         self._pingmesh_clients: list[str] = []
-        self._pingmesh_policy: dict = {}
         if topology_metadata is None:
             raise ValueError("Canonical topology_metadata is required for Pingmesh anomaly detection")
         manifest = coerce_topology_manifest(topology_metadata)
         self.topology_id = topology_id or manifest.topology_id
         projected_topology = manifest.to_agent_topology()
         self._pingmesh_clients = [device.name for device in manifest.clients()]
-        self._pingmesh_policy = dict(projected_topology["pingmesh"])
+        self._client_addresses = {device.name: device.data_ip for device in manifest.clients()}
+        self._pingmesh_plan = manifest.require_pingmesh_plan()
+        self._compile_coverage_expectations()
+        self.plan_id = self._pingmesh_plan.settings.plan_id
         self._load_topology_metadata(projected_topology)
 
     def _anomaly_to_dict(self, anomaly: Anomaly) -> dict:
         return asdict(anomaly)
-
-    def _infer_spines_for_cross_rack(self, src_leaf: str, dst_leaf: str) -> list[str]:
-        """Return the set of spines shared between two leafs (for cross-rack paths)."""
-        if not self.leaf_to_spines:
-            return []
-        src_spines = set(self.leaf_to_spines.get(src_leaf, []))
-        dst_spines = set(self.leaf_to_spines.get(dst_leaf, []))
-        return sorted(src_spines & dst_spines) if (src_spines and dst_spines) else sorted(src_spines | dst_spines)
 
     @staticmethod
     def _anomaly_family(anomaly: Anomaly) -> str:
@@ -90,8 +86,7 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
     def _aggregate_anomalies(self, anomalies: list[Anomaly]) -> dict:
         by_src_leaf: dict[str, dict[str, int]] = {}
         by_dst_leaf: dict[str, dict[str, int]] = {}
-        by_spine: dict[str, dict[str, int]] = {}
-        keys = ("drop_count", "latency_spikes", "jitter_spikes", "path_unreachable", "mtu_suspects")
+        keys = ("drop_count", "latency_spikes", "path_unreachable", "mtu_suspects")
         for anomaly in anomalies:
             src_leaf = self._resolve_leaf(anomaly.src_leaf, anomaly.src_name)
             dst_leaf = self._resolve_leaf(anomaly.dst_leaf, anomaly.dst_name)
@@ -101,9 +96,6 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
                 key = "path_unreachable" if anomaly.type == "path_unreachable" else "drop_count"
                 by_src_leaf[src_leaf][key] += 1
                 by_dst_leaf[dst_leaf][key] += 1
-            elif anomaly.type == "jitter_spike":
-                by_src_leaf[src_leaf]["jitter_spikes"] += 1
-                by_dst_leaf[dst_leaf]["jitter_spikes"] += 1
             elif anomaly.type == "mtu_or_fragmentation_suspect":
                 by_src_leaf[src_leaf]["mtu_suspects"] += 1
                 by_dst_leaf[dst_leaf]["mtu_suspects"] += 1
@@ -111,22 +103,7 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
                 by_src_leaf[src_leaf]["latency_spikes"] += 1
                 by_dst_leaf[dst_leaf]["latency_spikes"] += 1
 
-            # Spine aggregation for cross-rack anomalies
-            if src_leaf != dst_leaf and src_leaf != "unknown" and dst_leaf != "unknown":
-                inferred_spines = self._infer_spines_for_cross_rack(src_leaf, dst_leaf)
-                for spine in inferred_spines:
-                    bucket = by_spine.setdefault(spine, dict.fromkeys(keys, 0))
-                    if anomaly.type in ("packet_loss", "path_unreachable"):
-                        key = "path_unreachable" if anomaly.type == "path_unreachable" else "drop_count"
-                        bucket[key] += 1
-                    elif anomaly.type == "jitter_spike":
-                        bucket["jitter_spikes"] += 1
-                    elif anomaly.type == "mtu_or_fragmentation_suspect":
-                        bucket["mtu_suspects"] += 1
-                    else:
-                        bucket["latency_spikes"] += 1
-
-        return {"by_src_leaf": by_src_leaf, "by_dst_leaf": by_dst_leaf, "by_spine": by_spine}
+        return {"by_src_leaf": by_src_leaf, "by_dst_leaf": by_dst_leaf}
 
     def _build_report(
         self,
@@ -144,11 +121,10 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
         regular_loss = [item for item in anomalies if item.type == "packet_loss"]
         unreachable = [item for item in anomalies if item.type == "path_unreachable"]
         mtu = [item for item in anomalies if item.type == "mtu_or_fragmentation_suspect"]
-        jitter = [item for item in anomalies if item.type == "jitter_spike"]
-
         now_utc = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S") + "Z"
         return {
             "timestamp": now_utc,
+            "plan_id": self.plan_id,
             "windows": {
                 "baseline": {"start": baseline_start, "end": baseline_end},
                 "current": {"start": current_start, "end": current_end},
@@ -156,13 +132,13 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
             "query_status": query_status,
             "coverage": coverage,
             "quality": quality,
+            "ingestion_status": coverage.get("ingestion", {}).get("status", "not_ready"),
             "summary": {
                 "total_anomalies": len(anomalies),
                 "latency_spikes": len(latency),
                 "packet_loss_events": len(regular_loss),
                 "path_unreachable_events": len(unreachable),
                 "mtu_or_fragmentation_events": len(mtu),
-                "jitter_spikes": len(jitter),
             },
             "anomalies": [self._anomaly_to_dict(item) for item in anomalies],
             "returned_anomalies": len(anomalies),
@@ -197,47 +173,23 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
         return selected
 
     def _merge_window_anomalies(self, analyses: list[tuple[str, list[Anomaly]]]) -> list[Anomaly]:
-        merged: dict[tuple[str, str, str], Anomaly] = {}
+        full: dict[tuple[str, str, str], Anomaly] = {}
         seen_windows: dict[tuple[str, str, str], set[str]] = {}
-        statistical_types = {"latency_spike", "jitter_spike"}
-        full_statistical: dict[tuple[str, str, str], Anomaly] = {}
         for window_name, anomalies in analyses:
             if window_name != "full":
                 continue
             for anomaly in anomalies:
-                if anomaly.type in statistical_types:
-                    key = (self._anomaly_family(anomaly), anomaly.src_ip, anomaly.dst_ip)
-                    full_statistical[key] = anomaly
-        severity_rank = {"low": 0, "medium": 1, "high": 2}
-        type_rank = {"packet_loss": 0, "path_unreachable": 1}
+                key = (self._anomaly_family(anomaly), anomaly.src_ip, anomaly.dst_ip)
+                full[key] = anomaly
+                seen_windows.setdefault(key, set()).add("full")
         for window_name, anomalies in analyses:
+            if window_name == "full":
+                continue
             for anomaly in anomalies:
                 key = (self._anomaly_family(anomaly), anomaly.src_ip, anomaly.dst_ip)
-                if anomaly.type in statistical_types:
-                    if key not in full_statistical:
-                        continue
+                if key in full:
                     seen_windows.setdefault(key, set()).add(window_name)
-                    merged.setdefault(key, full_statistical[key])
-                    continue
-                seen_windows.setdefault(key, set()).add(window_name)
-                current = merged.get(key)
-                candidate_rank = (
-                    type_rank.get(anomaly.type, 0),
-                    severity_rank.get(anomaly.severity, 0),
-                    anomaly.value,
-                )
-                current_rank = (
-                    (
-                        type_rank.get(current.type, 0),
-                        severity_rank.get(current.severity, 0),
-                        current.value,
-                    )
-                    if current
-                    else (-1, -1, -1.0)
-                )
-                if current is None or candidate_rank > current_rank:
-                    merged[key] = anomaly
-        for key, anomaly in merged.items():
+        for key, anomaly in full.items():
             windows = sorted(seen_windows[key])
             anomaly.windows_observed = windows
             if "early" in windows and "steady" in windows:
@@ -248,7 +200,7 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
                 anomaly.persistence = "steady_only"
             else:
                 anomaly.persistence = "full_window"
-        return sorted(merged.values(), key=lambda item: (item.type, item.src_ip, item.dst_ip))
+        return sorted(full.values(), key=lambda item: (item.type, item.src_ip, item.dst_ip))
 
     def generate_windowed_anomaly_report(
         self,
@@ -258,31 +210,24 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
         current_start: str,
         current_end: str,
         windows: list[dict],
+        include_internal_health: bool = False,
+        evidence_pairs: list[dict] | None = None,
+        deadline: float | None = None,
     ) -> dict:
-        baseline = self._query_snapshot(baseline_start, baseline_end)
-        current = self._query_snapshot(current_start, current_end)
+        budget = {"deadline": deadline} if deadline is not None else {}
+        if (baseline_start, baseline_end) == (current_start, current_end):
+            # A newly captured healthy window needs one fresh read. Absolute
+            # health below is still checked; a zero relative delta is no proof.
+            baseline, baseline_coverage = self._query_covered_snapshot(baseline_start, baseline_end, **budget)
+            current, current_coverage = baseline, dict(baseline_coverage)
+        else:
+            # Both reads remain fresh; HTTP concurrency is process-wide bounded.
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                baseline_future = executor.submit(self._query_covered_snapshot, baseline_start, baseline_end, **budget)
+                current_future = executor.submit(self._query_covered_snapshot, current_start, current_end, **budget)
+                baseline, baseline_coverage = baseline_future.result()
+                current, current_coverage = current_future.result()
         query_status = self._error_status(baseline, current)
-        if query_status["ok"]:
-            initial_coverage = self.summarize_coverage(current.rows)
-            expected_seconds = int(initial_coverage.get("expected_epoch_cycles", 0)) * int(
-                self._pingmesh_policy.get("cycle_interval_seconds", 1)
-            )
-            actual_seconds = max(
-                0.0,
-                (
-                    datetime.fromisoformat(current_end.replace("Z", "+00:00"))
-                    - datetime.fromisoformat(current_start.replace("Z", "+00:00"))
-                ).total_seconds(),
-            )
-            for _attempt in range(2):
-                coverage = self.summarize_coverage(current.rows)
-                if actual_seconds < expected_seconds or coverage.get("coverage_status") == "complete":
-                    break
-                time.sleep(max(1, int(self._pingmesh_policy.get("cycle_interval_seconds", 1))))
-                current = self._query_snapshot(current_start, current_end)
-                query_status = self._error_status(baseline, current)
-                if not query_status["ok"]:
-                    break
         if not query_status["ok"]:
             return self._build_report(
                 anomalies=[],
@@ -291,7 +236,7 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
                 current_start=current_start,
                 current_end=current_end,
                 query_status=query_status,
-                coverage={"status": "error", "coverage_status": "error", "error": query_status["error"]},
+                coverage={**current_coverage, "status": "error", "error": query_status["error"]},
                 quality={},
             )
 
@@ -300,15 +245,37 @@ class AnomalyDetector(DetectorQueryMixin, DetectorCoverageMixin, DetectorAnalysi
         for window in windows:
             name = str(window.get("name") or "window")
             rows = self._slice_rows(current.rows, str(window["start_time"]), str(window["end_time"]))
-            window_analyses.append((name, self.analyze_snapshot_rows(baseline.rows, rows).anomalies))
+            # A healthy steady window usually contains the entire snapshot.
+            # Check the actual slice, so invalid timestamps and boundary rows
+            # retain their filtering semantics even when the bounds match.
+            analysis = (
+                full_analysis if len(rows) == len(current.rows) else self.analyze_snapshot_rows(baseline.rows, rows)
+            )
+            window_analyses.append((name, analysis.anomalies))
         anomalies = self._merge_window_anomalies(window_analyses)
-        return self._build_report(
+        report = self._build_report(
             anomalies=anomalies,
             baseline_start=baseline_start,
             baseline_end=baseline_end,
             current_start=current_start,
             current_end=current_end,
             query_status=query_status,
-            coverage=self.summarize_coverage(current.rows),
+            coverage=current_coverage,
             quality=full_analysis.quality,
         )
+        absolute_health = {
+            name: int(report["quality"].pop(name, 0) or 0)
+            for name in (
+                "absolute_unreachable_paths",
+                "absolute_packet_loss_paths",
+                "absolute_network_mtu_paths",
+            )
+        }
+        if include_internal_health:
+            report["_baseline_health"] = absolute_health
+            report["_baseline_coverage"] = baseline_coverage
+        if evidence_pairs:
+            from ._detector_analysis import probe_pair_evidence
+
+            report["_probe_evidence"] = probe_pair_evidence(baseline.rows, current.rows, evidence_pairs)
+        return report

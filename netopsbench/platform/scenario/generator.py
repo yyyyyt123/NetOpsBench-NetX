@@ -2,20 +2,28 @@
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import random
-import re
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from netopsbench.models.topology import DeviceRole, TopologyManifest
-from netopsbench.platform.topology.configdb_payload import interface_names_for_config
+from netopsbench.models.profiles import ScaleRegistry, default_scale_registry
+from netopsbench.models.scenario import ScenarioSpec
+from netopsbench.models.topology import TopologyManifest
+from netopsbench.platform.topology.configdb_payload import (
+    interface_names_from_payload,
+    interface_networks_from_payload,
+    load_configdb_payload,
+)
 from netopsbench.platform.topology.topology_utils import load_topology_manifest
+from netopsbench.platform.utils.frr import parse_bgp_config
+
+from .candidates import CandidatePaths
 
 
 def default_campaign_spec() -> Path:
@@ -27,49 +35,12 @@ def default_campaign_spec() -> Path:
 
 @dataclass
 class TopologyContext:
-    topology_dir: Path
     manifest: TopologyManifest
-    device_interfaces: dict[str, list[str]]
-    leaf_interface_roles: dict[str, dict[str, list[str]]]
-    client_interfaces: dict[str, list[str]]
-    device_asns: dict[str, int] = field(default_factory=dict)
-    bgp_neighbors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    bgp_networks: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    bgp_neighbors: dict[str, list[dict[str, Any]]]
 
     @property
     def scale(self) -> str:
         return self.manifest.scale
-
-    @property
-    def metadata(self) -> dict[str, Any]:
-        return self.manifest.to_agent_topology()
-
-    def _device_names(self, role: DeviceRole) -> list[str]:
-        return [device.name for device in self.manifest.devices_by_role(role)]
-
-    @property
-    def spines(self) -> list[str]:
-        return self._device_names(DeviceRole.SPINE)
-
-    @property
-    def leafs(self) -> list[str]:
-        return self._device_names(DeviceRole.LEAF)
-
-    @property
-    def cores(self) -> list[str]:
-        return self._device_names(DeviceRole.CORE)
-
-    @property
-    def aggs(self) -> list[str]:
-        return self._device_names(DeviceRole.AGG)
-
-    @property
-    def edges(self) -> list[str]:
-        return self._device_names(DeviceRole.EDGE)
-
-    @property
-    def clients(self) -> list[dict[str, Any]]:
-        return self.metadata["devices"]["clients"]
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -88,660 +59,374 @@ def load_topology(scale: str, topology_dir: str | None) -> TopologyContext:
         raise FileNotFoundError(f"Topology metadata not found: {metadata_path}")
 
     manifest = load_topology_manifest(metadata_path)
-    device_interfaces, leaf_interface_roles, client_interfaces = _interface_facts_from_manifest(manifest)
-    device_asns: dict[str, int] = {}
     bgp_neighbors: dict[str, list[dict[str, Any]]] = {}
-    bgp_networks: dict[str, list[dict[str, Any]]] = {}
 
     config_dir = topo_dir / "configs"
     switch_devices = [device.name for device in manifest.switches()]
     for device in switch_devices:
-        cfg = _device_config_path(config_dir, device)
+        cfg = config_dir / "sonic" / device / "config_db.json"
         frr_cfg = config_dir / "frr" / f"{device}.conf"
         if not cfg.is_file():
             raise FileNotFoundError(f"SONiC ConfigDB artifact not found: {cfg}")
         if not frr_cfg.is_file():
             raise FileNotFoundError(f"FRR artifact not found: {frr_cfg}")
-        parsed_interfaces = parse_network_interfaces(cfg)
-        if not parsed_interfaces:
+        configdb = load_configdb_payload(cfg)
+        if not interface_names_from_payload(configdb):
             raise ValueError(f"SONiC ConfigDB has no interfaces: {cfg}")
-        device_interfaces[device] = parsed_interfaces
-        bgp_info = parse_bgp_config(frr_cfg)
+        bgp_info = parse_bgp_config(frr_cfg.read_text())
         if bgp_info.get("local_as") is None:
             raise ValueError(f"FRR artifact has no BGP router stanza: {frr_cfg}")
-        device_asns[device] = int(bgp_info["local_as"])
-        bgp_neighbors[device] = list(bgp_info.get("neighbors") or [])
-        bgp_networks[device] = list(bgp_info.get("networks") or [])
-
-    return TopologyContext(
-        topology_dir=topo_dir,
-        manifest=manifest,
-        device_interfaces=device_interfaces,
-        leaf_interface_roles=leaf_interface_roles,
-        client_interfaces=client_interfaces,
-        device_asns=device_asns,
-        bgp_neighbors=bgp_neighbors,
-        bgp_networks=bgp_networks,
-    )
-
-
-def _device_config_path(config_dir: Path, device: str) -> Path:
-    return config_dir / "sonic" / device / "config_db.json"
-
-
-def parse_network_interfaces(cfg_path: Path) -> list[str]:
-    return interface_names_for_config(cfg_path)
-
-
-def parse_bgp_config(cfg_path: Path) -> dict[str, Any]:
-    """Parse local ASN, neighbors, and advertised networks from one FRR config."""
-    info: dict[str, Any] = {"local_as": None, "neighbors": [], "networks": []}
-    if not cfg_path.exists():
-        return info
-
-    local_as_re = re.compile(r"^router bgp (\d+)$")
-    neighbor_re = re.compile(r"^neighbor (\S+) remote-as (\d+)$")
-    neighbor_rm_re = re.compile(r"^neighbor (\S+) route-map (\S+) (in|out)$")
-    network_re = re.compile(r"^network (\S+)(?: route-map (\S+))?$")
-
-    neighbors: dict[str, dict[str, Any]] = {}
-    networks: list[dict[str, Any]] = []
-    seen_networks = set()
-
-    with cfg_path.open("r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            match = local_as_re.match(line)
-            if match:
-                info["local_as"] = int(match.group(1))
+        neighbors = list(bgp_info.get("neighbors") or [])
+        interface_networks = interface_networks_from_payload(configdb)
+        for neighbor in neighbors:
+            try:
+                peer_ip = ipaddress.ip_address(str(neighbor["peer_ip"]))
+            except (KeyError, ValueError):
                 continue
-
-            match = neighbor_re.match(line)
-            if match:
-                peer_ip = match.group(1)
-                peer = neighbors.setdefault(
-                    peer_ip,
-                    {"peer_ip": peer_ip, "remote_as": None, "route_maps": []},
-                )
-                peer["remote_as"] = int(match.group(2))
+            interface = next(
+                (
+                    name
+                    for name, network in interface_networks.items()
+                    if peer_ip in ipaddress.ip_network(network, strict=False)
+                ),
+                None,
+            )
+            if interface is None:
                 continue
+            neighbor["interface"] = interface
+        bgp_neighbors[device] = neighbors
 
-            match = neighbor_rm_re.match(line)
-            if match:
-                peer_ip, route_map, direction = match.groups()
-                peer = neighbors.setdefault(
-                    peer_ip,
-                    {"peer_ip": peer_ip, "remote_as": None, "route_maps": []},
-                )
-                attachment = {"name": route_map, "direction": direction}
-                if attachment not in peer["route_maps"]:
-                    peer["route_maps"].append(attachment)
-                continue
-
-            match = network_re.match(line)
-            if match:
-                prefix, route_map = match.groups()
-                identity = (prefix, route_map or "")
-                if identity in seen_networks:
-                    continue
-                seen_networks.add(identity)
-                networks.append({"prefix": prefix, "route_map": route_map})
-
-    info["neighbors"] = sorted(neighbors.values(), key=lambda item: item["peer_ip"])
-    info["networks"] = sorted(networks, key=lambda item: item["prefix"])
-    return info
-
-
-def _interface_facts_from_manifest(
-    manifest: TopologyManifest,
-) -> tuple[dict[str, list[str]], dict[str, dict[str, list[str]]], dict[str, list[str]]]:
-    """Derive interface ownership and fabric direction from canonical links."""
-    devices = {device.name: device for device in manifest.devices}
-    switch_interfaces: dict[str, set[str]] = {}
-    client_interfaces: dict[str, set[str]] = {}
-    interface_roles: dict[str, dict[str, set[str]]] = {}
-
-    def add_role(device: str, interface: str, role: str) -> None:
-        normalized = normalize_sonic_interface(interface)
-        if normalized is None:
-            return
-        roles = interface_roles.setdefault(device, {"uplink": set(), "downlink": set(), "any": set()})
-        roles[role].add(normalized)
-        roles["any"].add(normalized)
-
-    uplink_peers = {
-        DeviceRole.LEAF: {DeviceRole.SPINE},
-        DeviceRole.EDGE: {DeviceRole.AGG},
-        DeviceRole.AGG: {DeviceRole.CORE},
-    }
-    downlink_peers = {
-        DeviceRole.LEAF: {DeviceRole.CLIENT},
-        DeviceRole.EDGE: {DeviceRole.CLIENT},
-        DeviceRole.AGG: {DeviceRole.EDGE},
-    }
-    for link in manifest.links:
-        left, right = link.endpoints
-        for endpoint, peer in ((left, right), (right, left)):
-            device = devices[endpoint.device]
-            peer_role = devices[peer.device].role
-            if device.role is DeviceRole.CLIENT:
-                client_interfaces.setdefault(device.name, set()).add(endpoint.interface)
-                continue
-            normalized = normalize_sonic_interface(endpoint.interface)
-            if normalized is not None:
-                switch_interfaces.setdefault(device.name, set()).add(normalized)
-            if peer_role in uplink_peers.get(device.role, set()):
-                add_role(device.name, endpoint.interface, "uplink")
-            elif peer_role in downlink_peers.get(device.role, set()):
-                add_role(device.name, endpoint.interface, "downlink")
-
-    return (
-        {name: sorted(interfaces) for name, interfaces in switch_interfaces.items()},
-        {
-            name: {role: sorted(interfaces) for role, interfaces in roles.items()}
-            for name, roles in interface_roles.items()
-        },
-        {name: sorted(interfaces) for name, interfaces in client_interfaces.items()},
-    )
-
-
-def normalize_sonic_interface(name: str | None) -> str | None:
-    """Normalize interface names to SONiC EthernetX when possible."""
-    if not name:
-        return name
-    raw = name.strip()
-    lower = raw.lower()
-    if lower.startswith("ethernet") and raw[8:].isdigit():
-        return f"Ethernet{int(raw[8:])}"
-    if lower.startswith("eth") and raw[3:].isdigit():
-        idx = int(raw[3:])
-        if idx >= 1:
-            return f"Ethernet{(idx - 1) * 4}"
-    if lower.startswith("e1-") and raw[3:].isdigit():
-        idx = int(raw[3:])
-        if idx >= 1:
-            return f"Ethernet{(idx - 1) * 4}"
-    if "ethernet-1/" in lower:
-        try:
-            idx = int(raw.split("/")[-1])
-            if idx >= 1:
-                return f"Ethernet{(idx - 1) * 4}"
-        except ValueError:
-            return raw
-    return raw
-
-
-def count_for_scale(item: dict[str, Any], scale: str, default_count: int) -> int:
-    cps = item.get("count_per_scale", {})
-    if isinstance(cps, dict) and scale in cps:
-        return int(cps[scale])
-    return int(item.get("count", default_count))
-
-
-def pick_device(role: str, topo: TopologyContext, rng: random.Random) -> str:
-    if role == "spine":
-        return rng.choice(topo.cores if topo.cores else topo.spines)
-    if role == "core":
-        return rng.choice(topo.cores if topo.cores else topo.spines)
-    if role == "leaf":
-        return rng.choice(topo.edges if topo.edges else topo.leafs)
-    if role == "edge":
-        return rng.choice(topo.edges if topo.edges else topo.leafs)
-    if role == "agg":
-        if not topo.aggs:
-            raise ValueError("device_role 'agg' requires a fat-tree topology")
-        return rng.choice(topo.aggs)
-    if role == "client":
-        return rng.choice([c["name"] for c in topo.clients])
-    raise ValueError(f"Unknown role: {role}")
-
-
-def pick_network_interface(device: str, topo: TopologyContext, rng: random.Random) -> str:
-    candidates = topo.device_interfaces.get(device) or ["Ethernet0"]
-    normalized = [normalize_sonic_interface(c) for c in candidates if normalize_sonic_interface(c)]
-    return rng.choice(normalized) if normalized else "Ethernet0"
-
-
-def pick_bgp_neighbor(device: str, topo: TopologyContext, rng: random.Random) -> dict[str, Any]:
-    candidates = topo.bgp_neighbors.get(device) or []
-    if not candidates:
-        raise ValueError(f"Device {device} has no parsed BGP neighbors")
-    return dict(rng.choice(candidates))
-
-
-def pick_advertised_network(device: str, topo: TopologyContext, rng: random.Random) -> dict[str, Any]:
-    candidates = topo.bgp_networks.get(device) or []
-    if not candidates:
-        raise ValueError(f"Device {device} has no parsed BGP networks")
-    return dict(rng.choice(candidates))
-
-
-def _client_leaf(client: dict[str, Any]) -> str:
-    return str(client.get("leaf") or client.get("edge") or "").strip()
-
-
-def _pick_client_for_route_fault(
-    topo: TopologyContext,
-    rng: random.Random,
-    excluded_leaf: str | None = None,
-) -> dict[str, Any]:
-    # Prefer remote leaf destinations to avoid selecting a local directly-connected subnet
-    # on the same leaf where the route fault is injected.
-    candidates = list(topo.clients)
-    if excluded_leaf:
-        remote = [c for c in candidates if _client_leaf(c) != excluded_leaf]
-        if remote:
-            candidates = remote
-    return rng.choice(candidates)
-
-
-def _client_subnet(client: dict[str, Any], prefix_len: int = 30) -> str:
-    ip_str = str(client.get("data_ip") or "").strip()
-    if not ip_str:
-        raise ValueError(f"Client {client.get('name', 'unknown')} missing data_ip in topology metadata")
-    ip_obj = ipaddress.ip_address(ip_str)
-    net = ipaddress.ip_network(f"{ip_obj}/{prefix_len}", strict=False)
-    return str(net)
-
-
-def _client_host_route(client: dict[str, Any]) -> str:
-    ip_str = str(client.get("data_ip") or "").strip()
-    if not ip_str:
-        raise ValueError(f"Client {client.get('name', 'unknown')} missing data_ip in topology metadata")
-    return f"{ip_str}/32"
-
-
-def pick_link_down_interface(device: str, topo: TopologyContext, rng: random.Random) -> str:
-    candidates = topo.device_interfaces.get(device) or ["Ethernet0"]
-    candidates = [normalize_sonic_interface(c) for c in candidates if normalize_sonic_interface(c)]
-    if not candidates:
-        candidates = ["Ethernet0"]
-    if device.startswith(("leaf", "edge")):
-        roles = topo.leaf_interface_roles.get(device)
-        if roles and roles.get("downlink"):
-            return rng.choice(roles["downlink"])
-    # On leafs, prefer client-facing links to create visible impact.
-    if device.startswith("leaf"):
-        num_spines = int(topo.metadata.get("scale", {}).get("num_spines", 0) or 0)
-        client_facing = []
-        for iface in candidates:
-            if iface.startswith("Ethernet") and iface[8:].isdigit():
-                port_idx = int(iface[8:])
-                if port_idx % 4 != 0:
-                    continue
-                eth_idx = (port_idx // 4) + 1
-                if num_spines and eth_idx > num_spines:
-                    client_facing.append(iface)
-        if client_facing:
-            return rng.choice(client_facing)
-    return rng.choice(candidates)
-
-
-def pick_leaf_interface(device: str, topo: TopologyContext, rng: random.Random, role: str) -> str:
-    roles = topo.leaf_interface_roles.get(device) or {}
-    role = (role or "any").lower()
-    pool = roles.get(role) or roles.get("any")
-    if pool:
-        return rng.choice(pool)
-    return pick_network_interface(device, topo, rng)
-
-
-def is_role_aware_switch(device: str) -> bool:
-    return device.startswith(("leaf", "edge", "agg"))
-
-
-def pick_client_interface(device: str, topo: TopologyContext, rng: random.Random) -> str:
-    candidates = topo.client_interfaces.get(device)
-    if candidates:
-        return rng.choice(candidates)
-    return "eth1"
+    return TopologyContext(manifest=manifest, bgp_neighbors=bgp_neighbors)
 
 
 @dataclass
-class FaultBuildTarget:
+class _Placement:
     device: str
-    interface: str | None = None
-    prefix: str | None = None
-    mtu: int | None = None
-    metadata: dict[str, Any] = field(default_factory=dict)
+    interface: str | None
+    peer: str | None
+    prefix: str
+    parameters: dict[str, Any]
+    witnesses: list[dict[str, str]]
+    controls: list[dict[str, str]]
 
 
-def _generic_fault_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    return FaultBuildTarget(device=pick_device(template.get("device_role", "leaf"), topo, rng))
+class _CandidateIndex(CandidatePaths):
+    """Shortest-path DAG membership, without enumerating complete paths."""
+
+    def __init__(self, topo: TopologyContext, seed: int):
+        from collections import Counter
+
+        super().__init__(topo.manifest)
+        self.topo = topo
+        random.Random(seed).shuffle(self.pairs)
+        self.device_uses, self.pod_uses, self.link_uses = Counter(), Counter(), Counter()
+        self.seed = seed
+
+    def _roots(self, unit):
+        candidates = [d for d in self.topo.manifest.switches() if d.role.value == unit.role]
+
+        # Prefer unused pods, devices and low/middle/high number ranges. High
+        # numbered nodes are eligible from the first cycle, including K18 >155.
+        def key(d):
+            pod = d.metadata.get("pod")
+            rank = next(i for i, item in enumerate(candidates) if item.name == d.name)
+            bucket = min(2, rank * 3 // max(1, len(candidates)))
+            return (
+                self.pod_uses[unit.role, pod] if pod is not None else 0,
+                self.device_uses[d.name],
+                self.pod_uses[unit.role, "bucket", bucket],
+                _stable_template_seed(self.seed, self.topo.scale, unit.id + d.name),
+            )
+
+        return sorted(candidates, key=key)
+
+    def place(self, unit):
+        fault = unit.fault_type
+        for device in self._roots(unit):
+            root = device.name
+            peers = [None]
+            if unit.position:
+                peer_role = unit.position.split("-")[-1]
+                peers = [
+                    peer for (node, peer) in self.ports if node == root and self.devices[peer].role.value == peer_role
+                ]
+                peers.sort(
+                    key=lambda peer: (
+                        self.link_uses[frozenset((root, peer))],
+                        _stable_template_seed(self.seed, self.topo.scale, unit.id + peer),
+                    )
+                )
+            for peer in peers:
+                found = []
+                parameters = {}
+                for src, dst in self.pairs:
+                    source, target = self.clients[src], self.clients[dst]
+                    reverse = fault in {"routing_loop", "route_flapping"} or unit.mechanism == "export_filter"
+                    member = self.contains(src, dst, root, peer) if not reverse else self.contains(src, dst, peer, root)
+                    if not member:
+                        continue
+                    if fault == "route_origination_misconfig" or unit.scope == "destination":
+                        if target.attached_switch != root:
+                            continue
+                    if unit.scope == "source" or fault == "static_route_misconfig":
+                        if source.attached_switch != root or target.attached_switch == root:
+                            continue
+                    if fault in {"ecmp_misconfig", "route_filter_misconfig"} and not reverse:
+                        hops = [
+                            neighbor
+                            for neighbor in self.adj[root]
+                            if self.distance(target.attached_switch)[neighbor] + 1
+                            == self.distance(target.attached_switch)[root]
+                        ]
+                        if not hops:
+                            continue
+                        if fault == "ecmp_misconfig" or unit.scope in {"reduced", "reduced_remote_pod"}:
+                            if len(hops) < 2:
+                                continue
+                        if unit.role == "agg" and (fault == "ecmp_misconfig" or unit.scope == "reduced_remote_pod"):
+                            if device.metadata.get("pod") == self.devices[target.attached_switch].metadata.get("pod"):
+                                continue
+                    else:
+                        hops = []
+                    prefix = str(ipaddress.ip_network(f"{target.data_ip}/30", strict=False))
+                    parameters = {"mechanism": unit.mechanism} if unit.mechanism else {}
+                    if (
+                        fault.startswith("bgp_")
+                        and fault != "bgp_process_down"
+                        or fault == "route_flapping"
+                        or unit.mechanism == "export_filter"
+                    ):
+                        parameters["peer_ip"] = self._peer_ip(root, peer)
+                    if unit.mechanism == "import_filter":
+                        chosen = self.adj[root] if unit.scope == "missing" else hops[:1]
+                        parameters["peer_ips"] = [self._peer_ip(root, neighbor) for neighbor in chosen]
+                    if fault == "static_route_misconfig":
+                        local = [c for c in self.clients.values() if c.attached_switch == root and c.name != src]
+                        if not local:
+                            continue
+                        parameters.update(target_ip=f"{target.data_ip}/32", wrong_nexthop=local[0].data_ip)
+                        prefix = f"{target.data_ip}/32"
+                    if fault == "blackhole_route":
+                        prefix = f"{target.data_ip}/32"
+                    if fault == "routing_loop":
+                        parameters["next_hop"] = self._peer_ip(root, peer)
+                        prefix = f"{target.data_ip}/32"
+                    if fault.startswith("acl_"):
+                        parameters["direction"] = "out"
+                        if fault == "acl_source_misconfig":
+                            parameters["source_prefix"] = f"{source.data_ip}/32"
+                        if fault == "acl_l4_port_misconfig":
+                            parameters["destination_port"] = 33434
+                    parameters.update(
+                        {
+                            "packet_loss": {"loss_pct": 30},
+                            "packet_corruption": {"corruption_pct": 20},
+                            "high_latency": {"latency_ms": 120},
+                            "mtu_mismatch": {"mtu": 1400},
+                        }.get(fault, {})
+                    )
+                    found.append({"src": src, "dst": dst})
+                    break
+                if not found:
+                    continue
+                affected = found[0]
+                found = self.affected_pairs(fault, root, peer, affected, reverse=reverse)
+                # Choose controls from the same immutable plan, based on the
+                # scope of this configuration rather than synthetic extra traffic.
+                controls = []
+                for src, dst in self.pairs:
+                    if {"src": src, "dst": dst} == affected:
+                        continue
+                    if fault == "acl_source_misconfig":
+                        eligible = affected["src"] not in {src, dst} and self.contains(src, dst, root, peer)
+                    elif fault == "acl_destination_misconfig":
+                        eligible = dst != affected["dst"] and src != affected["dst"]
+                    elif fault in {
+                        "route_origination_misconfig",
+                        "route_filter_misconfig",
+                        "routing_loop",
+                        "blackhole_route",
+                        "static_route_misconfig",
+                        "route_flapping",
+                    }:
+                        eligible = dst != affected["dst"] and src != affected["dst"]
+                    elif fault in {"device_down", "bgp_process_down", "ecmp_misconfig"}:
+                        eligible = not self.contains(src, dst, root)
+                    else:
+                        eligible = not self.contains(src, dst, root, peer)
+                        if peer and peer not in self.clients:
+                            eligible = eligible and not self.contains(src, dst, peer, root)
+                        if peer in self.clients:
+                            eligible = eligible and peer not in {src, dst}
+                    if eligible:
+                        controls.append({"src": src, "dst": dst})
+                        break
+                if not controls:
+                    if self.topo.manifest.purpose != "validation":
+                        continue
+                    # XS has only two directed flows; the reverse is a comparison,
+                    # not proof of an unaffected path. XS is validation only.
+                    controls = [{"src": affected["dst"], "dst": affected["src"]}]
+                self.device_uses[root] += 1
+                self.pod_uses[unit.role, device.metadata.get("pod")] += 1
+                candidates = [d for d in self.topo.manifest.switches() if d.role.value == unit.role]
+                rank = next(i for i, d in enumerate(candidates) if d.name == root)
+                self.pod_uses[unit.role, "bucket", min(2, rank * 3 // len(candidates))] += 1
+                if peer:
+                    self.link_uses[frozenset((root, peer))] += 1
+                return _Placement(root, self.ports.get((root, peer)), peer, prefix, parameters, found, controls)
+        raise ValueError(f"No planned candidate for necessary coverage unit {unit.id} in {self.topo.scale}")
+
+    def _peer_ip(self, root, peer):
+        interface = self.ports.get((root, peer))
+        neighbors = self.topo.bgp_neighbors.get(root, [])
+        match = next((n for n in neighbors if n.get("interface") == interface), None)
+        if not match:
+            raise ValueError(f"No configured neighbor for {root}->{peer}")
+        return match["peer_ip"]
 
 
-def _link_down_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    target.interface = pick_link_down_interface(target.device, topo, rng)
-    return target
+def _stable_template_seed(seed: int, scale: str, template_name: str) -> int:
+    return int.from_bytes(hashlib.sha256(f"{seed}\0{scale}\0{template_name}".encode()).digest()[:8], "big")
 
 
-def _role_interface_target(
+def generate(
+    spec: dict[str, Any],
     topo: TopologyContext,
-    rng: random.Random,
-    template: dict[str, Any],
-) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    role = template.get("interface_role") or "uplink"
-    target.interface = (
-        pick_leaf_interface(target.device, topo, rng, role)
-        if is_role_aware_switch(target.device)
-        else pick_network_interface(target.device, topo, rng)
-    )
-    return target
+    out_dir: Path,
+    seed: int,
+    *,
+    scale_registry: ScaleRegistry | None = None,
+) -> list[Path]:
+    import json
 
+    from netopsbench.platform.faults.catalog import FAULT_CATALOG_VERSION, coverage_units
 
-def _packet_fault_target(
-    topo: TopologyContext,
-    rng: random.Random,
-    template: dict[str, Any],
-) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    if target.device.startswith("client"):
-        target.interface = pick_client_interface(target.device, topo, rng)
-    elif is_role_aware_switch(target.device):
-        target.interface = pick_leaf_interface(
-            target.device,
-            topo,
-            rng,
-            template.get("interface_role") or "uplink",
-        )
-    else:
-        target.interface = pick_network_interface(target.device, topo, rng)
-    return target
-
-
-def _blackhole_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    client = _pick_client_for_route_fault(topo, rng, excluded_leaf=target.device)
-    target.prefix = _client_subnet(client, prefix_len=30)
-    return target
-
-
-def _static_route_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    device = pick_device("leaf", topo, rng)
-    client = _pick_client_for_route_fault(topo, rng, excluded_leaf=device)
-    return FaultBuildTarget(
-        device=device,
-        metadata={"target_ip": _client_host_route(client), "wrong_nexthop": "auto"},
-    )
-
-
-def _bgp_neighbor_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    neighbor = pick_bgp_neighbor(target.device, topo, rng)
-    target.metadata = {
-        "peer_ip": neighbor["peer_ip"],
-        "misconfig_kind": template.get("misconfig_kind", "peer_as_mismatch"),
-    }
-    if neighbor.get("remote_as") is not None:
-        target.metadata["original_remote_as"] = int(neighbor["remote_as"])
-    return target
-
-
-def _route_policy_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    network = pick_advertised_network(target.device, topo, rng)
-    target.prefix = network["prefix"]
-    target.metadata = {"misconfig_kind": template.get("misconfig_kind", "network_statement_missing")}
-    if network.get("route_map"):
-        target.metadata["route_map"] = network["route_map"]
-    return target
-
-
-def _acl_target(topo: TopologyContext, rng: random.Random, template: dict[str, Any]) -> FaultBuildTarget:
-    target = _generic_fault_target(topo, rng, template)
-    target.prefix = pick_advertised_network(target.device, topo, rng)["prefix"]
-    target.interface = (
-        pick_leaf_interface(target.device, topo, rng, "uplink")
-        if is_role_aware_switch(target.device)
-        else pick_network_interface(target.device, topo, rng)
-    )
-    target.metadata = {"direction": template.get("direction", "in")}
-    return target
-
-
-FaultScenarioBuilder = Callable[[TopologyContext, random.Random, dict[str, Any]], FaultBuildTarget]
-
-FAULT_SCENARIO_BUILDERS: dict[str, FaultScenarioBuilder] = {
-    "device_down": _generic_fault_target,
-    "link_down": _link_down_target,
-    "link_flapping": _role_interface_target,
-    "mtu_mismatch": _role_interface_target,
-    "high_latency": _role_interface_target,
-    "packet_loss": _packet_fault_target,
-    "packet_corruption": _packet_fault_target,
-    "blackhole_route": _blackhole_target,
-    "static_route_misconfig": _static_route_target,
-    "bgp_neighbor_misconfig": _bgp_neighbor_target,
-    "route_policy_misconfig": _route_policy_target,
-    "acl_misconfig": _acl_target,
-}
-
-
-def diagnostic_observation_duration(base_duration: int, manifest: TopologyManifest) -> int:
-    """Return one complete canonical Pingmesh epoch for a diagnostic window."""
-    coverage_seconds = manifest.pingmesh.coverage_epoch_seconds(manifest.facts.total_clients)
-    return max(base_duration, coverage_seconds)
-
-
-def _validate_traffic_profiles(spec: dict[str, Any]) -> None:
-    configured = [spec.get("defaults", {}).get("traffic_profile")]
-    configured.extend(template.get("traffic_profile") for template in spec.get("fault_templates", []))
-    invalid = next((profile for profile in configured if profile not in (None, "standard")), None)
-    if invalid is not None:
-        raise ValueError(f"Only the standard traffic profile is supported, got: {invalid}")
-
-
-def build_fault_instance(
-    fault_type: str,
-    difficulty: str,
-    topo: TopologyContext,
-    rng: random.Random,
-    defaults: dict[str, Any],
-    template: dict[str, Any],
-    idx: int,
-) -> dict[str, Any]:
-    # Negative sample: healthy network, no fault injected.
-    if fault_type == "none":
-        baseline_duration = diagnostic_observation_duration(
-            int(defaults.get("baseline_duration_seconds", 20)),
-            topo.manifest,
-        )
-        recovery_duration = int(defaults.get("recovery_duration_seconds", 20))
-        baseline_stabilization = int(defaults.get("baseline_stabilization_seconds", 5))
-        scenario_id = f"generated_healthy_network_{topo.scale}_{idx:03d}"
-        return {
+    if spec.get("fault_catalog_version") != FAULT_CATALOG_VERSION:
+        raise ValueError("Obsolete campaign spec; use fault catalog version 2 and regenerate")
+    defaults = spec.get("defaults", {})
+    if "fault_duration_seconds" in defaults:
+        raise ValueError("Configure experiment.observation_seconds in scale profiles and regenerate scenarios")
+    policy = (scale_registry or default_scale_registry()).get(topo.scale).experiment
+    duration = policy.window_seconds(topo.manifest.require_pingmesh_plan().settings.complete_window_seconds)
+    if defaults.get("traffic_profile", "standard") != "standard":
+        raise ValueError("Only standard traffic is supported")
+    validation = topo.manifest.purpose == "validation"
+    units = coverage_units(topo.manifest.family, validation=validation)
+    index = _CandidateIndex(topo, seed)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rows, paths = [], []
+    fault_indices = {}
+    for unit in units:
+        placement = index.place(unit)
+        placement.parameters.update(affected_candidates=placement.witnesses, control_candidates=placement.controls)
+        if unit.scope:
+            placement.parameters["impact_scope"] = unit.scope
+        if unit.fault_type in {"link_flapping", "route_flapping"}:
+            placement.parameters.update(down_time=policy.flapping_down_seconds, up_time=policy.flapping_up_seconds)
+        fault_indices[unit.fault_type] = fault_indices.get(unit.fault_type, 0) + 1
+        scenario_id = f"generated_{unit.fault_type}_{topo.scale}_{fault_indices[unit.fault_type]:03d}"
+        episode = {
+            "episode_id": "diagnosis",
+            "fault_type": unit.fault_type,
+            "target_device": placement.device,
+            "duration_seconds": duration,
+            "stabilization_time": 0,
+            "parameters": placement.parameters,
+        }
+        if placement.interface:
+            episode["target_interface"] = placement.interface
+        if unit.fault_type in {
+            "routing_loop",
+            "route_origination_misconfig",
+            "route_filter_misconfig",
+            "route_flapping",
+            "ecmp_misconfig",
+            "blackhole_route",
+            "static_route_misconfig",
+            "acl_source_misconfig",
+            "acl_destination_misconfig",
+            "acl_l4_port_misconfig",
+        }:
+            episode["target_prefix"] = placement.prefix
+        payload = {
+            "schema_version": "1",
             "scenario_id": scenario_id,
-            "name": f"Generated healthy network case #{idx} ({topo.scale})",
-            "description": f"Auto-generated negative sample — no fault injected ({topo.scale} topology).",
+            "name": scenario_id,
             "topology_scale": topo.scale,
             "traffic_profile": "standard",
             "metadata": {
-                "difficulty": difficulty,
-                "negative_sample": True,
-                "generator": {
-                    "seed": defaults.get("seed"),
-                    "topology_dir": str(topo.topology_dir),
-                    "template": template.get("name", "healthy_network"),
-                },
+                "fault_catalog_version": FAULT_CATALOG_VERSION,
+                "difficulty": "medium",
+                "coverage_unit": unit.id,
+                "purpose": "validation" if validation else "benchmark",
+                "experiment": policy.model_dump(mode="json"),
+                "generator": {"seed": seed},
             },
-            "episodes": [
-                {
-                    "episode_id": "ep001_observation_1",
-                    "description": "Observe healthy network — no faults",
-                    "fault_type": "none",
-                    "duration_seconds": baseline_duration,
-                    "stabilization_time": baseline_stabilization,
-                },
-                {
-                    "episode_id": "ep002_observation_2",
-                    "description": "Continue observing healthy network",
-                    "fault_type": "none",
-                    "duration_seconds": baseline_duration,
-                    "stabilization_time": baseline_stabilization,
-                },
-                {
-                    "episode_id": "ep003_observation_3",
-                    "description": "Final healthy network observation",
-                    "fault_type": "none",
-                    "duration_seconds": recovery_duration,
-                    "stabilization_time": baseline_stabilization,
-                },
-            ],
+            "episode": episode,
         }
-
-    # Merge nested ``parameters`` dict into the top-level template so that
-    # campaign-level overrides like ``parameters: {misconfig_kind: ...}``
-    # are visible to ``template.get("misconfig_kind")`` lookups below.
-    if "parameters" in template:
-        template = {**template, **template["parameters"]}
-    try:
-        builder = FAULT_SCENARIO_BUILDERS[fault_type]
-    except KeyError as exc:
-        raise ValueError(f"No scenario builder registered for fault type: {fault_type}") from exc
-    target = builder(topo, rng, template)
-    extra_episode_metadata = dict(target.metadata)
-
-    if template.get("variant"):
-        extra_episode_metadata["variant"] = template["variant"]
-    if template.get("recovery_mode"):
-        extra_episode_metadata["recovery_mode"] = template["recovery_mode"]
-
-    parameter_defaults = {
-        "link_flapping": {"iterations": 6, "down_time": 2, "up_time": 3},
-        "packet_loss": {"loss_pct": 20},
-        "packet_corruption": {"corruption_pct": 20},
-        "high_latency": {"latency_ms": 100},
-    }
-    for key, default in parameter_defaults.get(fault_type, {}).items():
-        extra_episode_metadata[key] = int(template.get(key, default))
-    if fault_type == "mtu_mismatch":
-        target.mtu = int(template.get("mtu", 1400))
-
-    expected_location = {"device": target.device}
-    if target.interface:
-        if target.device.startswith("client"):
-            expected_location["interface"] = target.interface
-        else:
-            expected_location["interface"] = normalize_sonic_interface(target.interface)
-
-    scenario_id = f"generated_{fault_type}_{topo.scale}_{idx:03d}"
-    scenario_name = f"Generated {fault_type} case #{idx} ({topo.scale})"
-
-    baseline_duration = diagnostic_observation_duration(
-        int(defaults.get("baseline_duration_seconds", 20)),
-        topo.manifest,
-    )
-    fault_duration = diagnostic_observation_duration(
-        int(defaults.get("fault_duration_seconds", 30)),
-        topo.manifest,
-    )
-    recovery_duration = int(defaults.get("recovery_duration_seconds", 20))
-    baseline_stabilization = int(defaults.get("baseline_stabilization_seconds", 5))
-    fault_stabilization = int(
-        template.get("fault_stabilization_seconds", defaults.get("fault_stabilization_seconds", 5))
-    )
-    recovery_stabilization = int(defaults.get("recovery_stabilization_seconds", 10))
-
-    episode_fault = {
-        "episode_id": "ep002_fault",
-        "description": f"Inject {fault_type} on {target.device}",
-        "fault_type": fault_type,
-        "target_device": target.device,
-        "duration_seconds": fault_duration,
-        "stabilization_time": fault_stabilization,
-        "metadata": {"severity": template.get("severity", "medium")},
-    }
-    if target.interface:
-        episode_fault["target_interface"] = target.interface
-    if target.prefix:
-        episode_fault["target_prefix"] = target.prefix
-    if target.mtu:
-        episode_fault["mtu"] = target.mtu
-    episode_fault["metadata"].update(extra_episode_metadata)
-
-    return {
-        "scenario_id": scenario_id,
-        "name": scenario_name,
-        "description": template.get(
-            "description",
-            f"Auto-generated {fault_type} localization scenario for {topo.scale} topology.",
-        ),
-        "topology_scale": topo.scale,
-        "traffic_profile": "standard",
-        "metadata": {
-            "difficulty": difficulty,
-            "expected_diagnosis": fault_type,
-            "expected_location": expected_location,
-            "generator": {
-                "seed": defaults.get("seed"),
-                "topology_dir": str(topo.topology_dir),
-                "template": template.get("name", fault_type),
-            },
-        },
-        "episodes": [
+        scenario = ScenarioSpec.model_validate(payload)
+        path = out_dir / f"{scenario_id}.yaml"
+        path.write_text(yaml.safe_dump(scenario.model_dump(mode="json", exclude_none=True), sort_keys=False))
+        paths.append(path)
+        rows.append(
             {
-                "episode_id": "ep001_baseline",
-                "description": "Establish baseline - no faults",
-                "fault_type": "none",
-                "target_device": target.device,
-                "duration_seconds": baseline_duration,
-                "stabilization_time": baseline_stabilization,
+                "scenario_id": scenario_id,
+                "unit": unit.id,
+                "fault_type": unit.fault_type,
+                "mechanism": unit.mechanism or unit.fault_type,
+                "root": placement.device,
+                "role": unit.role,
+                "pod": index.devices[placement.device].metadata.get("pod"),
+                "interface": placement.interface,
+                "neighbor": placement.peer,
+                "prefix": placement.prefix,
+                "affected_candidates": placement.witnesses,
+                "control_candidates": placement.controls,
+            }
+        )
+    for number in range(1, (1 if validation else 4) + 1):
+        scenario_id = f"generated_healthy_network_{topo.scale}_{number:03d}"
+        payload = {
+            "schema_version": "1",
+            "scenario_id": scenario_id,
+            "name": scenario_id,
+            "topology_scale": topo.scale,
+            "metadata": {
+                "negative_sample": True,
+                "difficulty": "medium",
+                "fault_catalog_version": FAULT_CATALOG_VERSION,
+                "purpose": "validation" if validation else "benchmark",
+                "experiment": policy.model_dump(mode="json"),
             },
-            episode_fault,
-            {
-                "episode_id": "ep003_recovery_verify",
-                "description": "Verify recovery after fault removal",
+            "episode": {
+                "episode_id": "diagnosis",
                 "fault_type": "none",
-                "target_device": target.device,
-                "duration_seconds": recovery_duration,
-                "stabilization_time": recovery_stabilization,
+                "stabilization_time": 0,
+                "duration_seconds": duration,
             },
-        ],
+        }
+        scenario = ScenarioSpec.model_validate(payload)
+        path = out_dir / f"{scenario_id}.yaml"
+        path.write_text(yaml.safe_dump(scenario.model_dump(mode="json", exclude_none=True), sort_keys=False))
+        paths.append(path)
+    matrix = {
+        "fault_catalog_version": FAULT_CATALOG_VERSION,
+        "scale": topo.scale,
+        "seed": seed,
+        "plan_id": topo.manifest.require_pingmesh_plan().settings.plan_id,
+        "coverage_units": rows,
+        "positive_cases": len(rows),
+        "negative_cases": 1 if validation else 4,
     }
-
-
-def generate(spec: dict[str, Any], topo: TopologyContext, out_dir: Path, seed: int) -> list[Path]:
-    _validate_traffic_profiles(spec)
-    rng = random.Random(seed)
-    defaults = dict(spec.get("defaults", {}))
-    defaults["seed"] = seed
-    default_count = int(defaults.get("count_per_fault", 5))
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    generated: list[Path] = []
-
-    for template in spec.get("fault_templates", []):
-        fault_type = template["fault_type"]
-        difficulty = template.get("difficulty", "medium")
-        count = count_for_scale(template, topo.scale, default_count)
-        for idx in range(1, count + 1):
-            payload = build_fault_instance(
-                fault_type=fault_type,
-                difficulty=difficulty,
-                topo=topo,
-                rng=rng,
-                defaults=defaults,
-                template=template,
-                idx=idx,
-            )
-            out_path = out_dir / f"{payload['scenario_id']}.yaml"
-            with out_path.open("w", encoding="utf-8") as f:
-                yaml.safe_dump(payload, f, sort_keys=False, allow_unicode=False)
-            generated.append(out_path)
-
-    return generated
+    (out_dir / "coverage.json").write_text(json.dumps(matrix, indent=2) + "\n")
+    return paths
 
 
 def cleanup_existing_outputs(out_dir: Path) -> int:
     if not out_dir.exists():
         return 0
-
-    removed = 0
-    for pattern in ("*.yaml", "*.yml"):
-        for existing in out_dir.glob(pattern):
-            if existing.is_file():
-                existing.unlink()
-                removed += 1
-    return removed
+    paths = [p for pattern in ("*.yaml", "*.yml", "coverage.json") for p in out_dir.glob(pattern) if p.is_file()]
+    for path in paths:
+        path.unlink()
+    return len(paths)

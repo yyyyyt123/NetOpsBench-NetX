@@ -1,14 +1,12 @@
-import random
 import subprocess
 import tempfile
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
 from netopsbench.platform.faults.injector import FaultInjector
 from netopsbench.platform.observability.bgp_parser import parse_bgp_summary
 from netopsbench.platform.observability.influxdb import FluxQueryResult
-from netopsbench.platform.scenario import generator as _generate_scenarios_mod
 from netopsbench.platform.toolkit._core.device.route_parsers import parse_route_table
 from netopsbench.platform.toolkit._core.device.telemetry_parsers import (
     parse_influx_metric_rows,
@@ -115,30 +113,6 @@ def test_parse_route_table_preserves_blackhole_discard_kind():
     assert routes[0]["discard_interface"] == "blackhole"
 
 
-def test_build_fault_instance_static_route_targets_remote_client(tmp_path):
-    gs = _generate_scenarios_mod
-    topology_dir = tmp_path / "topology"
-    generate_topology("xs", str(topology_dir))
-    topo = gs.load_topology("xs", str(topology_dir))
-    template = {"name": "static_route_misconfig", "device_role": "leaf", "severity": "medium"}
-    defaults = {"seed": 42}
-
-    scenario = gs.build_fault_instance(
-        "static_route_misconfig",
-        "hard",
-        topo,
-        random.Random(1),
-        defaults,
-        template,
-        1,
-    )
-
-    episode = scenario["episodes"][1]
-    assert episode["target_device"] == "leaf1"
-    assert episode["metadata"]["target_ip"] == "192.168.102.2/32"
-    assert episode["metadata"]["wrong_nexthop"] == "auto"
-
-
 def test_recover_static_route_misconfig_prefers_specific_nexthop(monkeypatch):
     injector = FaultInjector(topology_metadata=_metadata())
     injector.active_faults = [
@@ -155,8 +129,13 @@ def test_recover_static_route_misconfig_prefers_specific_nexthop(monkeypatch):
     class Result:
         returncode = 0
         stderr = ""
+        stdout = ""
 
     def fake_vtysh(device, commands):
+        if commands == ["show running-config"]:
+            return Result()
+        if commands == ["show ip route 192.168.102.2/32"]:
+            return Result()
         captured.append((device, commands))
         return Result()
 
@@ -188,29 +167,44 @@ def test_inject_static_route_misconfig_auto_uses_topology_clients(monkeypatch):
     class Result:
         returncode = 0
         stderr = ""
+        stdout = "ip route 192.168.2.2/32 192.168.1.2\n"
 
-    captured = {}
+    captured = []
 
     def fake_vtysh(device, commands):
-        captured["device"] = device
-        captured["commands"] = commands
+        if commands == ["show running-config"]:
+            return Result()
+        if commands == ["show ip route 192.168.2.2/32"]:
+            return Result()
+        captured.append((device, commands))
         return Result()
 
     monkeypatch.setattr(injector._static_route._sonic, "vtysh", fake_vtysh)
 
+    monkeypatch.setattr(injector._static_route, "_running_config_has_route", lambda *args: False)
+    monkeypatch.setattr(injector._cmd, "docker_exec", lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="0"))
     result = injector.inject_static_route_misconfig(
         device="leaf1",
-        target_ip="192.168.102.2/32",
+        target_ip="192.168.2.2/32",
         wrong_nexthop="auto",
     )
 
     assert result["success"] is True
-    assert result["wrong_nexthop"] == "192.168.101.2"
-    assert captured["device"] == "leaf1"
-    assert "ip route 192.168.102.2/32 192.168.101.2" in captured["commands"]
+    assert result["wrong_nexthop"] == "192.168.1.2"
+    assert captured == [
+        (
+            "leaf1",
+            [
+                "configure terminal",
+                "ip route 192.168.2.2/32 192.168.1.2",
+                "end",
+                "write memory",
+            ],
+        )
+    ]
 
 
-def test_get_interface_mtu_falls_back_to_live_link(monkeypatch):
+def test_get_interface_mtu_uses_effective_live_link(monkeypatch):
     injector = FaultInjector(topology_metadata=_metadata())
 
     class Result:
@@ -229,6 +223,85 @@ def test_get_interface_mtu_falls_back_to_live_link(monkeypatch):
     monkeypatch.setattr(injector._iface._cmd, "docker_exec", fake_docker_exec)
 
     assert injector._iface.get_interface_mtu("spine1", "Ethernet0") == 9100
+
+
+def test_get_interface_mtu_does_not_hide_live_drift_with_config_db(monkeypatch):
+    injector = FaultInjector(topology_metadata=_metadata())
+
+    class Result:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_docker_exec(_container, cmd, timeout=30):
+        if cmd == ["ip", "-o", "link", "show", "dev", "Ethernet0"]:
+            return Result(stdout="9: Ethernet0: <UP> mtu 1500 qdisc mq state UP")
+        if cmd[:4] == ["sonic-db-cli", "CONFIG_DB", "hget", "PORT|Ethernet0"]:
+            return Result(stdout="9100")
+        raise AssertionError(f"unexpected command: {cmd}")
+
+    monkeypatch.setattr(injector._iface._cmd, "docker_exec", fake_docker_exec)
+
+    assert injector._iface.get_interface_mtu("spine1", "Ethernet0") == 1500
+
+
+def test_mtu_handler_applies_live_fallback_when_config_db_does_not_converge(monkeypatch):
+    injector = FaultInjector(topology_metadata=_metadata())
+
+    class Result:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    effective = iter([9100, 9100, 1400])
+    fallback_commands = []
+    monkeypatch.setattr(
+        injector._impairment._iface,
+        "get_interface_mtu",
+        lambda _device, _interface: next(effective),
+    )
+    monkeypatch.setattr(
+        injector._impairment._sonic,
+        "config_cmd",
+        lambda _device, _args: Result(),
+    )
+    monkeypatch.setattr(
+        injector._impairment._cmd,
+        "docker_exec",
+        lambda _container, command: fallback_commands.append(command) or Result(),
+    )
+
+    result = injector.inject_mtu_mismatch("spine1", "Ethernet0", mtu=1400)
+
+    assert result["success"] is True
+    assert result["original_mtu"] == 9100
+    assert fallback_commands == [["ip", "link", "set", "eth1", "mtu", "1400"]]
+
+
+def test_netem_readback_compares_normalized_numeric_values(monkeypatch):
+    injector = FaultInjector(topology_metadata=_metadata())
+
+    class Result:
+        def __init__(self, returncode=0, stdout="", stderr=""):
+            self.returncode = returncode
+            self.stdout = stdout
+            self.stderr = stderr
+
+    def fake_docker_exec(_container, command, timeout=30):
+        if command[:4] == ["tc", "qdisc", "replace", "dev"]:
+            return Result()
+        if command == ["tc", "qdisc", "show", "dev", "eth1"]:
+            return Result(stdout="qdisc netem 8001: root refcnt 2 limit 1000 loss 10%")
+        raise AssertionError(f"unexpected command: {command}")
+
+    monkeypatch.setattr(injector._impairment._cmd, "docker_exec", fake_docker_exec)
+
+    monkeypatch.setattr(injector._impairment, "_require_default_qdisc", lambda *args: None)
+    result = injector.inject_packet_loss("spine1", "Ethernet0", loss_pct=10.0)
+
+    assert result["success"] is True
 
 
 def test_recover_mtu_mismatch_normalizes_invalid_saved_mtu(monkeypatch):
@@ -250,6 +323,7 @@ def test_recover_mtu_mismatch_normalizes_invalid_saved_mtu(monkeypatch):
         raise AssertionError("linux mtu fallback should not be used when normalized SONiC MTU succeeds")
 
     monkeypatch.setattr(injector._iface, "get_common_port_mtu", lambda device, exclude_interface=None: 9100)
+    monkeypatch.setattr(injector._iface, "get_interface_mtu", lambda device, interface: 9100)
     monkeypatch.setattr(injector._impairment._sonic, "config_cmd", fake_sonic_config)
     monkeypatch.setattr(injector._impairment._cmd, "docker_exec", unexpected_docker_exec)
 
@@ -340,6 +414,37 @@ def test_influx_query_failure_is_structured_not_empty_data(monkeypatch):
     assert result.status == "error"
     assert result.rows == []
     assert "offline" in result.error
+
+
+def test_query_influx_parses_multiple_yield_headers_and_keeps_zero(monkeypatch):
+    toolkit = AgentToolkit(topology_metadata=_metadata())
+    csv_text = """#datatype,string,long,string,long
+,result,table,source,_value
+,index_count,0,leaf1,5
+
+#datatype,string,long,dateTime:RFC3339,double,string
+,result,table,_time,_value,source
+,index_last,1,2026-07-11T00:00:20Z,0,leaf1
+"""
+    monkeypatch.setattr(
+        "netopsbench.platform.toolkit._core.device.telemetry_parsers.query_flux",
+        lambda *args, **kwargs: FluxQueryResult(status="ok", text=csv_text),
+    )
+
+    result = query_influx(toolkit, 'from(bucket: "test")')
+
+    assert result.status == "ok"
+    assert result.rows == [
+        {"": "", "result": "index_count", "table": 0.0, "source": "leaf1", "_value": 5.0},
+        {
+            "": "",
+            "result": "index_last",
+            "table": 1.0,
+            "_time": "2026-07-11T00:00:20Z",
+            "_value": 0.0,
+            "source": "leaf1",
+        },
+    ]
 
 
 def test_parse_bgp_summary_skips_total_footer():
@@ -502,7 +607,7 @@ def test_get_device_logs_falls_back_to_container_logs(monkeypatch):
         lambda container, cmd_args, timeout: subprocess.CompletedProcess(
             args=["docker", "exec", container] + list(cmd_args),
             returncode=0,
-            stdout=(f"{datetime.now(UTC):%b %d %H:%M:%S.%f} " "leaf1 NOTICE #root: fallback-message\n"),
+            stdout=(f"{datetime.now(UTC):%b %d %H:%M:%S.%f} leaf1 NOTICE #root: fallback-message\n"),
             stderr="",
         ),
     )
@@ -513,6 +618,26 @@ def test_get_device_logs_falls_back_to_container_logs(monkeypatch):
     assert result.data["source"] == "container_logs_fallback"
     assert result.data["logs"][0]["message"] == "fallback-message"
     assert result.data["logs"][0]["severity"] == "notice"
+
+
+def test_container_log_fallback_respects_episode_end_time(monkeypatch):
+    from netopsbench.platform.toolkit._core.device.log_parsers import parse_local_syslog_lines
+
+    now = datetime.now(UTC).replace(microsecond=0)
+    before = now - timedelta(seconds=10)
+    inside = now
+    at_end = now + timedelta(seconds=10)
+    lines = "\n".join(
+        [
+            f"{before:%b %d %H:%M:%S} leaf1 NOTICE #root: before",
+            f"{inside:%b %d %H:%M:%S} leaf1 NOTICE #root: inside",
+            f"{at_end:%b %d %H:%M:%S} leaf1 NOTICE #root: at-end",
+        ]
+    )
+
+    parsed = parse_local_syslog_lines(lines, cutoff=inside, end_time=at_end)
+
+    assert [item["message"] for item in parsed] == ["inside"]
 
 
 def test_ping_test_allows_infra_source(monkeypatch):
@@ -532,21 +657,82 @@ def test_ping_test_allows_infra_source(monkeypatch):
     assert result.success is True
 
 
-def test_traceroute_allows_infra_source(monkeypatch):
+@pytest.mark.parametrize(("source", "role"), [("spine1", "spine"), ("leaf1", "leaf")])
+def test_traceroute_rejects_infra_source_without_docker_exec(monkeypatch, source, role):
+    toolkit = AgentToolkit(topology_metadata=_metadata())
+    calls = []
+
+    monkeypatch.setattr(toolkit, "_docker_exec", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    result = toolkit.traceroute(source, "192.168.102.2")
+
+    assert result.success is False
+    assert result.data is None
+    assert result.error == f"Traceroute source must be a client device, got {source} ({role})"
+    assert calls == []
+
+
+def test_traceroute_uses_bounded_probe_budget(monkeypatch):
+    toolkit = AgentToolkit(topology_metadata=_metadata())
+    calls = []
+
+    def fake_docker_exec(container, cmd, timeout):
+        calls.append((container, cmd, timeout))
+        return subprocess.CompletedProcess(cmd, 0, "1  *\n2  192.168.102.2  1.1 ms\n", "")
+
+    monkeypatch.setattr(toolkit, "_docker_exec", fake_docker_exec)
+
+    result = toolkit.traceroute("client1", "192.168.102.2")
+
+    assert result.success is True
+    assert result.data["traceroute"].startswith("1  *")
+    assert calls == [
+        (
+            toolkit.container_names["client1"],
+            ["traceroute", "-n", "-q", "1", "-w", "1", "-m", "8", "192.168.102.2"],
+            12,
+        )
+    ]
+
+
+def test_traceroute_preserves_timeout_error_contract(monkeypatch):
     toolkit = AgentToolkit(topology_metadata=_metadata())
 
-    class Result:
-        returncode = 0
-        stdout = "traceroute to 192.168.102.2, 30 hops max\n"
-        stderr = ""
+    def fake_docker_exec(container, cmd, timeout):
+        raise subprocess.TimeoutExpired(cmd, timeout)
+
+    monkeypatch.setattr(toolkit, "_docker_exec", fake_docker_exec)
+
+    result = toolkit.traceroute("client1", "192.168.102.2")
+
+    assert result.success is False
+    assert result.data is None
+    assert result.error == "Traceroute timed out"
+
+
+def test_traceroute_reports_nonzero_command_exit(monkeypatch):
+    toolkit = AgentToolkit(topology_metadata=_metadata())
+    cmd = ["traceroute", "-n", "192.168.102.2"]
 
     monkeypatch.setattr(
-        "netopsbench.platform.toolkit._core.device.validators.subprocess.run",
-        lambda *a, **kw: Result(),
+        toolkit,
+        "_docker_exec",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            cmd,
+            127,
+            'OCI runtime exec failed: exec: "traceroute": executable file not found',
+            "",
+        ),
     )
 
-    result = toolkit.traceroute("spine1", "192.168.102.2")
-    assert result.success is True
+    result = toolkit.traceroute("client1", "192.168.102.2")
+
+    assert result.success is False
+    assert result.data is None
+    assert result.error == (
+        "Traceroute failed on client1 (exit 127): "
+        'OCI runtime exec failed: exec: "traceroute": executable file not found'
+    )
 
 
 def test_ping_test_allows_client_source(monkeypatch):

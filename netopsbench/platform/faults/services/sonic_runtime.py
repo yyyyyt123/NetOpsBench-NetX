@@ -7,14 +7,14 @@ import subprocess
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from ..context import FaultContext
+    from ..context import FaultRuntimeContext
     from .command_runner import CommandRunner
 
 
 class SonicRuntime:
     """SONiC device command execution and BGP readiness checks."""
 
-    def __init__(self, cmd: CommandRunner, ctx: FaultContext) -> None:
+    def __init__(self, cmd: CommandRunner, ctx: FaultRuntimeContext) -> None:
         self._cmd = cmd
         self._ctx = ctx
 
@@ -29,19 +29,26 @@ class SonicRuntime:
         cmd = ["vtysh"]
         for command in commands:
             cmd.extend(["-c", command])
-        return self._cmd.docker_exec(container, cmd)
+        result = self._cmd.docker_exec(container, cmd)
+        if result.returncode == 0 and "write memory" in commands:
+            # FRR rewrites its bind-mounted startup file as frr:frr 0640.
+            # Preserve the generated configuration's host-side readability
+            # so runtime baseline fingerprints can still inspect it.
+            readable = self._cmd.docker_exec(container, ["chmod", "a+r", "/etc/frr/frr.conf"])
+            if readable.returncode != 0:
+                return subprocess.CompletedProcess(
+                    result.args,
+                    readable.returncode,
+                    result.stdout,
+                    readable.stderr or "Saved FRR configuration could not be made readable",
+                )
+        return result
 
     def config_cmd(self, device: str, args: list[str]) -> subprocess.CompletedProcess:
         container = self._ctx.container_names.get(device)
         if not container:
             raise ValueError(f"Unknown device: {device}")
         return self._cmd.docker_exec(container, ["config"] + args)
-
-    def reload_bgp_config(self, device: str) -> subprocess.CompletedProcess:
-        container = self._ctx.container_names.get(device)
-        if not container:
-            raise ValueError(f"Unknown device: {device}")
-        return self._cmd.docker_exec(container, ["vtysh", "-b"], timeout=60)
 
     def bgp_neighbor_states(self, output: str):
         states = []
@@ -68,3 +75,14 @@ class SonicRuntime:
             return False
         states = self.bgp_neighbor_states(output)
         return bool(states) and all(state.isdigit() for state in states)
+
+    def bgp_neighbor_state(self, device: str, peer_ip: str) -> bool | None:
+        """Return the neighbor's established state, or ``None`` when unreadable."""
+        result = self.vtysh(device, ["show ip bgp summary"])
+        if result.returncode != 0:
+            return None
+        for raw_line in (result.stdout or "").splitlines():
+            parts = raw_line.split()
+            if len(parts) >= 10 and parts[0] == peer_ip:
+                return parts[9].isdigit()
+        return False

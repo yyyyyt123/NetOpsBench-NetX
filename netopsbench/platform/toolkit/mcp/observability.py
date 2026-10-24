@@ -5,16 +5,20 @@ from .contracts import ToolSpec
 def get_device_logs(
     device: str,
     time_range_minutes: int = 30,
-    severity: str = None,
+    severity: str | None = None,
     include_raw: bool = False,
+    start_time: str = "",
+    end_time: str = "",
 ):
-    """Get device logs from InfluxDB."""
+    """Get device logs from an explicit episode window or a rolling lookback."""
     return as_payload(
         get_toolkit().get_device_logs(
             device=device,
             time_range_minutes=time_range_minutes,
             severity=severity,
             include_raw=include_raw,
+            start_time=start_time or None,
+            end_time=end_time or None,
         )
     )
 
@@ -49,6 +53,7 @@ def query_bgp_events(
     role: str = "",
     state: str = "non_established",
     limit: int = 100,
+    event_type: str = "session",
 ):
     """Find BGP session events from centralized historical telemetry."""
     return as_payload(
@@ -60,6 +65,7 @@ def query_bgp_events(
             peer=peer or None,
             role=role or None,
             state=state,
+            event_type=event_type,
             limit=limit,
         )
     )
@@ -69,10 +75,14 @@ def get_pingmesh_summary(
     time_range_minutes: int = 10,
     start_time: str = "",
     end_time: str = "",
+    src_client: str | None = None,
+    dst_client: str | None = None,
 ):
     """Get Pingmesh summary by path type."""
     return as_payload(
         get_toolkit().get_pingmesh_summary(
+            src_client=src_client,
+            dst_client=dst_client,
             time_range_minutes=time_range_minutes,
             start_time=start_time or None,
             end_time=end_time or None,

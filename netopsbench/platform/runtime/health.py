@@ -11,48 +11,110 @@ Programmatic usage::
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from math import ceil
+from pathlib import Path
 
 from netopsbench.config import config
 from netopsbench.logging_utils import get_logger
-from netopsbench.models.profiles import get_scale_profile
+from netopsbench.models.profiles import ScaleRegistry, get_scale_profile
 from netopsbench.models.runtime import RuntimeIdentity
-from netopsbench.models.topology import DeviceRole, TopologyManifest
+from netopsbench.models.topology import Device, DeviceRole, TopologyManifest
+from netopsbench.platform.client_agent.contract import (
+    HEARTBEAT_MAX_AGE_SECONDS,
+    PINGMESH_CONTROL_PORT,
+)
+from netopsbench.platform.client_agent.control import request_agent
 from netopsbench.platform.topology.topology_utils import (
     clab_container_name,
-    coerce_topology_manifest,
     load_topology_manifest,
 )
+from netopsbench.platform.utils.control import OperationControl
 from netopsbench.platform.utils.proc import docker_prefix, safe_run
 
 logger = get_logger(__name__)
 
 HEALTH_POLL_INTERVAL_SECONDS = 5
 ACTIVE_INTERFACE_COVERAGE_MIN_RATIO = 0.5
+_NETWORK_PROBE_SOURCE = (Path(__file__).parent.parent / "observability" / "_routing_probe.py").read_text(
+    encoding="utf-8"
+)
 
 
-def _docker_exec(container: str, *cmd: str, check: bool = False, capture: bool = True) -> subprocess.CompletedProcess:
+def _docker_exec(
+    container: str,
+    *cmd: str,
+    check: bool = False,
+    capture: bool = True,
+    timeout: float = 60,
+    control: OperationControl | None = None,
+) -> subprocess.CompletedProcess:
     prefix = docker_prefix()
     return safe_run(
         [*prefix, "docker", "exec", container, *cmd],
         check=check,
         capture_output=capture,
         text=True,
-        timeout=60,
+        timeout=timeout,
+        control=control,
     )
 
 
-def _running_container_count(lab_name: str) -> int:
+def _routing_state(
+    container: str, control: OperationControl | None = None, route_snapshot: dict | None = None
+) -> tuple[str, str]:
+    budget = control.remaining(125) if control is not None else 125
+    result = _docker_exec(
+        container,
+        "python3",
+        "-c",
+        _NETWORK_PROBE_SOURCE,
+        "--budget-seconds",
+        str(budget),
+        timeout=budget,
+        control=control,
+    )
+    if result.returncode != 0:
+        return "", ""
+    try:
+        payload = json.loads(result.stdout)
+        if payload["version"] != 1:
+            return "", ""
+        checks = payload["checks"]
+        if route_snapshot is not None:
+            fib = checks.get("fib", {})
+            route_snapshot.update(
+                packet_counters=payload.get("packet_counters", {"error": "Not collected"}),
+                fib=json.loads(fib["stdout"]) if fib.get("returncode") == 0 else [],
+                bgp_collection_ok=checks.get("bgp", {}).get("returncode") == 0,
+                collected_at=time.time(),
+            )
+            if fib.get("returncode") != 0:
+                route_snapshot["error"] = "FIB collection failed"
+        outputs = []
+        for name in ("bgp", "interfaces"):
+            check = checks[name]
+            if check["returncode"] != 0 or not isinstance(check["stdout"], str):
+                return "", ""
+            outputs.append(check["stdout"])
+        return outputs[0], outputs[1]
+    except (KeyError, TypeError, ValueError):
+        return "", ""
+
+
+def _running_container_count(lab_name: str, control: OperationControl | None = None) -> int:
     result = safe_run(
         [*docker_prefix(), "docker", "ps", "--filter", f"label=containerlab={lab_name}", "--format", "{{.Names}}"],
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
+        control=control,
     )
     return len([line for line in result.stdout.strip().splitlines() if line])
 
@@ -93,65 +155,34 @@ def _parse_active_interfaces(show_interfaces_output: str) -> set[str]:
     return active
 
 
-def _expected_active_interface_count(topo: TopologyManifest | dict, device: str) -> int:
-    manifest = coerce_topology_manifest(topo)
-    target = manifest.device(device)
-    if target is None:
-        return 0
-    clients = manifest.clients()
-    fat_tree_k = int(manifest.facts.fat_tree_k or 0)
-
-    if fat_tree_k:
-        half = fat_tree_k // 2
-        if target.role is DeviceRole.CORE:
-            return fat_tree_k
-        if target.role is DeviceRole.AGG:
-            return fat_tree_k
-        if target.role is DeviceRole.EDGE:
-            attached_clients = [client for client in clients if client.attached_switch == device]
-            clients_per_edge = len(attached_clients) or int(manifest.facts.clients_per_attached_switch)
-            return half + clients_per_edge
-
-    if target.role is DeviceRole.SPINE:
-        return int(manifest.facts.num_leafs or len(manifest.devices_by_role(DeviceRole.LEAF)))
-    if target.role is DeviceRole.LEAF:
-        num_spines = int(manifest.facts.num_spines or len(manifest.devices_by_role(DeviceRole.SPINE)))
-        attached_clients = [client for client in clients if client.attached_switch == device]
-        clients_per_leaf = len(attached_clients) or int(manifest.facts.clients_per_attached_switch)
-        return num_spines + clients_per_leaf
-    return 0
+def expected_network_counts(topo: TopologyManifest) -> dict[str, dict[str, int]]:
+    """Compile interface and BGP expectations once from the current manifest."""
+    routed = {item.name for item in topo.routing_devices()}
+    counts = {item.name: {"active_interfaces": 0, "bgp_neighbors": 0} for item in topo.devices}
+    for link in topo.links:
+        routing_link = all(endpoint.device in routed for endpoint in link.endpoints)
+        for endpoint in link.endpoints:
+            counts[endpoint.device]["active_interfaces"] += 1
+            counts[endpoint.device]["bgp_neighbors"] += int(routing_link)
+    return counts
 
 
-def _expected_bgp_neighbor_count(topo: TopologyManifest | dict, device: str) -> int:
-    manifest = coerce_topology_manifest(topo)
-    target = manifest.device(device)
-    if target is None:
-        return 0
-    fat_tree_k = int(manifest.facts.fat_tree_k or 0)
-    if fat_tree_k:
-        if target.role in {DeviceRole.CORE, DeviceRole.AGG}:
-            return fat_tree_k
-        if target.role is DeviceRole.EDGE:
-            return fat_tree_k // 2
-    if target.role is DeviceRole.SPINE:
-        return len(manifest.devices_by_role(DeviceRole.LEAF))
-    if target.role is DeviceRole.LEAF:
-        return len(manifest.devices_by_role(DeviceRole.SPINE))
-    return 0
-
-
-def _active_interface_coverage_error(
-    container: str,
-    device: str,
-    active_interfaces: set[str],
-    expected_count: int,
-) -> str | None:
-    if expected_count <= 0 or len(active_interfaces) >= expected_count:
-        return None
-    return (
-        f"active interface coverage too low on {container}: "
-        f"active={len(active_interfaces)} expected>={expected_count}"
+def _convergence_targets(topo: TopologyManifest, *, all_routing_devices: bool) -> list[Device]:
+    routed = topo.routing_devices()
+    if all_routing_devices:
+        return routed
+    if not routed:
+        return []
+    edge_switches = topo.edge_devices()
+    names = [routed[0].name]
+    role_groups = (
+        (topo.devices_by_role(DeviceRole.AGG), edge_switches) if topo.family == "fat-tree" else (edge_switches,)
     )
+    for group in role_groups:
+        if group:
+            names.extend([group[0].name, group[-1].name])
+    target_names = set(names)
+    return [device for device in routed if device.name in target_names]
 
 
 def check_worker_health(
@@ -161,6 +192,76 @@ def check_worker_health(
     influxdb_org: str | None = None,
     health_retries: int | None = None,
     health_delay: int | None = None,
+    scale_registry: ScaleRegistry | None = None,
+    require_client_agent: bool = True,
+    all_routing_devices: bool = False,
+    *,
+    deadline: float | None = None,
+    cancel_event=None,
+    route_snapshot: dict | None = None,
+    expected_routes: dict | None = None,
+) -> list[str]:
+    """Check health within one elapsed-time budget, including all retries."""
+    started = time.monotonic()
+    topo = _load_topology_metadata(str(worker.topology_dir))
+    limit = started + get_scale_profile(topo.scale, scale_registry).health_timeout_seconds
+    control = OperationControl(cancel_event, min(limit, deadline) if deadline is not None else limit)
+    try:
+        control.remaining()
+        return _check_worker_health(
+            worker,
+            influxdb_url,
+            influxdb_token,
+            influxdb_org,
+            health_retries,
+            health_delay,
+            scale_registry,
+            require_client_agent,
+            all_routing_devices,
+            topology=topo,
+            control=control,
+            route_snapshot=route_snapshot,
+            expected_routes=expected_routes,
+        )
+    except (TimeoutError, subprocess.TimeoutExpired):
+        return ["Worker health check deadline exceeded"]
+
+
+def _parallel_check(function, items, workers, control):
+    """Queued probes must not start after cancellation or deadline expiry."""
+
+    def probe(item):
+        control.remaining()
+        result = function(item)
+        control.remaining()
+        return result
+
+    executor = ThreadPoolExecutor(max_workers=min(workers, max(1, len(items))))
+    futures = []
+    try:
+        for item in items:
+            control.remaining()
+            futures.append(executor.submit(probe, item))
+        return [future.result(timeout=control.remaining()) for future in futures]
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
+def _check_worker_health(
+    worker: RuntimeIdentity,
+    influxdb_url: str | None = None,
+    influxdb_token: str | None = None,
+    influxdb_org: str | None = None,
+    health_retries: int | None = None,
+    health_delay: int | None = None,
+    scale_registry: ScaleRegistry | None = None,
+    require_client_agent: bool = True,
+    all_routing_devices: bool = False,
+    *,
+    topology: TopologyManifest,
+    control: OperationControl,
+    route_snapshot: dict | None = None,
+    expected_routes: dict | None = None,
 ) -> list[str]:
     """Run all health checks and return a list of error messages (empty = healthy).
 
@@ -173,7 +274,7 @@ def check_worker_health(
     """
     errors: list[str] = []
     topology_dir = str(worker.topology_dir)
-    topo = _load_topology_metadata(topology_dir)
+    topo = topology
     projected_topo = topo.to_agent_topology()
     lab_name = worker.lab_name
     if topo.name != worker.lab_name or topo.topology_id != worker.topology_id:
@@ -193,7 +294,7 @@ def check_worker_health(
     influxdb_token = influxdb_token or config.influxdb_token
     influxdb_org = influxdb_org or config.influxdb_org
 
-    profile = get_scale_profile(topo.scale)
+    profile = get_scale_profile(topo.scale, scale_registry)
     delay = HEALTH_POLL_INTERVAL_SECONDS if health_delay is None else health_delay
     retries = health_retries or max(1, ceil(profile.health_timeout_seconds / max(1, delay)))
 
@@ -213,6 +314,7 @@ def check_worker_health(
         text=True,
         check=False,
         timeout=30,
+        control=control,
     )
     if telegraf_container not in ret.stdout.strip().splitlines():
         errors.append(f"worker telegraf container is not running: {telegraf_container}")
@@ -222,81 +324,97 @@ def check_worker_health(
     # [2/5] Container count
     logger.info("[2/5] Checking container count...")
     expected_nodes = len(switches) + len(clients)
-    running_nodes = _running_container_count(lab_name)
+    running_nodes = _running_container_count(lab_name, control=control)
     if running_nodes < expected_nodes:
         errors.append(
-            f"running node count mismatch for {lab_name}: " f"got {running_nodes} expected at least {expected_nodes}"
+            f"running node count mismatch for {lab_name}: got {running_nodes} expected at least {expected_nodes}"
         )
         return errors
 
-    # [3/5] BGP convergence
     bgp_device = routed[0].name if routed else "spine1"
-    logger.info("[3/5] Checking BGP convergence on %s...", bgp_device)
-    bgp_container = clab_container_name(lab_name, bgp_device)
-    expected_bgp = _expected_bgp_neighbor_count(topo, bgp_device)
-    established = 0
-    for _ in range(retries):
-        ret = _docker_exec(bgp_container, "vtysh", "-c", "show ip bgp summary")
-        established = _parse_bgp_established(ret.stdout or "")
-        if established >= expected_bgp:
+    convergence_targets = _convergence_targets(topo, all_routing_devices=all_routing_devices)
+    obs_device = edge_switches[0].name if edge_switches else (routed[0].name if routed else bgp_device)
+    syslog_marker = f"NETOPSBENCH_HEALTH_{lab_name}_{time.time_ns()}"
+    # Allow collector ingestion to overlap all-device convergence checks.
+    if collector_ip:
+        _docker_exec(
+            clab_container_name(lab_name, bgp_device),
+            "bash",
+            "-lc",
+            f"logger -n '{collector_ip}' -P 514 -d '{syslog_marker}'",
+            control=control,
+        )
+    network_interfaces: dict[str, set[str]] = {}
+    expected_counts = expected_network_counts(topo)
+
+    logger.info(
+        "[3/5] Checking BGP and interface convergence on %s routing devices...",
+        len(convergence_targets),
+    )
+
+    route_errors = {}
+
+    def network_state(device) -> tuple[str, int, int, int, int]:
+        container = clab_container_name(lab_name, device.name)
+        if route_snapshot is None:
+            bgp, interfaces = _routing_state(container, control=control)
+        else:
+            node_snapshot: dict = {}
+            bgp, interfaces = _routing_state(container, control=control, route_snapshot=node_snapshot)
+            from netopsbench.platform.observability.bgp_parser import parse_bgp_summary
+
+            node_snapshot.update(bgp=parse_bgp_summary(bgp), interfaces=interfaces)
+            route_snapshot.setdefault("nodes", {})[device.name] = node_snapshot
+            if expected_routes is not None:
+                from netopsbench.platform.observability.routes import verify_route_recovery
+
+                route_errors[device.name] = verify_route_recovery(
+                    {"nodes": {device.name: expected_routes["nodes"].get(device.name, {})}},
+                    {"nodes": {device.name: node_snapshot}},
+                )
+        network_interfaces[device.name] = _parse_active_interfaces(interfaces)
+        return (
+            device.name,
+            _parse_bgp_established(bgp),
+            expected_counts[device.name]["bgp_neighbors"],
+            len(network_interfaces[device.name]),
+            expected_counts[device.name]["active_interfaces"],
+        )
+
+    pending: dict[str, tuple[int, int, int, int]] = {}
+    pending_devices = list(convergence_targets)
+    for attempt in range(retries):
+        network_states = _parallel_check(network_state, pending_devices, 16, control)
+        pending = {
+            device: (established, expected_bgp, active, expected_active)
+            for device, established, expected_bgp, active, expected_active in network_states
+            if established < expected_bgp or active < expected_active or route_errors.get(device)
+        }
+        if not pending:
             break
-        time.sleep(delay)
-    if established < expected_bgp:
-        errors.append(f"BGP not converged on {bgp_container}: " f"established={established} expected>={expected_bgp}")
+        pending_devices = [device for device in pending_devices if device.name in pending]
+        if attempt + 1 < retries:
+            control.sleep(delay)
+    if pending:
+        details = ", ".join(
+            f"{device}(bgp={state[0]}/{state[1]},if={state[2]}/{state[3]})"
+            for device, state in sorted(pending.items())[:12]
+        )
+        errors.append(f"network not converged on {len(pending)} routing devices: {details}")
+        errors.extend(error for name in pending for error in route_errors.get(name, []))
         return errors
 
-    logger.info("[3b/5] Checking active interface coverage...")
-    coverage_targets = [bgp_device]
-    if topo.family == "fat-tree":
-        for role_devices in (topo.devices_by_role(DeviceRole.AGG), edge_switches):
-            if role_devices:
-                name = role_devices[0].name
-                if name and name not in coverage_targets:
-                    coverage_targets.append(name)
-        if edge_switches:
-            last_edge = edge_switches[-1].name
-            if last_edge and last_edge not in coverage_targets:
-                coverage_targets.append(last_edge)
-    elif edge_switches:
-        first_edge = edge_switches[0].name
-        if first_edge and first_edge not in coverage_targets:
-            coverage_targets.append(first_edge)
-        last_edge = edge_switches[-1].name
-        if last_edge and last_edge not in coverage_targets:
-            coverage_targets.append(last_edge)
-    for device in coverage_targets:
-        expected_count = _expected_active_interface_count(topo, device)
-        if expected_count <= 0:
-            continue
-        container = clab_container_name(lab_name, device)
-        active_ifaces: set[str] = set()
-        for _ in range(retries):
-            ret = _docker_exec(container, "bash", "-lc", "show interfaces status")
-            active_ifaces = _parse_active_interfaces(ret.stdout or "")
-            if len(active_ifaces) >= expected_count:
-                break
-            time.sleep(delay)
-        coverage_error = _active_interface_coverage_error(
-            container=container,
-            device=device,
-            active_interfaces=active_ifaces,
-            expected_count=expected_count,
-        )
-        if coverage_error:
-            errors.append(coverage_error)
-            return errors
-
-    # [4/5] Client connectivity + Pingmesh agent
-    logger.info("[4/5] Checking client connectivity and Pingmesh agent...")
+    # [4/5] Client connectivity + native Pingmesh process
+    logger.info("[4/5] Checking client connectivity and native Pingmesh process...")
     src_client = clients[0]
     src_name = str(src_client.get("name", ""))
-    src_leaf = str(src_client.get("leaf", ""))
+    src_attached_switch = str(src_client.get("attached_switch", ""))
     dst_ip = ""
     # Prefer cross-rack destination
     for other in clients[1:]:
         other_ip = str(other.get("data_ip", "")).strip()
-        other_leaf = str(other.get("leaf", "")).strip()
-        if other_leaf != src_leaf and other_ip:
+        other_attached_switch = str(other.get("attached_switch", "")).strip()
+        if other_attached_switch != src_attached_switch and other_ip:
             dst_ip = other_ip
             break
         if not dst_ip and other_ip:
@@ -308,71 +426,110 @@ def check_worker_health(
     src_container = clab_container_name(lab_name, src_name)
     connectivity_ok = False
     for _ in range(retries):
-        ret = _docker_exec(src_container, "ping", "-c", "1", "-W", "2", dst_ip)
+        ret = _docker_exec(src_container, "ping", "-c", "1", "-W", "2", dst_ip, control=control)
         if ret.returncode == 0:
             connectivity_ok = True
             break
-        time.sleep(delay)
+        control.sleep(delay)
     if not connectivity_ok:
         errors.append(f"client connectivity failed from {src_container} to {dst_ip}")
         return errors
 
-    agent_running = False
-    for _ in range(retries):
-        ret = _docker_exec(src_container, "ps", "aux")
-        if "netopsbench.platform.pingmesh.cli" in (ret.stdout or ""):
-            agent_running = True
-            break
-        time.sleep(delay)
-    if not agent_running:
-        errors.append(f"Pingmesh agent is not running in {src_container}")
-        return errors
+    if require_client_agent:
+        agent_targets = clients if all_routing_devices else [src_client]
+
+        def agent_state(client: dict) -> tuple[str, bool]:
+            name = str(client.get("name", "")).strip()
+            management_ip = str(client.get("mgmt_ip", "")).strip()
+            if not management_ip:
+                return name, False
+            try:
+                response = request_agent(management_ip, PINGMESH_CONTROL_PORT, "status", timeout=control.remaining(2))
+            except (OSError, RuntimeError, ValueError):
+                response = {}
+            status = response.get("status") or {}
+            heartbeat_ns = int(status.get("heartbeat_unix_ns", 0) or 0)
+            heartbeat_age = time.time() - heartbeat_ns / 1_000_000_000
+            return name, bool(
+                response.get("ok") is True
+                and status.get("ready") is True
+                and status.get("plan_id") == topo.require_pingmesh_plan().settings.plan_id
+                and status.get("config_schema_version") == 2
+                and 0 <= heartbeat_age <= HEARTBEAT_MAX_AGE_SECONDS
+            )
+
+        pending_agents = list(agent_targets)
+        failed_agents: list[str] = []
+        for attempt in range(retries):
+            agent_states = _parallel_check(agent_state, pending_agents, 32, control)
+            failed_agents = [name for name, ready in agent_states if not ready]
+            if not failed_agents:
+                break
+            failed_set = set(failed_agents)
+            pending_agents = [client for client in pending_agents if str(client.get("name", "")).strip() in failed_set]
+            if attempt + 1 < retries:
+                control.sleep(delay)
+        if failed_agents:
+            preview = ", ".join(sorted(failed_agents)[:12])
+            errors.append(f"Native Pingmesh process is not ready on {len(failed_agents)} clients: {preview}")
+            return errors
 
     # [5/5] InfluxDB observability path
     logger.info("[5/5] Checking InfluxDB observability path...")
-    obs_device = edge_switches[0].name if edge_switches else (routed[0].name if routed else bgp_device)
-    obs_container = clab_container_name(lab_name, obs_device)
-
-    # Get active interfaces
-    ret = _docker_exec(obs_container, "bash", "-lc", "show interfaces status")
-    observed_active_interfaces = sorted(_parse_active_interfaces(ret.stdout or ""))
-
-    # Send syslog marker
-    syslog_marker = f"NETOPSBENCH_HEALTH_{lab_name}_{int(time.time())}"
-    if collector_ip:
-        _docker_exec(
-            clab_container_name(lab_name, bgp_device),
-            "bash",
-            "-lc",
-            f"logger -n '{collector_ip}' -P 514 -d '{syslog_marker}'",
+    if obs_device in network_interfaces:
+        observed_active_interfaces = sorted(network_interfaces[obs_device])
+    else:
+        ret = _docker_exec(
+            clab_container_name(lab_name, obs_device), "bash", "-lc", "show interfaces status", control=control
         )
+        observed_active_interfaces = sorted(_parse_active_interfaces(ret.stdout or ""))
 
     # Delegate to the observability validation module
     from netopsbench.platform.observability.influxdb import query_flux
     from netopsbench.platform.observability.validation import check_observability
 
     def query_runner(query: str) -> str:
-        result = query_flux(influxdb_url, influxdb_token, influxdb_org, query, timeout=20)
+        result = query_flux(
+            influxdb_url, influxdb_token, influxdb_org, query, timeout=control.remaining(20), deadline=control.deadline
+        )
         if result.status != "ok":
             raise RuntimeError(result.error or "InfluxDB query failed")
         return result.text
 
+    pending_checks = {"interfaces", "syslog"}
+    if require_client_agent:
+        pending_checks.add("pingmesh")
+    if bgp_device:
+        pending_checks.add("bgp")
+
+    def observe(check: str) -> tuple[str, list[str]]:
+        try:
+            result = check_observability(
+                query_runner,
+                bucket=worker.bucket,
+                obs_device=obs_device,
+                bgp_device=bgp_device,
+                topology_id=worker.topology_id,
+                plan_id=topo.require_pingmesh_plan().settings.plan_id,
+                syslog_marker=syslog_marker,
+                active_interfaces=observed_active_interfaces,
+                min_active_coverage_ratio=ACTIVE_INTERFACE_COVERAGE_MIN_RATIO,
+                require_pingmesh=require_client_agent,
+                checks={check},
+            )
+        except RuntimeError as exc:
+            result = [str(exc)]
+        return check, result
+
     obs_errors: list[str] = []
     for attempt in range(retries):
-        obs_errors = check_observability(
-            query_runner,
-            bucket=worker.bucket,
-            obs_device=obs_device,
-            bgp_device=bgp_device,
-            topology_id=worker.topology_id,
-            syslog_marker=syslog_marker,
-            active_interfaces=observed_active_interfaces,
-            min_active_coverage_ratio=ACTIVE_INTERFACE_COVERAGE_MIN_RATIO,
-        )
-        if not obs_errors:
+        results = _parallel_check(observe, sorted(pending_checks), 4, control)
+        obs_errors = [error for _check, check_errors in results for error in check_errors]
+        pending_checks = {check for check, check_errors in results if check_errors}
+        if not pending_checks:
             break
         if attempt + 1 < retries:
-            time.sleep(delay)
+            control.sleep(delay)
     errors.extend(obs_errors)
 
     if not errors:

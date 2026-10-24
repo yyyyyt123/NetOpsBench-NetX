@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import subprocess
+from datetime import UTC, datetime
 
 from netopsbench.platform.topology.topology_utils import is_network_device_name
 
@@ -12,7 +14,53 @@ from .text_parsers import parse_table
 
 
 class InterfaceOpsMixin:
-    def get_device_interfaces(self, device: str, format: str = "structured") -> ToolResult:
+    def get_device_interfaces(
+        self, device: str, format: str = "structured", interface: str | None = None, include_tc: bool = False
+    ) -> ToolResult:
+        if include_tc and not interface:
+            return ToolResult(success=False, data=None, error="include_tc requires interface")
+        result = self._get_device_interfaces(device, format)
+        if not result.success:
+            return result
+        try:
+            container = self._resolve_container(device)
+            addresses = self._docker_exec(container, ["ip", "-j", "-4", "addr", "show"], timeout=30)
+            if addresses.returncode:
+                result.data["address_collection_error"] = addresses.stderr or "Address collection failed"
+            else:
+                rows = json.loads(addresses.stdout)
+                result.data["addresses"] = {
+                    row["ifname"]: [f"{a['local']}/{a['prefixlen']}" for a in row.get("addr_info", [])] for row in rows
+                }
+            if include_tc:
+                safe_interface = self._validate_interface_name(interface)
+                known = {
+                    endpoint.interface
+                    for link in self.manifest.links
+                    for endpoint in link.endpoints
+                    if endpoint.device == device
+                }
+                from netopsbench.platform.utils.interface_names import to_linux_interface, to_sonic_interface
+
+                if safe_interface not in known and safe_interface not in {to_sonic_interface(name) for name in known}:
+                    raise ValueError("Unknown data interface")
+                linux_interface = to_linux_interface(safe_interface)
+                qdisc = self._docker_exec(
+                    container, ["tc", "-s", "-j", "qdisc", "show", "dev", linux_interface], timeout=30
+                )
+                if qdisc.returncode:
+                    raise RuntimeError(qdisc.stderr or "qdisc collection failed")
+                result.data["qdisc"] = {
+                    "interface": safe_interface,
+                    "linux_interface": linux_interface,
+                    "rows": json.loads(qdisc.stdout),
+                }
+            result.data["collected_at"] = datetime.now(UTC).isoformat()
+            return result
+        except Exception as exc:
+            return ToolResult(success=False, data=None, error=str(exc))
+
+    def _get_device_interfaces(self, device: str, format: str = "structured") -> ToolResult:
         try:
             self._validate_device_name(device)
             safe_format = (format or "raw").lower()

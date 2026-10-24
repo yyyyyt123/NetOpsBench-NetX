@@ -1,7 +1,99 @@
-from netopsbench.platform.session.context import (
+from netopsbench.platform.incident.context import (
+    build_canonical_observation,
     build_public_case_id,
     build_public_symptoms,
 )
+from netopsbench.sdk import (
+    build_canonical_observation as sdk_build_canonical_observation,
+)
+from netopsbench.sdk import (
+    build_public_case_id as sdk_build_public_case_id,
+)
+from netopsbench.sdk import (
+    build_public_symptoms as sdk_build_public_symptoms,
+)
+
+
+def test_canonical_observation_builders_are_public_sdk_contracts():
+    assert sdk_build_canonical_observation is build_canonical_observation
+    assert sdk_build_public_case_id is build_public_case_id
+    assert sdk_build_public_symptoms is build_public_symptoms
+
+
+def test_canonical_observation_is_compact_non_semantic_and_stable():
+    symptoms = {
+        "episode": {"episode_id": "diagnosis"},
+        "observations": {"pingmesh_metrics": {"summary": {"total_anomalies": 2}}},
+        "pingmesh_query_window": {"start_time": "start", "end_time": "end"},
+        "observation_type": "scenario_episode",
+        "ground_truth": {"fault_type": "link_down"},
+    }
+    observation = build_canonical_observation(
+        case_id="case-deadbeef1234",
+        topology={
+            "topology_type": "clos",
+            "devices": {
+                "spines": [{}, {}],
+                "leafs": [{}, {}, {}, {}],
+                "clients": [{}] * 8,
+            },
+            "links": [{}] * 14,
+        },
+        symptoms=symptoms,
+    )
+
+    assert observation == {
+        "case_id": "case-deadbeef1234",
+        "topology_summary": {
+            "family": "clos",
+            "spines": 2,
+            "leafs": 4,
+            "cores": 0,
+            "aggs": 0,
+            "edges": 0,
+            "clients": 8,
+            "links": 14,
+        },
+        "symptoms": {
+            "episode": symptoms["episode"],
+            "observations": symptoms["observations"],
+            "pingmesh_query_window": symptoms["pingmesh_query_window"],
+        },
+    }
+    serialized = str(observation)
+    assert "task_id" not in serialized
+    assert "split" not in serialized
+    assert "ground_truth" not in serialized
+
+
+def test_canonical_fat_tree_summary_preserves_real_tiers():
+    observation = build_canonical_observation(
+        case_id="case-fat-tree",
+        topology={
+            "topology_type": "fat-tree",
+            "devices": {
+                "spines": [{}] * 16,
+                "leafs": [{}] * 32,
+                "cores": [{}] * 16,
+                "aggs": [{}] * 32,
+                "edges": [{}] * 32,
+                "clients": [{}] * 64,
+            },
+            "links": [{}] * 128,
+        },
+        symptoms={},
+    )
+
+    assert observation["topology_summary"] == {
+        "family": "fat-tree",
+        "spines": 0,
+        "leafs": 0,
+        "cores": 16,
+        "aggs": 32,
+        "edges": 32,
+        "clients": 64,
+        "links": 128,
+    }
 
 
 def test_build_public_symptoms_strips_fault_injection_labels():
@@ -42,7 +134,7 @@ def test_build_public_case_id_is_non_semantic_and_stable():
     assert "link_down" not in case_a
 
 
-def test_build_public_symptoms_bounds_anomalies_without_mutating_raw_result():
+def test_build_public_symptoms_preserves_complete_anomalies_and_aggregates():
     anomalies = [
         {
             "type": "packet_loss",
@@ -69,8 +161,108 @@ def test_build_public_symptoms_bounds_anomalies_without_mutating_raw_result():
     payload = build_public_symptoms(episode_result=episode_result, pingmesh_query_window={})
     metrics = payload["observations"]["pingmesh_metrics"]
 
-    assert len(metrics["anomalies"]) == 100
-    assert metrics["returned_anomalies"] == 100
-    assert metrics["truncated"] is True
+    assert len(metrics["anomalies"]) == 150
+    assert "returned_anomalies" not in metrics
+    assert "truncated" not in metrics
     assert metrics["summary"]["total_anomalies"] == 150
+    assert "aggregated_anomalies" in metrics
     assert len(episode_result["observations"]["pingmesh_metrics"]["anomalies"]) == 150
+    assert "aggregated_anomalies" in episode_result["observations"]["pingmesh_metrics"]
+
+
+def test_canonical_observation_compacts_without_changing_public_symptoms():
+    episode_result = {
+        "episode": {"episode_id": "ep", "duration_seconds": 30},
+        "observations": {
+            "pingmesh_metrics": {
+                "anomalies": [{"type": "packet_loss", "severity": "high", "value": index} for index in range(20)],
+                "aggregated_anomalies": {"by_src_leaf": {}},
+            }
+        },
+    }
+    symptoms = build_public_symptoms(episode_result=episode_result, pingmesh_query_window={})
+    canonical = build_canonical_observation(
+        case_id="case-deadbeef1234",
+        topology={"devices": {}, "links": []},
+        symptoms=symptoms,
+    )
+
+    compacted = canonical["symptoms"]["observations"]["pingmesh_metrics"]
+    assert len(compacted["anomalies"]) == 12
+    assert compacted["truncated"] is True
+    assert "aggregated_anomalies" not in compacted
+    assert len(symptoms["observations"]["pingmesh_metrics"]["anomalies"]) == 20
+
+
+def test_agent_success_false_survives_runtime_callback(tmp_path):
+    from types import SimpleNamespace
+
+    from netopsbench.platform.session.diagnosis import build_runtime_diagnosis_callback
+    from netopsbench.sdk.agents import DiagnosisResult
+
+    async def diagnose(context):
+        return DiagnosisResult("provider", "inconclusive", success=False, reasoning="provider unavailable")
+
+    callback = build_runtime_diagnosis_callback(
+        SimpleNamespace(diagnose=diagnose, name="provider"), str(tmp_path), "case"
+    )
+    result = callback(
+        {},
+        diagnostic_session=SimpleNamespace(config=SimpleNamespace(max_agent_seconds=600)),
+        diagnostic_payload={"case_id": "anonymous", "topology": {}, "symptoms": {}, "canonical_observation": {}},
+    )
+    assert result["success"] is False
+    assert result["error"] == "provider unavailable"
+
+
+def test_agent_cancellation_waits_for_resource_cleanup():
+    import asyncio
+    import threading
+    from types import SimpleNamespace
+
+    import pytest
+
+    from netopsbench.platform.session.diagnosis import run_agent_diagnose
+
+    cleaned = []
+    cancelled = threading.Event()
+
+    async def diagnose(context):
+        try:
+            cancelled.set()
+            await asyncio.sleep(100)
+        finally:
+            cleaned.append(True)
+
+    with pytest.raises(RuntimeError, match="cancelled"):
+        run_agent_diagnose(SimpleNamespace(diagnose=diagnose), None, cancelled)
+    assert cleaned == [True]
+
+
+def test_scenario_cancellation_prevents_injection_and_allows_recovery_sleep(monkeypatch):
+    import threading
+
+    import pytest
+
+    from netopsbench.platform.scenario.executor import ScenarioExecutor
+    from netopsbench.platform.topology.clos_builder import build_clos_plan
+    from netopsbench.platform.topology.config import config_for_scale
+
+    slept = []
+    runner = ScenarioExecutor(
+        topology_metadata=build_clos_plan(config_for_scale("xs")).manifest,
+        sleep_fn=lambda seconds: slept.append(seconds),
+    )
+    runner._cancel_event = threading.Event()
+    runner._cancel_event.set()
+    monkeypatch.setattr(
+        "netopsbench.platform.scenario.executor._inject_fault_impl",
+        lambda *a: pytest.fail("cancelled scenario must not inject"),
+    )
+    with pytest.raises(RuntimeError, match="cancelled"):
+        runner._inject_fault(None)
+    with pytest.raises(RuntimeError, match="cancelled"):
+        runner.sleep(1)
+    runner._recovering = True
+    runner.sleep(1)
+    assert slept == [1]

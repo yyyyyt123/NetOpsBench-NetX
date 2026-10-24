@@ -2,20 +2,33 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from importlib.resources import files
 from pathlib import Path
+from typing import Literal
 
-from netopsbench.models.profiles import ScaleProfile, get_scale_profile
+from netopsbench.models.profiles import ScaleProfile, ScaleRegistry, get_scale_profile
+from netopsbench.models.topology import PingmeshPolicy
 
-DEFAULT_SONIC_VS_IMAGE = "yyyyyt123/netopsbench-sonic-vs-202505-telemetry:202505-telemetry"
-DEFAULT_CLIENT_IMAGE = "yyyyyt123/netopsbench-client:python3"
+from .planning import pingmesh_policy_for_profile
+
+DEFAULT_SONIC_VS_IMAGE = (
+    "yyyyyt123/netopsbench-sonic-vs-202505-telemetry"
+    "@sha256:0e039d2fea3f85788f15db8ebad27cf5bd5b2cdaf17e8c31eab852021e23ea73"
+)
+DEFAULT_CLIENT_IMAGE = "netopsbench-client:pingmesh-v2"
+
 SONIC_PLATFORM = "x86_64-kvm_x86_64-r0"
 SONIC_HWSKU = "Force10-S6000"
 SONIC_HWSKU_PATH = f"/usr/share/sonic/device/{SONIC_PLATFORM}/{SONIC_HWSKU}"
 SONIC_PORT_CONFIG_PATH = f"{SONIC_HWSKU_PATH}/port_config.ini"
 SONIC_LANEMAP_PATH = f"{SONIC_HWSKU_PATH}/lanemap.ini"
 SONIC_PORT_COUNTER_INTERVAL_MS = 10_000
+# PID namespace init ignores default-action SIGTERM unless it installs a
+# handler. Keep this wrapper minimal, but explicitly handle Docker's stop
+# signals before waiting on the idle child.
+SONIC_PID1_COMMAND = "-c \"trap 'exit 0' TERM INT; sleep infinity & wait $!\""
 _TOPOLOGY_RESOURCES = files("netopsbench.platform.topology")
 SONIC_BASE_CONFIG_DB = _TOPOLOGY_RESOURCES.joinpath("sonic_vs_base_config_db.json")
 SONIC_START_WRAPPER_SOURCE = _TOPOLOGY_RESOURCES.joinpath("sonic_start.sh")
@@ -35,13 +48,15 @@ class TopologyConfig:
     clients_per_leaf: int = 1
     nos_kind: str = "sonic-vs"
     nos_image: str = DEFAULT_SONIC_VS_IMAGE
-    client_image: str = DEFAULT_CLIENT_IMAGE
+    client_image: str = field(default_factory=lambda: os.environ.get("NETOPSBENCH_CLIENT_IMAGE", DEFAULT_CLIENT_IMAGE))
     mgmt_ipv4_subnet: str = "172.20.20.0/24"
     mgmt_network_name: str | None = None
     collector_ip: str | None = None
     spine_asn: int = 65001
     leaf_asn_start: int = 65011
+    purpose: Literal["benchmark", "validation"] = "benchmark"
     scale_name: str | None = None
+    pingmesh_policy: PingmeshPolicy | None = None
 
 
 @dataclass
@@ -52,15 +67,15 @@ class FatTreeConfig:
     name: str = "dcn"
     nos_kind: str = "sonic-vs"
     nos_image: str = DEFAULT_SONIC_VS_IMAGE
-    client_image: str = DEFAULT_CLIENT_IMAGE
+    client_image: str = field(default_factory=lambda: os.environ.get("NETOPSBENCH_CLIENT_IMAGE", DEFAULT_CLIENT_IMAGE))
     mgmt_ipv4_subnet: str = "172.20.20.0/24"
     mgmt_network_name: str | None = None
     collector_ip: str | None = None
-    core_asn_start: int = 65001
-    agg_asn_start: int = 65101
-    edge_asn_start: int = 65201
+    asn_base: int = 65001
     clients_per_edge: int | None = None
+    purpose: Literal["benchmark", "validation"] = "benchmark"
     scale_name: str | None = None
+    pingmesh_policy: PingmeshPolicy | None = None
 
     def __post_init__(self) -> None:
         if self.k < 2 or self.k % 2 != 0:
@@ -110,6 +125,8 @@ def _clos_config_from_profile(profile: ScaleProfile) -> TopologyConfig:
         clients_per_leaf=profile.clients_per_attached_switch,
         mgmt_ipv4_subnet=_topology_mgmt_subnet(profile),
         scale_name=profile.name,
+        purpose=profile.purpose,
+        pingmesh_policy=pingmesh_policy_for_profile(profile),
     )
 
 
@@ -119,11 +136,13 @@ def _fat_tree_config_from_profile(profile: ScaleProfile) -> FatTreeConfig:
         clients_per_edge=profile.clients_per_attached_switch,
         mgmt_ipv4_subnet=_topology_mgmt_subnet(profile),
         scale_name=profile.name,
+        purpose=profile.purpose,
+        pingmesh_policy=pingmesh_policy_for_profile(profile),
     )
 
 
-def config_for_scale(scale: str) -> TopologyConfig | FatTreeConfig:
-    profile = get_scale_profile(scale)
+def config_for_scale(scale: str, registry: ScaleRegistry | None = None) -> TopologyConfig | FatTreeConfig:
+    profile = get_scale_profile(scale, registry)
     if profile.family == "clos":
         return _clos_config_from_profile(profile)
     return _fat_tree_config_from_profile(profile)
@@ -135,6 +154,7 @@ __all__ = [
     "SONIC_BASE_CONFIG_DB",
     "SONIC_HWSKU",
     "SONIC_LANEMAP_PATH",
+    "SONIC_PID1_COMMAND",
     "SONIC_PLATFORM",
     "SONIC_PORT_COUNTER_INTERVAL_MS",
     "SONIC_PORT_CONFIG_PATH",

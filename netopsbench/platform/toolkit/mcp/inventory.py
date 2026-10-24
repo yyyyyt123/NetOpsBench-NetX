@@ -7,9 +7,11 @@ def get_topology():
     return as_payload(get_toolkit().get_topology())
 
 
-def get_device_interfaces(device: str, format: str = "summary"):
+def get_device_interfaces(device: str, format: str = "summary", interface: str | None = None, include_tc: bool = False):
     """Get interface state and counters for a device."""
-    return as_payload(get_toolkit().get_device_interfaces(device=device, format=format))
+    return as_payload(
+        get_toolkit().get_device_interfaces(device=device, format=format, interface=interface, include_tc=include_tc)
+    )
 
 
 def get_bgp_neighbors(device: str, format: str = "structured"):
@@ -17,9 +19,9 @@ def get_bgp_neighbors(device: str, format: str = "structured"):
     return as_payload(get_toolkit().get_bgp_neighbors(device=device, format=format))
 
 
-def get_bgp_neighbor(device: str, peer: str):
+def get_bgp_neighbor(device: str, peer: str, view: str = "detail", prefix: str | None = None):
     """Get live detail for one BGP neighbor on one network device."""
-    return as_payload(get_toolkit().get_bgp_neighbor(device=device, peer=peer))
+    return as_payload(get_toolkit().get_bgp_neighbor(device=device, peer=peer, view=view, prefix=prefix))
 
 
 def get_route_table(
@@ -28,6 +30,7 @@ def get_route_table(
     format: str = "structured",
     max_routes: int = 100,
     max_lines: int = 500,
+    view: str = "frr",
 ):
     """Get route table for a device, optionally filtered by prefix."""
     return as_payload(
@@ -35,6 +38,7 @@ def get_route_table(
             device=device,
             prefix=prefix,
             format=format,
+            view=view,
             max_routes=max_routes,
             max_lines=max_lines,
         )
@@ -56,7 +60,13 @@ def get_device_acl(device: str, view: str = "summary", max_lines: int = 300):
     return as_payload(get_toolkit().get_device_acl(device=device, view=view, max_lines=max_lines))
 
 
+def get_device_status(device: str):
+    """Read node runtime, accessibility and supported service states."""
+    return as_payload(get_toolkit().get_device_status(device=device))
+
+
 TOOL_SPECS = [
+    ToolSpec(name="get_device_status", group="inventory", handler=get_device_status),
     ToolSpec(name="get_topology", group="inventory", handler=get_topology),
     ToolSpec(name="get_device_interfaces", group="inventory", handler=get_device_interfaces),
     ToolSpec(name="get_bgp_neighbors", group="inventory", handler=get_bgp_neighbors),

@@ -8,10 +8,9 @@
 #   bash scripts/run_all_benchmarks.sh          # 前台跑
 #
 # 每个 scale 使用不同并发 worker 数:
-#   xs:     3 workers  (14 scenarios, 3×6=18 containers)
-#   small:  3 workers  (15 scenarios, 3×14=42 containers)
-#   medium: 2 workers  (28 scenarios, 2×28=56 containers)
-#   large:  2 workers  (52 scenarios, 2×84=168 containers)
+#   xs:     3 workers  (4 validation scenarios, 3×6=18 containers)
+#   medium: 2 workers  (64 scenarios, 2×28=56 containers)
+#   large:  2 workers  (64 scenarios, 2×84=168 containers)
 #   xlarge/fat-tree: 1 worker by default
 #
 # 跑完后汇总 CSV 写入 scenario_results/benchmark_summary_<ts>.csv
@@ -32,15 +31,15 @@ VENDOR="${BENCH_VENDOR:-minimax}"
 # BENCH_WORKERS_LARGE=4 bash scripts/run_all_benchmarks.sh
 declare -A SCALE_WORKERS=(
     [xs]="${BENCH_WORKERS_XS:-3}"
-    [small]="${BENCH_WORKERS_SMALL:-3}"
     [medium]="${BENCH_WORKERS_MEDIUM:-2}"
     [large]="${BENCH_WORKERS_LARGE:-2}"
     [xlarge]="${BENCH_WORKERS_XLARGE:-1}"
     [fat-tree-k8]="${BENCH_WORKERS_FAT_TREE_K8:-1}"
     [fat-tree-k12]="${BENCH_WORKERS_FAT_TREE_K12:-1}"
+    [fat-tree-k18]="${BENCH_WORKERS_FAT_TREE_K18:-1}"
 )
-# Ordered list of scales to run (override with BENCH_SCALES="xs small")
-IFS=' ' read -ra SCALES <<< "${BENCH_SCALES:-xs small medium large}"
+# Ordered list of scales to run (override with BENCH_SCALES="medium large")
+IFS=' ' read -ra SCALES <<< "${BENCH_SCALES:-medium large}"
 
 # 加载 API keys
 set -a
@@ -56,31 +55,6 @@ list_run_dirs() {
     local runs_dir="$REPO_ROOT/.netopsbench/runs"
     [ -d "$runs_dir" ] || return 0
     find "$runs_dir" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort
-}
-
-# ── Helper: clean all clab resources ────────────────────────
-cleanup_clab() {
-    # Preserve worker deploy logs before cleaning runtimes
-    local runtime_logs_dir="$REPO_ROOT/.netopsbench/runtimes"
-    if [ -d "$runtime_logs_dir" ] && [ -n "${LOG_DIR:-}" ]; then
-        for logdir in "$runtime_logs_dir"/*/logs; do
-            [ -d "$logdir" ] && cp -a "$logdir" "${LOG_DIR}/$(basename "$(dirname "$logdir")")_deploy_logs" 2>/dev/null || true
-        done
-    fi
-    for cid in $(sudo docker ps -aq --filter "name=clab-" 2>/dev/null); do
-        sudo docker rm -f "$cid" &>/dev/null || true
-    done
-    # Also remove worker telegraf containers (not prefixed with clab-)
-    for cid in $(sudo docker ps -aq --filter "name=telegraf-" 2>/dev/null); do
-        sudo docker rm -f "$cid" &>/dev/null || true
-    done
-    for net in $(sudo docker network ls --filter "name=clab-mgmt-" -q 2>/dev/null); do
-        for ep in $(sudo docker network inspect "$net" --format '{{range .Containers}}{{.Name}} {{end}}' 2>/dev/null); do
-            sudo docker network disconnect -f "$net" "$ep" &>/dev/null || true
-        done
-        sudo docker network rm "$net" &>/dev/null || true
-    done
-    sudo rm -rf "$REPO_ROOT/.netopsbench/runtimes/"* 2>/dev/null || true
 }
 
 # ── 执行计划 ────────────────────────────────────────────────
@@ -99,16 +73,14 @@ echo " Total:   ${total_scenarios} scenarios"
 echo " Logs:    ${LOG_DIR}"
 echo "======================================================"
 
-# Clean stale runtime data. Run artifacts are preserved by default so traces
-# remain available across benchmark invocations.
+# Run artifacts are preserved by default so traces remain available across
+# benchmark invocations. Runtime resources remain SDK-owned.
 if [[ "${BENCH_CLEAN_RUNS:-0}" == "1" ]]; then
     echo "Cleaning previous run artifacts because BENCH_CLEAN_RUNS=1"
     sudo rm -rf "$REPO_ROOT/.netopsbench/runs/"* 2>/dev/null || true
 else
     echo "Preserving previous run artifacts in ${REPO_ROOT}/.netopsbench/runs"
 fi
-cleanup_clab
-
 # ── 逐 scale 执行 ──────────────────────────────────────────
 failed=0
 for scale in "${SCALES[@]}"; do
@@ -128,6 +100,10 @@ for scale in "${SCALES[@]}"; do
         run_status="completed"
     else
         echo "[$(date '+%H:%M:%S')]  ✗  ${label} — 失败 (see ${log_file})"
+        echo "[$(date '+%H:%M:%S')]     SDK teardown may have left an owned runtime; inspect with:"
+        echo "[$(date '+%H:%M:%S')]     netopsbench --workspace \"$REPO_ROOT\" runtime list"
+        echo "[$(date '+%H:%M:%S')]     If needed, teardown only the listed benchmark runtime:"
+        echo "[$(date '+%H:%M:%S')]     netopsbench --workspace \"$REPO_ROOT\" runtime teardown <runtime-name>"
         failed=$((failed + 1))
         run_status="failed"
     fi
@@ -166,8 +142,6 @@ PYEOF
         echo "[$(date '+%H:%M:%S')]     no new run artifact detected for ${label}"
     fi
 
-    # Clean up between scales
-    cleanup_clab
 done
 
 echo ""
@@ -183,6 +157,7 @@ SUMMARY_CSV="${REPO_ROOT}/scenario_results/benchmark_summary_${TIMESTAMP}.csv"
 import json, sys, csv
 from pathlib import Path
 from datetime import datetime
+from netopsbench.models.profiles import get_scale_profile, supported_scales
 
 repo = Path(sys.argv[1])
 ts = sys.argv[2]
@@ -234,10 +209,16 @@ for rj in report_paths:
         if not sid:
             raw_ids = (data.get("raw") or {}).get("scenario_ids") or []
             sid = raw_ids[0] if raw_ids else ""
-        for sc in ("xs", "small", "medium", "large", "xlarge", "fat-tree-k8", "fat-tree-k12"):
+        for sc in supported_scales():
             if f"_{sc}_" in sid:
                 scale = sc
                 break
+
+    if s.get("included_in_benchmark") is False or (
+        scale in supported_scales() and get_scale_profile(scale).purpose == "validation"
+    ):
+        print(f"Validation result preserved, excluded from benchmark CSV: {rj}")
+        continue
 
     reports.append({
         "run_dir": str(rj.parent.relative_to(results_dir)),
@@ -270,7 +251,7 @@ if not reports:
     sys.exit(0)
 
 # Sort by vendor, scale
-scale_order = {"xs": 0, "small": 1, "medium": 2, "large": 3, "xlarge": 4, "fat-tree-k8": 5, "fat-tree-k12": 6}
+scale_order = {scale: index for index, scale in enumerate(supported_scales())}
 reports.sort(key=lambda r: (r["vendor"], scale_order.get(r["scale"], 99), r["started_at"]))
 
 # Write CSV

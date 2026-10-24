@@ -4,9 +4,14 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import signal
 import subprocess
+import time
 from collections.abc import Sequence
 from pathlib import Path
+
+from .control import OperationControl, current_operation_control
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +20,16 @@ logger = logging.getLogger(__name__)
 # operations (lab deploy, telegraf install) should pass an explicit larger
 # timeout or ``None``.
 DEFAULT_SUBPROCESS_TIMEOUT_SECONDS = 120
+_SECRET_ASSIGNMENT = re.compile(r"""(?ix)
+    \b([A-Z0-9_]*(?:TOKEN|PASSWORD|SECRET|API_KEY)[A-Z0-9_]*)
+    =
+    (?:'[^']*'|"[^"]*"|[^\s;]+)
+    """)
+
+
+def _redacted_command(cmd: Sequence[str]) -> str:
+    rendered = " ".join(str(part) for part in cmd)
+    return _SECRET_ASSIGNMENT.sub(r"\1=<redacted>", rendered)
 
 
 def sudo_prefix() -> list[str]:
@@ -54,11 +69,12 @@ def safe_run(
     check: bool = False,
     capture_output: bool = True,
     text: bool = True,
-    cwd: str | None = None,
+    cwd: str | os.PathLike[str] | None = None,
     env: dict | None = None,
     input: str | None = None,
     stdout=None,
     stderr=None,
+    control: OperationControl | None = None,
 ) -> subprocess.CompletedProcess:
     """Run a subprocess with a sane default timeout and structured logging.
 
@@ -120,11 +136,60 @@ def safe_run(
             input=input,
         )
     try:
+        control = control or current_operation_control()
+        if control is not None:
+            return _controlled_run(cmd_list, run_kwargs, control)
         return subprocess.run(cmd_list, **run_kwargs)
     except subprocess.TimeoutExpired:
         logger.error(
             "subprocess timed out after %ss: %s",
             timeout,
-            " ".join(str(part) for part in cmd_list),
+            _redacted_command(cmd_list),
         )
         raise
+
+
+def _controlled_run(cmd: list[str], kwargs: dict, control: OperationControl) -> subprocess.CompletedProcess:
+    """Own and reap a process group on cancellation or deadline expiry."""
+    timeout = control.remaining(kwargs.pop("timeout"))
+    deadline = None if timeout is None else time.monotonic() + timeout
+    check = kwargs.pop("check")
+    data = kwargs.pop("input", None)
+    if kwargs.pop("capture_output", False):
+        kwargs.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if data is not None:
+        kwargs["stdin"] = subprocess.PIPE
+    with subprocess.Popen(cmd, start_new_session=True, **kwargs) as process:
+        try:
+            first = True
+            while True:
+                control.remaining()
+                remaining = None if deadline is None else deadline - time.monotonic()
+                if remaining is not None and remaining <= 0:
+                    raise subprocess.TimeoutExpired(cmd, timeout)
+                try:
+                    stdout, stderr = process.communicate(
+                        input=data if first else None,
+                        timeout=min(0.2, remaining) if remaining is not None else 0.2,
+                    )
+                    break
+                except subprocess.TimeoutExpired:
+                    first = False
+        except BaseException:
+            # Descendants may outlive the group leader; signal the owned group.
+            for sig in (signal.SIGTERM, signal.SIGKILL):
+                try:
+                    os.killpg(process.pid, sig)
+                except ProcessLookupError:
+                    pass
+                if sig == signal.SIGTERM:
+                    try:
+                        process.communicate(timeout=1)
+                    except subprocess.TimeoutExpired:
+                        pass
+            process.communicate()
+            raise
+        result = subprocess.CompletedProcess(cmd, process.returncode, stdout, stderr)
+        if check and result.returncode:
+            raise subprocess.CalledProcessError(result.returncode, cmd, stdout, stderr)
+        return result

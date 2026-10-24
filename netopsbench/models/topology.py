@@ -1,14 +1,15 @@
-"""Canonical, persisted topology schemas and the legacy agent projection."""
+"""Canonical persisted topology schemas and family-correct agent projection."""
 
 from __future__ import annotations
 
 from enum import StrEnum
-from math import ceil
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SCHEMA_VERSION: Literal["3"] = "3"
+from .pingmesh import PingmeshPlan
+
+SCHEMA_VERSION: Literal["4"] = "4"
 DEFAULT_LINK_MTU = 9232
 DEFAULT_SONIC_PORT_MTU = 9100
 
@@ -62,25 +63,12 @@ class Collector(_PersistedModel):
 
 
 class PingmeshPolicy(_PersistedModel):
+    cross_rack_pairs: int | None = Field(default=None, ge=1)
     destination_batch_size: int | None = Field(default=None, ge=1)
     rtt_port_pool_size: int = Field(default=16, ge=1)
     rtt_ports_per_cycle: int = Field(default=4, ge=1)
     cycle_interval_seconds: int = Field(default=1, ge=1)
     df_payload_size: int = Field(default=DEFAULT_SONIC_PORT_MTU - 28, ge=1)
-
-    def destination_batch_count(self, client_count: int) -> int:
-        destinations = max(0, int(client_count) - 1)
-        batch_size = self.destination_batch_size or max(1, destinations)
-        return max(1, ceil(destinations / batch_size))
-
-    def port_batch_count(self) -> int:
-        return max(1, ceil(self.rtt_port_pool_size / self.rtt_ports_per_cycle))
-
-    def coverage_epoch_cycles(self, client_count: int) -> int:
-        return self.destination_batch_count(client_count) * self.port_batch_count()
-
-    def coverage_epoch_seconds(self, client_count: int) -> int:
-        return self.coverage_epoch_cycles(client_count) * self.cycle_interval_seconds
 
 
 class TopologyDefaults(_PersistedModel):
@@ -114,16 +102,17 @@ class RoutingMetadata(_PersistedModel):
     edge_asn_range: str | None = None
     ecmp_hash_policy_by_role: dict[DeviceRole, Literal[0, 1]]
     ecmp: bool = True
-    bfd: bool = True
+    bfd: bool = False
 
 
 class TopologyManifest(_PersistedModel):
     """Versioned canonical topology, independent from runtime metadata formats."""
 
-    schema_version: Literal["3"] = SCHEMA_VERSION
+    schema_version: Literal["4"] = SCHEMA_VERSION
     topology_id: str
     name: str
     scale: str
+    purpose: Literal["benchmark", "validation"] = "benchmark"
     family: Literal["clos", "fat-tree"]
     management: Management
     collector: Collector
@@ -134,11 +123,31 @@ class TopologyManifest(_PersistedModel):
     routing: RoutingMetadata
     pingmesh: PingmeshPolicy = Field(default_factory=PingmeshPolicy)
 
+    pingmesh_plan: PingmeshPlan | None = None
+
+    def require_pingmesh_plan(self) -> PingmeshPlan:
+        if self.pingmesh_plan is None:
+            raise ValueError("Missing compiled Pingmesh plan; regenerate topology.json")
+        return self.pingmesh_plan
+
     @model_validator(mode="after")
     def _validate_topology_references(self) -> TopologyManifest:
         names = [device.name for device in self.devices]
         if len(names) != len(set(names)):
             raise ValueError("device names must be unique")
+        for field_name in ("mgmt_ip", "data_ip", "router_id"):
+            seen: set[str] = set()
+            duplicates: set[str] = set()
+            for device in self.devices:
+                value = getattr(device, field_name)
+                if value is None:
+                    continue
+                normalized = str(value)
+                if normalized in seen:
+                    duplicates.add(normalized)
+                seen.add(normalized)
+            if duplicates:
+                raise ValueError(f"{field_name} values must be unique: {', '.join(sorted(duplicates))}")
 
         devices_by_name = {device.name: device for device in self.devices}
         switch_roles = {device.role for device in self.switches()}
@@ -195,18 +204,20 @@ class TopologyManifest(_PersistedModel):
         return [device for device in self.switches() if device.name in attached_names]
 
     def to_agent_topology(self) -> dict[str, Any]:
-        """Adapt canonical data to the grouped topology metadata used by agents today."""
-        groups = {
-            "spines": self.devices_by_role(DeviceRole.SPINE),
-            "leafs": self.devices_by_role(DeviceRole.LEAF),
-            "cores": self.devices_by_role(DeviceRole.CORE),
-            "aggs": self.devices_by_role(DeviceRole.AGG),
-            "edges": self.devices_by_role(DeviceRole.EDGE),
-            "clients": self.clients(),
-        }
-        if self.family == "fat-tree":
-            groups["spines"] = groups["cores"]
-            groups["leafs"] = groups["edges"]
+        """Adapt canonical data to family-correct role groups for agents."""
+        if self.family == "clos":
+            groups = {
+                "spines": self.devices_by_role(DeviceRole.SPINE),
+                "leafs": self.devices_by_role(DeviceRole.LEAF),
+                "clients": self.clients(),
+            }
+        else:
+            groups = {
+                "cores": self.devices_by_role(DeviceRole.CORE),
+                "aggs": self.devices_by_role(DeviceRole.AGG),
+                "edges": self.devices_by_role(DeviceRole.EDGE),
+                "clients": self.clients(),
+            }
 
         projected: dict[str, Any] = {
             "name": self.name,
@@ -220,8 +231,7 @@ class TopologyManifest(_PersistedModel):
                 "link_mtu_scope": "containerlab/client link MTU",
                 "sonic_port_mtu_scope": "SONiC front-panel interface MTU",
                 "note": (
-                    "Do not compare link_mtu 9232 directly against healthy SONiC port MTU 9100 "
-                    "when diagnosing faults."
+                    "Do not compare link_mtu 9232 directly against healthy SONiC port MTU 9100 when diagnosing faults."
                 ),
             },
             "scale": self._agent_scale_facts(),
@@ -237,13 +247,7 @@ class TopologyManifest(_PersistedModel):
             ],
             "routing": self.routing.model_dump(mode="json", exclude_none=True),
         }
-        projected["pingmesh"] = {
-            **self.pingmesh.model_dump(mode="json"),
-            "destination_batch_count": self.pingmesh.destination_batch_count(self.facts.total_clients),
-            "port_batch_count": self.pingmesh.port_batch_count(),
-            "coverage_epoch_cycles": self.pingmesh.coverage_epoch_cycles(self.facts.total_clients),
-            "coverage_epoch_seconds": self.pingmesh.coverage_epoch_seconds(self.facts.total_clients),
-        }
+        projected["pingmesh"] = self.require_pingmesh_plan().summary()
         if self.family == "fat-tree":
             projected["fat_tree_k"] = self.facts.fat_tree_k
         return projected
@@ -269,17 +273,16 @@ class TopologyManifest(_PersistedModel):
             "host_density": self.facts.host_density,
             "total_clients": self.facts.total_clients,
             "total_devices": self.facts.total_switches,
-            "num_spines": self.facts.num_cores,
-            "num_leafs": self.facts.num_edges,
         }
 
     def _device_to_agent_entry(self, device: Device) -> dict[str, Any]:
         entry = device.model_dump(exclude={"role", "metadata"}, exclude_none=True, mode="json")
         entry.update({key: value for key, value in device.metadata.items() if key not in Device.model_fields})
         if device.role is DeviceRole.CLIENT and device.attached_switch:
-            entry["leaf"] = device.attached_switch
             if self.family == "fat-tree":
                 entry["edge"] = device.attached_switch
+            else:
+                entry["leaf"] = device.attached_switch
         return entry
 
 

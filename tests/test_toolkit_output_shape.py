@@ -17,7 +17,7 @@ def _toolkit() -> AgentToolkit:
 def test_toolkit_keeps_canonical_state_and_projects_public_topology(monkeypatch):
     toolkit = _toolkit()
 
-    assert toolkit.topology_metadata["schema_version"] == "3"
+    assert toolkit.topology_metadata["schema_version"] == "4"
     assert isinstance(toolkit.topology_metadata["devices"], list)
 
     public_topology = toolkit.get_topology()
@@ -59,12 +59,60 @@ def test_get_device_logs_can_include_raw_csv(monkeypatch):
     assert result.data["raw_csv"] == csv_text
 
 
+def test_get_device_logs_uses_explicit_episode_window(monkeypatch):
+    toolkit = _toolkit()
+    queries = []
+
+    def fake_query(*args, **kwargs):
+        queries.append(args[-1])
+        return FluxQueryResult(status="ok", text="")
+
+    monkeypatch.setattr("netopsbench.platform.toolkit._core.device.log_ops.query_flux", fake_query)
+    monkeypatch.setattr(
+        "netopsbench.platform.toolkit._core.device.log_ops.get_device_logs_fallback",
+        lambda *args, **kwargs: [],
+    )
+
+    result = toolkit.get_device_logs(
+        "leaf1",
+        start_time="2026-05-04T00:00:00Z",
+        end_time="2026-05-04T00:01:00Z",
+    )
+
+    assert result.success is True
+    assert 'range(start: time(v: "2026-05-04T00:00:00Z"), stop: time(v: "2026-05-04T00:01:00Z"))' in queries[0]
+    assert result.data["time_scope"] == {
+        "mode": "absolute",
+        "source": "explicit",
+        "start_time": "2026-05-04T00:00:00Z",
+        "end_time": "2026-05-04T00:01:00Z",
+    }
+
+
+def test_get_device_logs_requires_complete_valid_episode_window():
+    toolkit = _toolkit()
+
+    missing_end = toolkit.get_device_logs("leaf1", start_time="2026-05-04T00:00:00Z")
+    reversed_window = toolkit.get_device_logs(
+        "leaf1",
+        start_time="2026-05-04T00:01:00Z",
+        end_time="2026-05-04T00:00:00Z",
+    )
+
+    assert missing_end.success is False
+    assert "provided together" in missing_end.error
+    assert reversed_window.success is False
+    assert "earlier" in reversed_window.error
+
+
 def test_get_device_interfaces_summary_keeps_diagnostic_fields(monkeypatch):
     toolkit = _toolkit()
 
     def fake_exec(container, cmd_args, timeout):
         command = " ".join(cmd_args)
-        if "status" in command:
+        if cmd_args[:3] == ["ip", "-j", "-4"]:
+            stdout = '[{"ifname":"Ethernet0", "addr_info":[{"local":"10.0.0.1", "prefixlen":30}]}]'
+        elif "status" in command:
             stdout = "Interface    Admin    Oper    Speed\nEthernet0    up       up      100G\nEthernet4    up       down    100G\n"
         else:
             stdout = "IFACE      RX_ERR    TX_ERR    RX_DRP    TX_DRP\nEthernet0  0         0         0         0\nEthernet4  5         0         2         0\n"
@@ -105,6 +153,24 @@ def test_get_device_config_truncates_with_metadata(monkeypatch):
     assert result.data["truncated"] is True
     assert result.data["returned_lines"] == 2
     assert result.data["total_lines"] == 5
+
+
+def test_config_section_filter_preserves_nested_frr_blocks_without_unsupported_pipe(monkeypatch):
+    toolkit = _toolkit()
+    monkeypatch.setattr(toolkit, "_resolve_container", lambda device: "clab-dcn-leaf1")
+    config = "interface Ethernet0\n ip address 10.0.0.1/31\n!\nrouter bgp 65001\n neighbor 10.0.0.0 remote-as 65002\n !\n address-family ipv4 unicast\n exit-address-family\n!\nroute-map ALLOW permit 10\n!\n"
+
+    def execute(container, cmd_args, timeout):
+        assert cmd_args == ["vtysh", "-c", "show running-config"]
+        return subprocess.CompletedProcess(cmd_args, 0, config, "")
+
+    monkeypatch.setattr(toolkit, "_docker_exec", execute)
+    result = toolkit.get_device_config("leaf1", section="router bgp")
+    assert result.success
+    assert "remote-as 65002" in result.data["config"]
+    assert "address-family ipv4" in result.data["config"]
+    assert "interface Ethernet0" not in result.data["config"]
+    assert "route-map ALLOW" not in result.data["config"]
 
 
 def test_get_device_acl_respects_view(monkeypatch):

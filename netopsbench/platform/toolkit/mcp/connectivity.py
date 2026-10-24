@@ -2,19 +2,19 @@ from .context import as_payload, get_toolkit
 from .contracts import ToolSpec
 
 
-def traceroute(src: str, dst_ip: str):
-    """Run traceroute from any network device (client, leaf, or spine) to a destination IP."""
-    return as_payload(get_toolkit().traceroute(src=src, dst_ip=dst_ip))
+def traceroute(src: str, dst_ip: str, max_hops: int = 8):
+    """Run traceroute from a client device to a destination IP."""
+    return as_payload(get_toolkit().traceroute(src=src, dst_ip=dst_ip, max_hops=max_hops))
 
 
 def ping_test(
     src: str,
     dst_ip: str,
     count: int = 5,
-    payload_size: int = None,
+    payload_size: int | None = None,
     dont_fragment: bool = False,
 ):
-    """Run ping test from any network device (client, leaf, or spine) to a destination IP."""
+    """Run ping test from any topology device to a destination IP."""
     return as_payload(
         get_toolkit().ping_test(
             src=src,

@@ -21,7 +21,7 @@ def _coerce_value(value: Any) -> Any:
         return text
 
 
-def parse_bgp_summary(text: str) -> list[dict[str, Any]]:
+def parse_bgp_summary(text: str, *, strict: bool = False) -> list[dict[str, Any]]:
     """Return normalized neighbor rows from ``show ip bgp summary`` output."""
     lines = [line.rstrip() for line in text.splitlines() if line.strip()]
     header_index = next(
@@ -29,6 +29,8 @@ def parse_bgp_summary(text: str) -> list[dict[str, Any]]:
         None,
     )
     if header_index is None:
+        if strict:
+            raise ValueError("BGP summary header is unavailable")
         return []
 
     headers = lines[header_index].split()
@@ -45,13 +47,14 @@ def parse_bgp_summary(text: str) -> list[dict[str, Any]]:
             parts = parts[: len(headers) - 1] + [" ".join(parts[len(headers) - 1 :])]
         row = {_normalize_key(key): value for key, value in zip(headers, parts, strict=False)}
         state_value = row.get("state_pfxrcd")
-        established = state_value is not None and str(state_value).isdigit()
+        state_text = str(state_value) if state_value is not None else ""
+        established = state_text.isdigit()
         rows.append(
             {
                 "neighbor": row.get("neighbor"),
                 "asn": _coerce_value(row.get("as")),
                 "state": "Established" if established else state_value,
-                "prefixes_received": int(state_value) if established else None,
+                "prefixes_received": int(state_text) if established else None,
                 "up_down": row.get("up_down"),
                 "msg_rcvd": _coerce_value(row.get("msgrcvd")),
                 "msg_sent": _coerce_value(row.get("msgsent")),

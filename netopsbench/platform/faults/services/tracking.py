@@ -7,6 +7,7 @@ from collections.abc import Callable
 from typing import Any
 
 from netopsbench.platform.faults.models import ActiveFault
+from netopsbench.platform.utils.control import current_operation_control
 
 
 class FaultTracker:
@@ -23,21 +24,50 @@ class FaultTracker:
             self.active_faults.append(fault)
         return fault
 
-    def register_background_control(self, control_id: str, *, stop_event: Any, thread: Any) -> None:
+    def track_residual(self, fault_info: dict, error: str) -> ActiveFault:
+        """Track a mutation that could not be verified or fully compensated."""
+        payload = dict(fault_info)
+        payload.update(
+            {
+                "success": False,
+                "error": error,
+                "residual_mutation": True,
+            }
+        )
+        return self.track(payload)
+
+    def register_background_control(
+        self, control_id: str, *, stop_event: Any, thread: Any, controller: Any = None
+    ) -> None:
         with self._lock:
-            self._background_fault_controls[control_id] = {"stop_event": stop_event, "thread": thread}
+            self._background_fault_controls[control_id] = {
+                "stop_event": stop_event,
+                "thread": thread,
+                "controller": controller,
+            }
 
     def stop_background(self, control_id: str, *, join_timeout: float = 1.0) -> bool:
         with self._lock:
-            control = self._background_fault_controls.pop(control_id, None)
+            control = self._background_fault_controls.get(control_id)
         if control is None:
             return True
         stop_event = control.get("stop_event")
         thread = control.get("thread")
         if stop_event is not None:
             stop_event.set()
+        budget = current_operation_control()
+        if budget is not None:
+            try:
+                join_timeout = budget.remaining(join_timeout)
+            except TimeoutError:
+                return False
         if thread is not None and hasattr(thread, "join") and thread is not threading.current_thread():
             thread.join(timeout=join_timeout)
+            if bool(getattr(thread, "is_alive", lambda: False)()):
+                return False
+        with self._lock:
+            if self._background_fault_controls.get(control_id) is control:
+                self._background_fault_controls.pop(control_id, None)
         return True
 
     def remove_faults(self, predicate: Callable[[ActiveFault], bool]) -> None:

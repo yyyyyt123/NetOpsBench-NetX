@@ -13,25 +13,32 @@ from typing import Any, Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field
 
 from netopsbench.config import config
-from netopsbench.models.profiles import get_scale_profile
+from netopsbench.models.profiles import ScaleRegistry, default_scale_registry, get_scale_profile
 from netopsbench.models.runtime import RuntimeIdentity
+from netopsbench.platform.client_agent.deploy import deploy_client_agents
 from netopsbench.platform.observability.lifecycle import ensure_worker_observability
-from netopsbench.platform.pingmesh.deploy import deploy_pingmesh
+from netopsbench.platform.observability.ownership import ManagedBucketRegistry
 from netopsbench.platform.runtime.deployment import (
     allocate_management_subnets,
+    assert_worker_slot_available,
     deploy_worker_lab,
     runtime_deploy_lock,
     teardown_worker_lab,
 )
 from netopsbench.platform.runtime.health import check_worker_health
+from netopsbench.platform.utils.control import OperationControl
 
 logger = logging.getLogger(__name__)
 
 
 class RuntimePoolLike(Protocol):
+    id: str
     scale: str
     root_dir: Path
+    telemetry_ownership_file: Path
     workers: list[RuntimeIdentity]
+    metadata: dict[str, object]
+    _provision_created_buckets: list[str]
 
     @property
     def size(self) -> int: ...
@@ -59,8 +66,8 @@ class RuntimeLifecycleError(RuntimeError):
         super().__init__(f"Runtime lifecycle stage {result.stage!r} failed: {result.error}")
 
 
-def _parallel_job_count(scale: str, total: int) -> int:
-    configured = get_scale_profile(scale).worker_deploy_parallelism
+def _parallel_job_count(scale: str, total: int, registry: ScaleRegistry | None = None) -> int:
+    configured = get_scale_profile(scale, registry).worker_deploy_parallelism
     return max(1, min(total, configured))
 
 
@@ -76,12 +83,21 @@ def _worker_deploy_log_path(worker: RuntimeIdentity, runtime_root: Path | None =
     return runtime_root / "logs" / f"worker_{worker.worker_index:02d}.deploy.log"
 
 
-def deploy_workers(workers: Sequence[RuntimeIdentity], scale: str, runtime_root: Path | None = None) -> None:
+def deploy_workers(
+    workers: Sequence[RuntimeIdentity],
+    scale: str,
+    runtime_root: Path | None = None,
+    scale_registry: ScaleRegistry | None = None,
+    *,
+    control: OperationControl | None = None,
+) -> None:
     if not workers:
         return
-    job_count = _parallel_job_count(scale, len(workers))
+    job_count = _parallel_job_count(scale, len(workers), scale_registry)
 
     def deploy(worker: RuntimeIdentity) -> None:
+        if control is not None:
+            control.remaining()
         logger.info(
             "[Worker Deploy %s/%s] %s subnet=%s",
             worker.worker_index,
@@ -90,7 +106,7 @@ def deploy_workers(workers: Sequence[RuntimeIdentity], scale: str, runtime_root:
             worker.mgmt_subnet,
         )
         _append_worker_log_header(_worker_deploy_log_path(worker, runtime_root), f"worker deploy {worker.lab_name}")
-        deploy_worker_lab(worker, scale)
+        deploy_worker_lab(worker, scale, scale_registry, **({"control": control} if control is not None else {}))
 
     if job_count == 1:
         for worker in workers:
@@ -115,22 +131,37 @@ def deploy_workers(workers: Sequence[RuntimeIdentity], scale: str, runtime_root:
         raise error
 
 
-def ensure_worker_pingmesh(worker: RuntimeIdentity) -> None:
-    deploy_pingmesh(
+def ensure_worker_client_agent(worker: RuntimeIdentity, *, control: OperationControl | None = None) -> None:
+    preflight_errors = check_worker_health(
+        worker,
+        require_client_agent=False,
+        all_routing_devices=True,
+        cancel_event=control.cancel_event if control else None,
+    )
+    if preflight_errors:
+        raise RuntimeError("Network must converge before starting native client agents: " + "; ".join(preflight_errors))
+    deploy_client_agents(
         topology_dir=str(worker.topology_dir),
-        pinglist_file=str(Path(worker.topology_dir) / "configs" / "pingmesh" / "pinglist.json"),
         influxdb_token=config.influxdb_token,
         influxdb_org=config.influxdb_org,
         influxdb_bucket=worker.bucket,
-        topology_id=worker.topology_id,
     )
 
 
-def validate_worker_health(worker: RuntimeIdentity, runtime_root: Path | None = None) -> None:
+def validate_worker_health(
+    worker: RuntimeIdentity,
+    runtime_root: Path | None = None,
+    scale_registry: ScaleRegistry | None = None,
+    *,
+    control: OperationControl | None = None,
+) -> None:
     log_path = _worker_deploy_log_path(worker, runtime_root)
     _append_worker_log_header(log_path, "worker health validation")
     errors = check_worker_health(
         worker,
+        scale_registry=scale_registry,
+        all_routing_devices=True,
+        cancel_event=control.cancel_event if control else None,
     )
     if errors:
         message = "; ".join(errors)
@@ -139,16 +170,53 @@ def validate_worker_health(worker: RuntimeIdentity, runtime_root: Path | None = 
         raise RuntimeError(f"Worker health check failed: {message}")
 
 
-def teardown_workers(workers: Sequence[RuntimeIdentity]) -> None:
+def deploy_worker_transactionally(
+    worker: RuntimeIdentity,
+    scale: str,
+    scale_registry: ScaleRegistry | None = None,
+) -> None:
+    """Deploy one standalone worker with the same compensated lifecycle as pools."""
+    registry = scale_registry or default_scale_registry()
+    deployment_started = False
+    try:
+        with runtime_deploy_lock():
+            assert_worker_slot_available(worker)
+            deployment_started = True
+            deploy_worker_lab(worker, scale, registry)
+        ensure_worker_observability(worker)
+        ensure_worker_client_agent(worker)
+        validate_worker_health(worker, scale_registry=registry)
+    except Exception as provision_error:
+        if not deployment_started:
+            raise
+        try:
+            teardown_worker_lab(worker, registry)
+        except Exception as cleanup_error:
+            raise RuntimeError(
+                f"Worker provisioning failed ({type(provision_error).__name__}: {provision_error}) "
+                f"and cleanup failed ({type(cleanup_error).__name__}: {cleanup_error})"
+            ) from provision_error
+        raise
+
+
+def teardown_workers(workers: Sequence[RuntimeIdentity], scale_registry: ScaleRegistry | None = None) -> None:
+    failures: list[str] = []
     for worker in workers:
         try:
-            teardown_worker_lab(worker)
-        except Exception:
+            teardown_worker_lab(worker, scale_registry)
+        except Exception as exc:
             logger.warning("worker teardown failed for %s", worker.lab_name, exc_info=True)
+            failures.append(f"{worker.lab_name}: {type(exc).__name__}: {exc}")
+    if failures:
+        raise RuntimeError("Worker teardown failed: " + "; ".join(failures))
 
 
 class RuntimeLifecycle:
     """Execute the fixed runtime lifecycle stages."""
+
+    def __init__(self, scale_registry: ScaleRegistry | None = None):
+        self.scale_registry = scale_registry or default_scale_registry()
+        self.control: OperationControl | None = None
 
     def run(self, stage: str, runtime: RuntimePoolLike) -> LifecycleStageResult:
         operations = {
@@ -166,6 +234,8 @@ class RuntimeLifecycle:
         started_at = datetime.now(UTC)
         started_tick = monotonic()
         try:
+            if self.control is not None:
+                self.control.remaining()
             details = operation(runtime) or {}
         except Exception as exc:
             ended_at = datetime.now(UTC)
@@ -188,38 +258,65 @@ class RuntimeLifecycle:
             details=details,
         )
 
-    @staticmethod
-    def _deploy(runtime: RuntimePoolLike) -> dict[str, Any]:
-        with runtime_deploy_lock():
-            subnets = allocate_management_subnets(runtime.scale, runtime.size)
+    def _deploy(self, runtime: RuntimePoolLike) -> dict[str, Any]:
+        with runtime_deploy_lock(self.control):
+            subnets = allocate_management_subnets(runtime.scale, runtime.size, self.scale_registry)
             runtime.workers = [
                 worker.model_copy(update={"mgmt_subnet": subnets[index]})
                 for index, worker in enumerate(runtime.workers)
             ]
-            deploy_workers(runtime.workers, runtime.scale, runtime.root_dir)
+            for worker in runtime.workers:
+                assert_worker_slot_available(worker)
+            runtime.metadata["deployment_started"] = True
+            deploy_workers(
+                runtime.workers,
+                runtime.scale,
+                runtime.root_dir,
+                self.scale_registry,
+                **({"control": self.control} if self.control is not None else {}),
+            )
         return {"workers": runtime.size}
 
-    @staticmethod
-    def _ensure_observability(runtime: RuntimePoolLike) -> dict[str, Any]:
+    def _ensure_observability(self, runtime: RuntimePoolLike) -> dict[str, Any]:
+        registry = ManagedBucketRegistry(runtime.telemetry_ownership_file)
+        created: list[str] = []
+
+        def record_created(bucket: str) -> None:
+            registry.record_created(bucket, runtime.id)
+            created.append(bucket)
+            runtime._provision_created_buckets.append(bucket)
+
         for worker in runtime.workers:
-            ensure_worker_observability(worker)
+            if self.control is not None:
+                self.control.remaining()
+            ensure_worker_observability(
+                worker,
+                on_bucket_created=record_created,
+            )
+        return {"workers": runtime.size, "created_buckets": created}
+
+    def _ensure_pingmesh(self, runtime: RuntimePoolLike) -> dict[str, Any]:
+        for worker in runtime.workers:
+            ensure_worker_client_agent(worker, **({"control": self.control} if self.control is not None else {}))
         return {"workers": runtime.size}
 
-    @staticmethod
-    def _ensure_pingmesh(runtime: RuntimePoolLike) -> dict[str, Any]:
+    def _warm(self, runtime: RuntimePoolLike) -> dict[str, Any]:
         for worker in runtime.workers:
-            ensure_worker_pingmesh(worker)
-        return {"workers": runtime.size}
+            validate_worker_health(
+                worker,
+                runtime.root_dir,
+                self.scale_registry,
+                **({"control": self.control} if self.control is not None else {}),
+            )
+        return {
+            "workers": runtime.size,
+            "health": "ready",
+            "all_routing_devices": True,
+            "checked_at": datetime.now(UTC).isoformat(),
+        }
 
-    @staticmethod
-    def _warm(runtime: RuntimePoolLike) -> dict[str, Any]:
-        for worker in runtime.workers:
-            validate_worker_health(worker, runtime.root_dir)
-        return {"workers": runtime.size, "health": "ready"}
-
-    @staticmethod
-    def _teardown(runtime: RuntimePoolLike) -> dict[str, Any]:
-        teardown_workers(runtime.workers)
+    def _teardown(self, runtime: RuntimePoolLike) -> dict[str, Any]:
+        teardown_workers(runtime.workers, self.scale_registry)
         return {"workers": runtime.size}
 
 
@@ -227,9 +324,10 @@ __all__ = [
     "LifecycleStageResult",
     "RuntimeLifecycle",
     "RuntimeLifecycleError",
+    "deploy_worker_transactionally",
     "deploy_workers",
     "ensure_worker_observability",
-    "ensure_worker_pingmesh",
+    "ensure_worker_client_agent",
     "teardown_workers",
     "validate_worker_health",
 ]

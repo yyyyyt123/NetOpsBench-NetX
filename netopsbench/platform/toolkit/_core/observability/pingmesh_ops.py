@@ -8,11 +8,23 @@ from ..common import ToolResult
 
 
 class PingmeshOpsMixin:
+    def _pingmesh_plan_filter(self) -> str:
+        plan_id = self.manifest.require_pingmesh_plan().settings.plan_id
+        filters = {"topology_id": self.topology_id, "plan_id": plan_id}
+        clauses = []
+        for tag, value in filters.items():
+            if value:
+                safe = str(value).replace("\\", "\\\\").replace('"', '\\"')
+                clauses.append(f'  |> filter(fn: (r) => r.{tag} == "{safe}")\n')
+        return "".join(clauses)
+
     def get_pingmesh_summary(
         self,
         time_range_minutes: int = 10,
         start_time: str | None = None,
         end_time: str | None = None,
+        src_client: str | None = None,
+        dst_client: str | None = None,
     ) -> ToolResult:
         try:
             time_scope = self._resolve_pingmesh_time_scope(
@@ -20,10 +32,15 @@ class PingmeshOpsMixin:
                 start_time=start_time,
                 end_time=end_time,
             )
-            topology_filter = ""
-            if self.topology_id:
-                safe = str(self.topology_id).replace("\\", "\\\\").replace('"', '\\"')
-                topology_filter = f'  |> filter(fn: (r) => r.topology_id == "{safe}")\n'
+            topology_filter = self._pingmesh_plan_filter()
+            for tag, client in (("src_name", src_client), ("dst_name", dst_client)):
+                if client:
+                    self._validate_device_name(client)
+                    node = self.manifest.device(client)
+                    if node is None or node.role.value != "client":
+                        raise ValueError(f"Unknown client: {client}")
+                    topology_filter += f'  |> filter(fn: (r) => r.{tag} == "{client}")\n'
+
             query = f"""
 from(bucket: "{self.influxdb_bucket}")
 {time_scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "pingmesh")
@@ -32,7 +49,6 @@ from(bucket: "{self.influxdb_bucket}")
   |> aggregateWindow(every: 30s, fn: mean, createEmpty: false)
   |> last()
 """
-
             rows = self._query_influx_rows(query)
             summary: dict[str, dict[str, float | None]] = {}
             for row in rows:
@@ -48,6 +64,7 @@ from(bucket: "{self.influxdb_bucket}")
             return ToolResult(
                 success=True,
                 data={
+                    "plan_id": self.manifest.require_pingmesh_plan().settings.plan_id,
                     "time_scope": {key: value for key, value in time_scope.items() if key != "range_clause"},
                     "path_type_summary": summary,
                     "rows": rows,
@@ -72,10 +89,7 @@ from(bucket: "{self.influxdb_bucket}")
                 end_time=end_time,
             )
             safe_limit = max(1, min(int(limit), 50))
-            topology_filter = ""
-            if self.topology_id:
-                safe = str(self.topology_id).replace("\\", "\\\\").replace('"', '\\"')
-                topology_filter = f'  |> filter(fn: (r) => r.topology_id == "{safe}")\n'
+            topology_filter = self._pingmesh_plan_filter()
             query = f"""
 from(bucket: "{self.influxdb_bucket}")
 {time_scope["range_clause"]}  |> filter(fn: (r) => r._measurement == "pingmesh")
@@ -88,7 +102,6 @@ from(bucket: "{self.influxdb_bucket}")
   |> sort(columns: ["packet_loss", "rtt_p99"], desc: true)
   |> limit(n: {safe_limit})
 """
-
             rows = self._query_influx_rows(query, require_value=False)
             hotspots = []
             for row in rows:
@@ -104,6 +117,7 @@ from(bucket: "{self.influxdb_bucket}")
             return ToolResult(
                 success=True,
                 data={
+                    "plan_id": self.manifest.require_pingmesh_plan().settings.plan_id,
                     "time_scope": {key: value for key, value in time_scope.items() if key != "range_clause"},
                     "limit": safe_limit,
                     "hotspots": hotspots,

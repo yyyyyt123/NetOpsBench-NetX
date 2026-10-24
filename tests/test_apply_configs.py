@@ -1,3 +1,4 @@
+import json
 import subprocess
 
 import pytest
@@ -7,6 +8,18 @@ from netopsbench.platform.runtime import apply_configs
 
 def _completed(args, returncode=0, stdout="", stderr=""):
     return subprocess.CompletedProcess(args=args, returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def _install_probe_transport(monkeypatch, fake_command):
+    from netopsbench.platform.runtime._sonic_probe import probe
+
+    def transport(cmd, **kwargs):
+        assert cmd[:4] == ["docker", "exec", cmd[2], "python3"]
+        request = json.loads(cmd[-1])
+        result = probe(request["services"], request["expected_port_count"], run=fake_command)
+        return _completed(cmd, stdout=json.dumps(result))
+
+    monkeypatch.setattr(apply_configs, "safe_run", transport)
 
 
 def test_wait_for_sonic_requires_configdb_after_vtysh(monkeypatch):
@@ -28,7 +41,7 @@ def test_wait_for_sonic_requires_configdb_after_vtysh(monkeypatch):
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(apply_configs, "docker_prefix", lambda: [])
-    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    _install_probe_transport(monkeypatch, fake_safe_run)
 
     assert apply_configs._wait_for_sonic("spine1", "clab-demo-spine1", max_tries=1, delay=0)
     assert any("sonic-cfggen" in cmd for cmd in calls)
@@ -59,7 +72,7 @@ def test_wait_for_sonic_ignores_fatal_startup_when_services_are_ready(monkeypatc
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(apply_configs, "docker_prefix", lambda: [])
-    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    _install_probe_transport(monkeypatch, fake_safe_run)
 
     assert apply_configs._wait_for_sonic("spine1", "clab-demo-spine1", max_tries=1, delay=0)
     repair_calls = [cmd for cmd in calls if "bash" in cmd and any("start.sh" in part for part in cmd)]
@@ -80,7 +93,7 @@ def test_wait_for_sonic_does_not_repair_fatal_startup_without_configdb(monkeypat
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(apply_configs, "docker_prefix", lambda: [])
-    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    _install_probe_transport(monkeypatch, fake_safe_run)
 
     assert not apply_configs._wait_for_sonic("spine12", "clab-demo-spine12", max_tries=2, delay=0)
     repair_calls = [cmd for cmd in calls if "bash" in cmd and any("start.sh" in part for part in cmd)]
@@ -109,7 +122,7 @@ def test_wait_for_sonic_requires_key_supervisor_services(monkeypatch):
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(apply_configs, "docker_prefix", lambda: [])
-    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    _install_probe_transport(monkeypatch, fake_safe_run)
 
     assert not apply_configs._wait_for_sonic("spine1", "clab-demo-spine1", max_tries=1, delay=0)
 
@@ -130,7 +143,7 @@ def test_wait_for_sonic_requires_complete_counters_port_map(monkeypatch):
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(apply_configs, "docker_prefix", lambda: [])
-    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    _install_probe_transport(monkeypatch, fake_safe_run)
 
     assert not apply_configs._wait_for_sonic(
         "edge1",
@@ -157,7 +170,7 @@ def test_wait_for_sonic_accepts_complete_counters_port_map(monkeypatch):
         raise AssertionError(f"unexpected command: {cmd}")
 
     monkeypatch.setattr(apply_configs, "docker_prefix", lambda: [])
-    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+    _install_probe_transport(monkeypatch, fake_safe_run)
 
     assert apply_configs._wait_for_sonic(
         "edge1",
@@ -211,6 +224,71 @@ def test_apply_single_device_preseed_activates_without_shell_copy(monkeypatch, t
     assert "counterpoll port interval 10000" in joined
     assert "/usr/sbin/telemetry -port 50051 -noTLS -client_auth none" in joined
     assert "pkill -x telemetry" in joined
+
+
+def test_expected_interface_addresses_ignores_marker_keys(tmp_path):
+    config = tmp_path / "config_db.json"
+    config.write_text(
+        ('{"INTERFACE": {' '"Ethernet0": {}, ' '"Ethernet0|10.1.1.2/30": {}, ' '"Ethernet4|10.2.1.2/30": {}' "}}\n"),
+        encoding="utf-8",
+    )
+
+    assert apply_configs._expected_interface_addresses(str(config)) == {
+        "Ethernet0": {"10.1.1.2/30"},
+        "Ethernet4": {"10.2.1.2/30"},
+    }
+
+
+def test_reconcile_preseed_interfaces_repairs_only_missing_kernel_address(monkeypatch, tmp_path):
+    config = tmp_path / "config_db.json"
+    config.write_text(
+        ('{"INTERFACE": {' '"Ethernet0|10.1.1.2/30": {}, ' '"Ethernet4|10.2.1.2/30": {}' "}}\n"),
+        encoding="utf-8",
+    )
+    calls = []
+    inspection_count = 0
+
+    def fake_safe_run(cmd, **kwargs):
+        nonlocal inspection_count
+        calls.append(cmd)
+        if cmd[-4:] == ["ip", "-j", "address", "show"]:
+            inspection_count += 1
+            addresses = [
+                {
+                    "ifname": "Ethernet4",
+                    "addr_info": [{"local": "10.2.1.2", "prefixlen": 30}],
+                }
+            ]
+            if inspection_count > 1:
+                addresses.append(
+                    {
+                        "ifname": "Ethernet0",
+                        "addr_info": [{"local": "10.1.1.2", "prefixlen": 30}],
+                    }
+                )
+            return _completed(cmd, stdout=json.dumps(addresses))
+        return _completed(cmd)
+
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+
+    assert apply_configs._reconcile_preseed_interfaces([], "clab-demo-leaf1", str(config)) == []
+    assert any(cmd[-6:] == ["ip", "link", "set", "dev", "Ethernet0", "up"] for cmd in calls)
+    assert any(cmd[-6:] == ["ip", "address", "replace", "10.1.1.2/30", "dev", "Ethernet0"] for cmd in calls)
+    assert not any("Ethernet4" in cmd and "replace" in cmd for cmd in calls)
+
+
+def test_reconcile_preseed_interfaces_reports_persistent_drift(monkeypatch, tmp_path):
+    config = tmp_path / "config_db.json"
+    config.write_text('{"INTERFACE": {"Ethernet0|10.1.1.2/30": {}}}\n', encoding="utf-8")
+
+    def fake_safe_run(cmd, **kwargs):
+        if cmd[-4:] == ["ip", "-j", "address", "show"]:
+            return _completed(cmd, stdout="[]")
+        return _completed(cmd)
+
+    monkeypatch.setattr(apply_configs, "safe_run", fake_safe_run)
+
+    assert apply_configs._reconcile_preseed_interfaces([], "clab-demo-leaf1", str(config)) == ["Ethernet0|10.1.1.2/30"]
 
 
 def test_apply_single_device_requires_preseed_config(monkeypatch, tmp_path):
@@ -290,3 +368,68 @@ def test_ecmp_hash_policies_reject_preseed_device_missing_from_manifest(tmp_path
 
     with pytest.raises(RuntimeError, match="stale1"):
         apply_configs._ecmp_hash_policies(manifest, ["spine1", "stale1"])
+
+
+@pytest.mark.parametrize(
+    "stdout", ["", "null", "[]", "{}", '{"version":1,"ready":true}', '{"version":1,"ready":true,"checks":[]}']
+)
+def test_readiness_transport_rejects_incomplete_payload(monkeypatch, stdout):
+    monkeypatch.setattr(apply_configs, "safe_run", lambda *a, **k: _completed(a[0], stdout=stdout))
+    assert not apply_configs._sonic_readiness_snapshot([], "container", 8)
+
+
+def test_readiness_uses_one_exec_and_ordered_checks(monkeypatch):
+    from netopsbench.platform.runtime._sonic_probe import probe
+
+    inner = []
+    outer = []
+
+    def run(cmd, **kwargs):
+        inner.append(cmd)
+        text = "redis-server RUNNING\norchagent RUNNING\nzebra RUNNING" if cmd[0] == "supervisorctl" else "8"
+        return _completed(cmd, stdout=text)
+
+    def transport(cmd, **kwargs):
+        outer.append(cmd)
+        req = json.loads(cmd[-1])
+        return _completed(cmd, stdout=json.dumps(probe(req["services"], req["expected_port_count"], run=run)))
+
+    monkeypatch.setattr(apply_configs, "safe_run", transport)
+    assert apply_configs._sonic_readiness_snapshot([], "container", 8)
+    assert len(outer) == 1
+    assert [c[0] for c in inner] == ["sonic-cfggen", "vtysh", "supervisorctl", "sonic-cfggen", "redis-cli"]
+    assert not any("start.sh" in c for c in inner)
+
+
+@pytest.mark.parametrize("failed_index", range(5))
+def test_readiness_probe_timeout_at_every_step(failed_index):
+    from netopsbench.platform.runtime._sonic_probe import probe
+
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if len(calls) - 1 == failed_index:
+            raise subprocess.TimeoutExpired(cmd, 15)
+        return _completed(
+            cmd, stdout="redis-server RUNNING\norchagent RUNNING\nzebra RUNNING" if cmd[0] == "supervisorctl" else "8"
+        )
+
+    assert probe(["redis-server", "orchagent", "zebra"], 8, run=run)["ready"] is False
+    assert len(calls) == failed_index + 1
+
+
+def test_readiness_configdb_can_fail_after_vtysh():
+    from netopsbench.platform.runtime._sonic_probe import probe
+
+    cfg_calls = 0
+
+    def run(cmd, **kwargs):
+        nonlocal cfg_calls
+        if cmd[0] == "sonic-cfggen":
+            cfg_calls += 1
+            return _completed(cmd, returncode=0 if cfg_calls == 1 else 1)
+        return _completed(cmd, stdout="redis-server RUNNING\norchagent RUNNING\nzebra RUNNING")
+
+    assert not probe(["redis-server", "orchagent", "zebra"], run=run)["ready"]
+    assert cfg_calls == 2

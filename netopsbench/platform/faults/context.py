@@ -2,28 +2,26 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from netopsbench.models.profiles import ExperimentProfile, default_experiment_profile
 from netopsbench.models.topology import TopologyManifest
 from netopsbench.platform.topology.topology_utils import clab_container_name
 
 
 @dataclass(frozen=True, slots=True)
-class FaultContext:
-    """The manifest and artifact directory for one fault-injection runtime."""
+class FaultRuntimeContext:
+    """Canonical manifest-derived state shared by fault handlers."""
 
     manifest: TopologyManifest
-    clab_dir: Path
+    topology_dir: Path
+    experiment: ExperimentProfile = field(default_factory=default_experiment_profile)
 
     @property
-    def topology_name(self) -> str:
-        return self.manifest.name
-
-    @property
-    def topology_metadata(self) -> dict[str, Any]:
-        return self.manifest.model_dump(mode="json")
+    def topology_file(self) -> Path:
+        return self.topology_dir / f"{self.manifest.name}.clab.yaml"
 
     @property
     def container_names(self) -> dict[str, str]:
@@ -31,16 +29,16 @@ class FaultContext:
 
     @property
     def clients(self) -> list[dict[str, Any]]:
-        return list(self.manifest.to_agent_topology()["devices"]["clients"])
+        return [client.model_dump(mode="json") for client in self.manifest.clients()]
 
     @property
     def clients_by_leaf(self) -> dict[str, list[dict[str, Any]]]:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for client in self.clients:
-            attached_switch = str(client.get("leaf") or "").strip()
+            attached_switch = str(client.get("attached_switch") or "").strip()
             if attached_switch:
                 grouped.setdefault(attached_switch, []).append(client)
         return grouped
 
 
-__all__ = ["FaultContext"]
+__all__ = ["FaultRuntimeContext"]

@@ -19,6 +19,7 @@ from pathlib import Path
 from netopsbench.models.topology import DeviceRole, TopologyManifest
 from netopsbench.platform.topology.config import SONIC_PORT_COUNTER_INTERVAL_MS
 from netopsbench.platform.topology.topology_utils import clab_container_name, load_topology_manifest
+from netopsbench.platform.utils.control import OperationControl
 from netopsbench.platform.utils.proc import docker_prefix, safe_run
 
 _REQUIRED_SONIC_SERVICES = ("redis-server", "orchagent", "zebra")
@@ -49,6 +50,27 @@ def _expected_port_count(config_file: str) -> int:
         return 0
     ports = payload.get("PORT")
     return len(ports) if isinstance(ports, dict) else 0
+
+
+def _expected_interface_addresses(config_file: str) -> dict[str, set[str]]:
+    """Return interface addresses declared by the preseeded ConfigDB."""
+    try:
+        with open(config_file, encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    interfaces = payload.get("INTERFACE")
+    if not isinstance(interfaces, dict):
+        return {}
+
+    expected: dict[str, set[str]] = {}
+    for key in interfaces:
+        if not isinstance(key, str) or "|" not in key:
+            continue
+        interface, address = key.split("|", 1)
+        if interface and address:
+            expected.setdefault(interface, set()).add(address)
+    return expected
 
 
 def _startup_wrapper_file(topology_dir: str) -> str:
@@ -85,92 +107,35 @@ def _ecmp_hash_policies(manifest: TopologyManifest, devices: list[str]) -> dict[
     return policies
 
 
-def _configdb_ready(prefix: list[str], container: str) -> bool:
-    try:
-        configdb_ret = safe_run(
-            [
-                *prefix,
-                "docker",
-                "exec",
-                container,
-                "sonic-cfggen",
-                "-d",
-                "-v",
-                "DEVICE_METADATA.localhost.hostname",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired:
-        return False
-    return configdb_ret.returncode == 0
-
-
-def _startup_status(prefix: list[str], container: str) -> str | None:
+def _sonic_readiness_snapshot(
+    prefix: list[str], container: str, expected_port_count: int | None, *, control: OperationControl | None = None
+) -> bool:
+    """Run the existing ordered checks using a single container process."""
+    source = Path(__file__).with_name("_sonic_probe.py").read_text(encoding="utf-8")
+    request = json.dumps({"services": _REQUIRED_SONIC_SERVICES, "expected_port_count": expected_port_count})
     try:
         ret = safe_run(
-            [*prefix, "docker", "exec", container, "supervisorctl", "status", "start.sh"],
+            [*prefix, "docker", "exec", container, "python3", "-c", source, request],
             capture_output=True,
             text=True,
             check=False,
-            timeout=10,
+            timeout=80,
+            control=control,
         )
-    except subprocess.TimeoutExpired:
-        return None
-    parts = str(ret.stdout or ret.stderr or "").split()
-    return parts[1].upper() if len(parts) >= 2 else None
-
-
-def _required_services_ready(prefix: list[str], container: str) -> bool:
-    try:
-        ret = safe_run(
-            [*prefix, "docker", "exec", container, "supervisorctl", "status", *_REQUIRED_SONIC_SERVICES],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired:
+        if ret.returncode != 0:
+            return False
+        snapshot = json.loads(ret.stdout or "")
+    except (subprocess.TimeoutExpired, OSError, ValueError):
         return False
-    output = str(ret.stdout or ret.stderr or "")
-    states: dict[str, str] = {}
-    for line in output.splitlines():
-        parts = line.split()
-        if len(parts) >= 2:
-            states[parts[0]] = parts[1].upper()
-    return all(states.get(service) == "RUNNING" for service in _REQUIRED_SONIC_SERVICES)
-
-
-def _countersdb_ready(prefix: list[str], container: str, expected_port_count: int) -> bool:
-    try:
-        ret = safe_run(
-            [
-                *prefix,
-                "docker",
-                "exec",
-                container,
-                "redis-cli",
-                "-n",
-                "2",
-                "--raw",
-                "HLEN",
-                "COUNTERS_PORT_NAME_MAP",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=15,
-        )
-    except subprocess.TimeoutExpired:
+    if not isinstance(snapshot, dict) or snapshot.get("version") != 1 or snapshot.get("ready") is not True:
         return False
-    if ret.returncode != 0:
-        return False
-    try:
-        return int(str(ret.stdout).strip()) >= expected_port_count
-    except ValueError:
-        return False
+    checks = snapshot.get("checks")
+    required = ["config_before", "vtysh", "services", "config_after"]
+    if expected_port_count is not None:
+        required.append("ports")
+    return isinstance(checks, dict) and all(
+        isinstance(checks.get(name), dict) and checks[name].get("ok") is True for name in required
+    )
 
 
 def _wait_for_sonic(
@@ -179,46 +144,26 @@ def _wait_for_sonic(
     max_tries: int | None = None,
     delay: int = 5,
     expected_port_count: int | None = None,
+    control: OperationControl | None = None,
 ) -> bool:
     """Block until SONiC control-plane and ConfigDB commands are responsive."""
     max_tries = max_tries or SONIC_READINESS_MAX_TRIES
     prefix = docker_prefix()
     for _ in range(max_tries):
-        _startup_status(prefix, container)
-        configdb_ready = _configdb_ready(prefix, container)
-        if not configdb_ready:
-            time.sleep(delay)
-            continue
-
-        try:
-            vtysh_ret = safe_run(
-                [*prefix, "docker", "exec", container, "vtysh", "-c", "show version"],
-                capture_output=True,
-                text=True,
-                check=False,
-                timeout=15,
-            )
-        except subprocess.TimeoutExpired:
-            time.sleep(delay)
-            continue
-
-        if vtysh_ret.returncode != 0:
-            time.sleep(delay)
-            continue
-
-        if not _required_services_ready(prefix, container):
-            time.sleep(delay)
-            continue
-
-        if _configdb_ready(prefix, container) and (
-            expected_port_count is None or _countersdb_ready(prefix, container, expected_port_count)
-        ):
+        if control is not None:
+            control.remaining()
+        if _sonic_readiness_snapshot(prefix, container, expected_port_count, control=control):
             return True
-        time.sleep(delay)
+        if control is not None:
+            control.sleep(delay)
+        else:
+            time.sleep(delay)
     return False
 
 
-def _activate_preseed_device(prefix: list[str], container: str, ecmp_hash_policy: int) -> bool:
+def _activate_preseed_device(
+    prefix: list[str], container: str, ecmp_hash_policy: int, *, control: OperationControl | None = None
+) -> bool:
     command = (
         "set -e; "
         f"sysctl -w net.ipv4.fib_multipath_hash_policy={ecmp_hash_policy} >/dev/null; "
@@ -246,8 +191,97 @@ def _activate_preseed_device(prefix: list[str], container: str, ecmp_hash_policy
         text=True,
         check=False,
         timeout=30,
+        control=control,
     )
     return ret.returncode == 0
+
+
+def _kernel_interface_addresses(
+    prefix: list[str], container: str, *, control: OperationControl | None = None
+) -> dict[str, set[str]] | None:
+    try:
+        ret = safe_run(
+            [*prefix, "docker", "exec", container, "ip", "-j", "address", "show"],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+            control=control,
+        )
+    except subprocess.TimeoutExpired:
+        return None
+    if ret.returncode != 0:
+        return None
+    try:
+        payload = json.loads(ret.stdout or "[]")
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, list):
+        return None
+
+    observed: dict[str, set[str]] = {}
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        interface = item.get("ifname")
+        if not isinstance(interface, str):
+            continue
+        for address in item.get("addr_info") or []:
+            if not isinstance(address, dict):
+                continue
+            local = address.get("local")
+            prefixlen = address.get("prefixlen")
+            if isinstance(local, str) and isinstance(prefixlen, int):
+                observed.setdefault(interface, set()).add(f"{local}/{prefixlen}")
+    return observed
+
+
+def _reconcile_preseed_interfaces(
+    prefix: list[str], container: str, config_file: str, *, control: OperationControl | None = None
+) -> list[str]:
+    """Repair rare SONiC-VS startup drift between ConfigDB and kernel state."""
+    expected = _expected_interface_addresses(config_file)
+    if not expected:
+        return []
+    observed = _kernel_interface_addresses(prefix, container, control=control)
+    if observed is None:
+        return ["unable to inspect kernel interface addresses"]
+
+    missing = sorted(
+        (interface, address)
+        for interface, addresses in expected.items()
+        for address in addresses
+        if address not in observed.get(interface, set())
+    )
+    for interface, address in missing:
+        for command in (
+            ["ip", "link", "set", "dev", interface, "up"],
+            ["ip", "address", "replace", address, "dev", interface],
+        ):
+            try:
+                ret = safe_run(
+                    [*prefix, "docker", "exec", container, *command],
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                    timeout=15,
+                    control=control,
+                )
+            except subprocess.TimeoutExpired:
+                return [f"{interface}|{address}: command timed out"]
+            if ret.returncode != 0:
+                detail = (ret.stderr or ret.stdout or "").strip()
+                return [f"{interface}|{address}: {detail or f'exit status {ret.returncode}'}"]
+
+    observed = _kernel_interface_addresses(prefix, container, control=control)
+    if observed is None:
+        return ["unable to verify kernel interface addresses"]
+    return sorted(
+        f"{interface}|{address}"
+        for interface, addresses in expected.items()
+        for address in addresses
+        if address not in observed.get(interface, set())
+    )
 
 
 def _apply_single_device(
@@ -255,8 +289,13 @@ def _apply_single_device(
     topology_dir: str,
     lab_name: str,
     ecmp_hash_policy: int,
+    *,
+    readiness_max_tries: int | None = None,
+    control: OperationControl | None = None,
 ) -> tuple[str, bool, str, float, float, float]:
     """Activate one preseeded device after Containerlab has started it."""
+    if control is not None:
+        control.remaining()
     started_at = time.monotonic()
     container = clab_container_name(lab_name, device)
     prefix = docker_prefix()
@@ -288,7 +327,13 @@ def _apply_single_device(
         )
 
     readiness_started = time.monotonic()
-    if not _wait_for_sonic(device, container, expected_port_count=expected_port_count):
+    if not _wait_for_sonic(
+        device,
+        container,
+        max_tries=readiness_max_tries,
+        expected_port_count=expected_port_count,
+        control=control,
+    ):
         readiness_elapsed = time.monotonic() - readiness_started
         return (
             device,
@@ -301,12 +346,22 @@ def _apply_single_device(
     readiness_elapsed = time.monotonic() - readiness_started
 
     activation_started = time.monotonic()
-    if _activate_preseed_device(prefix, container, ecmp_hash_policy):
+    if _activate_preseed_device(prefix, container, ecmp_hash_policy, control=control):
+        unreconciled = _reconcile_preseed_interfaces(prefix, container, preseed_config, control=control)
         activation_elapsed = time.monotonic() - activation_started
+        if not unreconciled:
+            return (
+                device,
+                True,
+                "post-deploy activation",
+                time.monotonic() - started_at,
+                readiness_elapsed,
+                activation_elapsed,
+            )
         return (
             device,
-            True,
-            "post-deploy activation",
+            False,
+            "post-deploy interface reconciliation failed: " + ", ".join(unreconciled),
             time.monotonic() - started_at,
             readiness_elapsed,
             activation_elapsed,
@@ -322,10 +377,33 @@ def _apply_single_device(
     )
 
 
+def activate_device(
+    device: str,
+    topology_dir: str,
+    lab_name: str,
+    ecmp_hash_policy: int,
+    *,
+    readiness_max_tries: int | None = None,
+    control: OperationControl | None = None,
+) -> tuple[bool, str]:
+    """Activate one SONiC device using the canonical post-deploy path."""
+    _, success, message, *_ = _apply_single_device(
+        device,
+        topology_dir,
+        lab_name,
+        ecmp_hash_policy,
+        readiness_max_tries=readiness_max_tries,
+        control=control,
+    )
+    return success, message
+
+
 def apply_configs(
     topology_dir: str,
     max_parallel: int = 32,
     lab_name: str | None = None,
+    *,
+    control: OperationControl | None = None,
 ) -> ApplyResult:
     """Activate all preseeded SONiC devices in *topology_dir*."""
     manifest = load_topology_manifest(topology_dir)
@@ -359,6 +437,7 @@ def apply_configs(
                 topology_dir,
                 lab_name,
                 ecmp_hash_policies[device],
+                control=control,
             ): device
             for device in devices
         }
@@ -407,6 +486,7 @@ def apply_configs(
                 capture_output=True,
                 check=False,
                 timeout=30,
+                control=control,
             )
             print(f"  checked {candidates[0]}")
 
