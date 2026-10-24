@@ -123,28 +123,6 @@ def bgp_observation(worker, manifest, output: Path, *, control: OperationControl
 
 def completed_case_ids(entry: dict) -> set[str]:
     """Keep completed diagnoses, including zero scores and separately failed recovery."""
-
-    def diagnosis_completed(report, summary):
-        if report.get("mode") == "effects":
-            return False
-        if "diagnosis_complete" in report:
-            return report["diagnosis_complete"] is True
-        # Read original current-campaign evidence; never rewrite or rescore it.
-        path = summary.get("raw_result_path")
-        if not path:
-            return False
-        try:
-            raw = json.loads(Path(path).read_text())
-        except (OSError, ValueError):
-            return False
-        episode = raw.get("episode") or {}
-        execution = episode.get("execution") or {}
-        return (
-            (episode.get("diagnosis") or {}).get("success") is True
-            and execution.get("case_valid") is True
-            and execution.get("termination_reason") == "submitted"
-        )
-
     return {
         summary["scenario_id"]
         for report in entry.get("cases", [])
@@ -152,8 +130,12 @@ def completed_case_ids(entry: dict) -> set[str]:
         for summary in report.get("scenario_summaries", [])
         if summary.get("case_valid") is True
         and (
-            (not summary.get("cleanup_failed") and summary.get("status", "completed") == "completed")
-            or diagnosis_completed(report, summary)
+            (
+                report.get("mode") == "effects"
+                and not summary.get("cleanup_failed")
+                and summary.get("status") == "completed"
+            )
+            or (report.get("mode") != "effects" and report.get("diagnosis_complete") is True)
         )
     }
 

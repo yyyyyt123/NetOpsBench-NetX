@@ -100,7 +100,7 @@ def restored_scope_errors(before, after, scenario, config_proof):
 @dataclass
 class BaselineHandoff:
     window: dict | None = None
-    scope: RuntimeScope | str | None = None
+    scope: RuntimeScope | None = None
     source: str | None = None
     epoch: float | None = None
     last_changes: list[str] | None = None
@@ -112,7 +112,7 @@ class BaselineHandoff:
         self.clear()
         self.epoch = time.monotonic()
 
-    def take(self, scope: str | None, minimum_seconds: int) -> tuple[dict | None, str]:
+    def take(self, scope: RuntimeScope | None, minimum_seconds: int) -> tuple[dict | None, str]:
         window, previous_scope = self.window, self.scope
         self.last_changes = scope_changes(previous_scope, scope)
         self.window = None  # A failed or interrupted consumer cannot pass it on.
@@ -124,7 +124,7 @@ class BaselineHandoff:
             return None, "expired_or_short_window"
         return dict(window), "verified_previous_case"
 
-    def publish(self, window: dict, scope: str | None, source: str, minimum_seconds: int) -> bool:
+    def publish(self, window: dict, scope: RuntimeScope | None, source: str, minimum_seconds: int) -> bool:
         if not scope or self.epoch is None or not valid_window(window, minimum_seconds):
             self.window = None
             return False

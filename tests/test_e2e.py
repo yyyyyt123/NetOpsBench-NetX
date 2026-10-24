@@ -26,7 +26,6 @@ from netopsbench.models.topology import TopologyManifest
 from netopsbench.platform.client_agent.config import build_client_agent_config
 from netopsbench.platform.faults.injector import FaultInjector
 from netopsbench.platform.faults.specs import create_fault_registry
-from netopsbench.platform.scenario.generator import parse_bgp_config, parse_network_interfaces
 from netopsbench.platform.scenario.parser import parse_scenario_file
 from netopsbench.platform.scenario.validator import validate_scenario, validate_scenario_topology
 from netopsbench.platform.session.scoring import score_scenario_episode
@@ -35,7 +34,9 @@ from netopsbench.platform.toolkit.mcp.registry import load_tool_specs, tool_sche
 
 # Internal test path: direct toolkit import keeps implementation-level e2e checks fast.
 from netopsbench.platform.toolkit.toolkit import AgentToolkit, ToolResult
+from netopsbench.platform.topology.configdb_payload import interface_names_for_config
 from netopsbench.platform.topology.generator import generate_topology
+from netopsbench.platform.utils.frr import parse_bgp_config
 from netopsbench.platform.utils.interface_names import are_interfaces_equivalent
 
 
@@ -214,8 +215,8 @@ class TestTopologyGeneration:
             spine_cfg = Path(tmpdir, "configs", "sonic", "spine1", "config_db.json")
             spine_frr = Path(tmpdir, "configs", "frr", "spine1.conf")
 
-            assert parse_network_interfaces(spine_cfg) == ["Ethernet0", "Ethernet4"]
-            bgp_info = parse_bgp_config(spine_frr)
+            assert interface_names_for_config(spine_cfg) == ["Ethernet0", "Ethernet4"]
+            bgp_info = parse_bgp_config(spine_frr.read_text())
             assert bgp_info["local_as"] == 65001
             assert [neighbor["remote_as"] for neighbor in bgp_info["neighbors"]] == [65011, 65012]
 
@@ -860,7 +861,7 @@ episode:
             )
             result = validate_scenario_topology(scenario=scenario, topology_dir=tmpdir)
             assert result["status"] == "pass"
-            assert parse_network_interfaces(spine_config) == ["Ethernet4"]
+            assert interface_names_for_config(spine_config) == ["Ethernet4"]
 
             from netopsbench.platform.session.scoring import build_episode_ground_truth
 

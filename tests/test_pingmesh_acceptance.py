@@ -173,6 +173,7 @@ def test_docker_memory_units_are_converted():
 def test_resume_retains_valid_low_scores_and_retries_incomplete_cases():
     def report(case, valid, cleanup_failed=False, score=0):
         return {
+            "diagnosis_complete": not cleanup_failed,
             "summary": {"average_score": score},
             "scenario_summaries": [{"scenario_id": case, "case_valid": valid, "cleanup_failed": cleanup_failed}],
         }
@@ -207,6 +208,7 @@ def test_completed_campaign_returns_without_constructing_agent_or_executor(tmp_p
                     {
                         "scenario_summaries": [{"scenario_id": path.stem, "case_valid": True, "status": "completed"}],
                         "summary": {"average_score": 0},
+                        "diagnosis_complete": True,
                     }
                 ],
             }
@@ -243,6 +245,7 @@ def test_model_inconclusive_without_execution_error_remains_valid():
     diagnosis = {"verdict": "inconclusive", "metadata": {"llm_call_count": 4}}
     report = {
         "scenario_summaries": [{"scenario_id": "low-score", "case_valid": True, "cleanup_failed": False}],
+        "diagnosis_complete": True,
         "detailed_results": [{"details": {"agent_output": diagnosis}}],
     }
     assert acceptance.completed_case_ids({"cases": [report]}) == {"low-score"}
@@ -700,44 +703,75 @@ def test_codex_resume_identity_checked_before_credentials_or_container_preflight
         cli.preflight_agents(["codex"], "deepseek", tmp_path, expected={"codex": expected})
 
 
-def test_resume_keeps_completed_zero_score_diagnosis_when_recovery_requires_rebuild(tmp_path):
-    raw = tmp_path / "case.json"
-    raw.write_text(
-        json.dumps(
-            {
-                "episode": {
-                    "diagnosis": {"success": True},
-                    "execution": {"case_valid": True, "termination_reason": "submitted"},
-                }
-            }
-        )
-    )
+def test_resume_keeps_completed_zero_score_diagnosis_when_recovery_requires_rebuild():
     report = {
+        "diagnosis_complete": True,
         "summary": {"average_score": 0},
         "scenario_summaries": [
-            {
-                "scenario_id": "valid-zero",
-                "case_valid": True,
-                "status": "failed",
-                "cleanup_failed": True,
-                "raw_result_path": str(raw),
-            }
+            {"scenario_id": "valid-zero", "case_valid": True, "status": "failed", "cleanup_failed": True}
         ],
     }
-    before = raw.read_bytes()
     assert acceptance.completed_case_ids({"cases": [report]}) == {"valid-zero"}
-    assert raw.read_bytes() == before
-    raw.write_text(
-        json.dumps(
-            {
-                "episode": {
-                    "diagnosis": {"success": False},
-                    "execution": {"case_valid": True, "termination_reason": "agent_failed"},
-                }
-            }
-        )
-    )
+    report["diagnosis_complete"] = False
     assert acceptance.completed_case_ids({"cases": [report]}) == set()
     report["mode"] = "effects"
     report["diagnosis_complete"] = True
     assert acceptance.completed_case_ids({"cases": [report]}) == set()
+
+
+def test_resume_does_not_infer_missing_diagnosis_state_from_archived_raw_results(tmp_path):
+    raw = tmp_path / "case.json"
+    raw.write_text(json.dumps({"episode": {"diagnosis": {"success": True}}}))
+    report = {
+        "scenario_summaries": [
+            {"scenario_id": "old", "case_valid": True, "status": "completed", "raw_result_path": str(raw)}
+        ],
+    }
+    original = raw.read_bytes()
+    assert acceptance.completed_case_ids({"cases": [report]}) == set()
+    assert raw.read_bytes() == original
+
+
+def test_effects_resume_requires_valid_completed_and_recovered_case():
+    reports = [
+        {"mode": "effects", "scenario_summaries": [{"scenario_id": name, **summary}]}
+        for name, summary in (
+            ("completed", {"case_valid": True, "status": "completed", "cleanup_failed": False}),
+            ("invalid", {"case_valid": False, "status": "completed"}),
+            ("incomplete", {"case_valid": True, "status": "failed"}),
+            ("unrecovered", {"case_valid": True, "status": "completed", "cleanup_failed": True}),
+        )
+    ]
+    assert acceptance.completed_case_ids({"cases": reports}) == {"completed"}
+
+
+def test_legacy_campaign_rejected_before_provider_or_docker(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    from netopsbench.platform.session import acceptance
+
+    output = tmp_path / "campaign"
+    output.mkdir()
+    (output / "acceptance.json").write_text(
+        json.dumps({"mode": "effects", "fault_catalog_version": 2, "runtime_backend": {"provider": "custom"}})
+    )
+    monkeypatch.setattr(acceptance, "runtime_backend_identity", lambda: {"provider": "upstream"})
+    monkeypatch.setattr(acceptance.subprocess, "check_output", lambda *a, **kw: pytest.fail("Docker called"))
+    args = SimpleNamespace(
+        mode="effects",
+        agents=[],
+        scales="xs",
+        vendor="deepseek",
+        output=output,
+        resume_runtime=tmp_path / "runtime",
+        rebuild_runtime=False,
+    )
+    with pytest.raises(ValueError, match="Campaign runtime backend changed"):
+        acceptance.run_acceptance(
+            args,
+            bench_factory=None,
+            agent_factory=None,
+            preflight=lambda *a: pytest.fail("provider called"),
+            select_cases=None,
+            smoke_cases=None,
+        )

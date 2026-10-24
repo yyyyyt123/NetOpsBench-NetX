@@ -6,6 +6,7 @@ import pytest
 import yaml
 
 from netopsbench.models import topology as topology_models
+from netopsbench.models.profiles import get_scale_profile
 from netopsbench.models.scenario import EpisodeSpec, ScenarioSpec
 from netopsbench.models.topology import TopologyManifest
 from netopsbench.platform.faults.specs import FaultSpec, create_fault_registry
@@ -28,9 +29,10 @@ def test_all_diagnostic_observation_durations_use_complete_pingmesh_window():
     from netopsbench.platform.topology.fat_tree_builder import build_fat_tree_plan
 
     manifest = build_fat_tree_plan(config_for_scale("fat-tree-k12")).manifest
-    assert scenario_generator.diagnostic_observation_duration(20, manifest) == 42
-    assert scenario_generator.diagnostic_observation_duration(30, manifest) == 42
-    assert scenario_generator.diagnostic_observation_duration(90, manifest) == 90
+    profile = get_scale_profile("fat-tree-k12").experiment
+    complete = manifest.require_pingmesh_plan().settings.complete_window_seconds
+    for requested, expected in ((20, 42), (30, 42), (90, 90)):
+        assert profile.model_copy(update={"observation_seconds": requested}).window_seconds(complete) == expected
 
 
 @pytest.mark.parametrize(
@@ -53,7 +55,7 @@ def test_builtin_scale_complete_windows_are_topology_derived(scale, expected_win
     config = config_for_scale(scale)
     manifest = (build_clos_plan if isinstance(config, TopologyConfig) else build_fat_tree_plan)(config).manifest
     assert manifest.require_pingmesh_plan().settings.complete_window_seconds == expected_window
-    assert scenario_generator.diagnostic_observation_duration(30, manifest) == max(30, expected_window)
+    assert get_scale_profile(scale).experiment.window_seconds(expected_window) == max(30, expected_window)
 
 
 def test_custom_pingmesh_policy_derives_complete_window_without_scale_name():

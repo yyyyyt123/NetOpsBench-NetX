@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sequential real-runtime acceptance; defaults to DeepAgent and native Codex."""
+"""Sequential real-runtime acceptance; defaults to DeepAgent with DeepSeek."""
 
 from __future__ import annotations
 

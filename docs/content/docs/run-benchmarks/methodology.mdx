@@ -73,6 +73,11 @@ SHA-256 hashes and byte counts. Decode them with `json.load(gzip.open(path, "rt"
 Execution and scoring still use the complete live snapshots. Existing results
 and diagnostic trajectories are never rewritten.
 
+Campaign checkpoints explicitly record whether a diagnosis completed. Resume
+uses that state and validity evidence, including valid zero-score diagnoses;
+it does not infer completion by reopening historical raw results. Effects cases
+require successful recovery before they are considered completed.
+
 `netopsbench benchmark prepare` generates the six benchmark profiles.
 Use `--scales xs` explicitly for validation. Omitted scale arguments in SDK
 scenario creation, topology generation and public examples default to `medium`.

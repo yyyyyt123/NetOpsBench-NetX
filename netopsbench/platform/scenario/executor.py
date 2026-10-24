@@ -30,7 +30,7 @@ from netopsbench.platform.traffic.scenario_execution import setup_traffic as _se
 from netopsbench.platform.traffic.scenario_execution import stop_traffic as _stop_traffic_impl
 from netopsbench.platform.utils.control import OperationControl, operation_scope
 
-from .baseline import BaselineHandoff, frr_snapshot, restored_scope_errors, runtime_scope, scope_changes
+from .baseline import BaselineHandoff, RuntimeScope, frr_snapshot, restored_scope_errors, runtime_scope, scope_changes
 from .incident_backend import ExecutorIncidentBackend
 from .observation import analyze_observation_windows as _analyze_observation_windows_impl
 from .observation import capture_baseline_window as _capture_baseline_window_impl
@@ -176,7 +176,7 @@ class ScenarioExecutor:
             handoff.clear()
         self._stop_traffic()
 
-    def _baseline_scope(self, scenario: ScenarioSpec) -> str | None:
+    def _baseline_scope(self, scenario: ScenarioSpec) -> RuntimeScope | None:
         try:
             return runtime_scope(self, scenario)
         except Exception as exc:

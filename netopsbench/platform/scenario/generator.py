@@ -5,8 +5,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import random
-import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -15,9 +14,14 @@ import yaml
 
 from netopsbench.models.profiles import ScaleRegistry, default_scale_registry
 from netopsbench.models.scenario import ScenarioSpec
-from netopsbench.models.topology import DeviceRole, TopologyManifest
-from netopsbench.platform.topology.configdb_payload import interface_names_for_config, interface_networks_for_config
+from netopsbench.models.topology import TopologyManifest
+from netopsbench.platform.topology.configdb_payload import (
+    interface_names_from_payload,
+    interface_networks_from_payload,
+    load_configdb_payload,
+)
 from netopsbench.platform.topology.topology_utils import load_topology_manifest
+from netopsbench.platform.utils.frr import parse_bgp_config
 
 from .candidates import CandidatePaths
 
@@ -31,49 +35,12 @@ def default_campaign_spec() -> Path:
 
 @dataclass
 class TopologyContext:
-    topology_dir: Path
     manifest: TopologyManifest
-    device_interfaces: dict[str, list[str]]
-    leaf_interface_roles: dict[str, dict[str, list[str]]]
-    client_interfaces: dict[str, list[str]]
-    device_asns: dict[str, int] = field(default_factory=dict)
-    bgp_neighbors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
-    bgp_networks: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    bgp_neighbors: dict[str, list[dict[str, Any]]]
 
     @property
     def scale(self) -> str:
         return self.manifest.scale
-
-    @property
-    def metadata(self) -> dict[str, Any]:
-        return self.manifest.to_agent_topology()
-
-    def _device_names(self, role: DeviceRole) -> list[str]:
-        return [device.name for device in self.manifest.devices_by_role(role)]
-
-    @property
-    def spines(self) -> list[str]:
-        return self._device_names(DeviceRole.SPINE)
-
-    @property
-    def leafs(self) -> list[str]:
-        return self._device_names(DeviceRole.LEAF)
-
-    @property
-    def cores(self) -> list[str]:
-        return self._device_names(DeviceRole.CORE)
-
-    @property
-    def aggs(self) -> list[str]:
-        return self._device_names(DeviceRole.AGG)
-
-    @property
-    def edges(self) -> list[str]:
-        return self._device_names(DeviceRole.EDGE)
-
-    @property
-    def clients(self) -> list[dict[str, Any]]:
-        return self.metadata["devices"]["clients"]
 
 
 def load_yaml(path: Path) -> dict[str, Any]:
@@ -92,31 +59,25 @@ def load_topology(scale: str, topology_dir: str | None) -> TopologyContext:
         raise FileNotFoundError(f"Topology metadata not found: {metadata_path}")
 
     manifest = load_topology_manifest(metadata_path)
-    device_interfaces, leaf_interface_roles, client_interfaces = _interface_facts_from_manifest(manifest)
-    device_asns: dict[str, int] = {}
     bgp_neighbors: dict[str, list[dict[str, Any]]] = {}
-    bgp_networks: dict[str, list[dict[str, Any]]] = {}
 
     config_dir = topo_dir / "configs"
     switch_devices = [device.name for device in manifest.switches()]
     for device in switch_devices:
-        cfg = _device_config_path(config_dir, device)
+        cfg = config_dir / "sonic" / device / "config_db.json"
         frr_cfg = config_dir / "frr" / f"{device}.conf"
         if not cfg.is_file():
             raise FileNotFoundError(f"SONiC ConfigDB artifact not found: {cfg}")
         if not frr_cfg.is_file():
             raise FileNotFoundError(f"FRR artifact not found: {frr_cfg}")
-        parsed_interfaces = parse_network_interfaces(cfg)
-        if not parsed_interfaces:
+        configdb = load_configdb_payload(cfg)
+        if not interface_names_from_payload(configdb):
             raise ValueError(f"SONiC ConfigDB has no interfaces: {cfg}")
-        device_interfaces[device] = parsed_interfaces
-        bgp_info = parse_bgp_config(frr_cfg)
+        bgp_info = parse_bgp_config(frr_cfg.read_text())
         if bgp_info.get("local_as") is None:
             raise ValueError(f"FRR artifact has no BGP router stanza: {frr_cfg}")
-        device_asns[device] = int(bgp_info["local_as"])
         neighbors = list(bgp_info.get("neighbors") or [])
-        interface_networks = interface_networks_for_config(cfg)
-        interface_roles = leaf_interface_roles.get(device) or {}
+        interface_networks = interface_networks_from_payload(configdb)
         for neighbor in neighbors:
             try:
                 peer_ip = ipaddress.ip_address(str(neighbor["peer_ip"]))
@@ -133,169 +94,9 @@ def load_topology(scale: str, topology_dir: str | None) -> TopologyContext:
             if interface is None:
                 continue
             neighbor["interface"] = interface
-            neighbor["interface_role"] = next(
-                (role for role in ("uplink", "downlink") if interface in (interface_roles.get(role) or [])),
-                None,
-            )
         bgp_neighbors[device] = neighbors
-        bgp_networks[device] = list(bgp_info.get("networks") or [])
 
-    return TopologyContext(
-        topology_dir=topo_dir,
-        manifest=manifest,
-        device_interfaces=device_interfaces,
-        leaf_interface_roles=leaf_interface_roles,
-        client_interfaces=client_interfaces,
-        device_asns=device_asns,
-        bgp_neighbors=bgp_neighbors,
-        bgp_networks=bgp_networks,
-    )
-
-
-def _device_config_path(config_dir: Path, device: str) -> Path:
-    return config_dir / "sonic" / device / "config_db.json"
-
-
-def parse_network_interfaces(cfg_path: Path) -> list[str]:
-    return interface_names_for_config(cfg_path)
-
-
-def parse_bgp_config(cfg_path: Path) -> dict[str, Any]:
-    """Parse local ASN, neighbors, and advertised networks from one FRR config."""
-    info: dict[str, Any] = {"local_as": None, "neighbors": [], "networks": []}
-    if not cfg_path.exists():
-        return info
-
-    local_as_re = re.compile(r"^router bgp (\d+)$")
-    neighbor_re = re.compile(r"^neighbor (\S+) remote-as (\d+)$")
-    neighbor_rm_re = re.compile(r"^neighbor (\S+) route-map (\S+) (in|out)$")
-    network_re = re.compile(r"^network (\S+)(?: route-map (\S+))?$")
-
-    neighbors: dict[str, dict[str, Any]] = {}
-    networks: list[dict[str, Any]] = []
-    seen_networks = set()
-
-    with cfg_path.open("r", encoding="utf-8") as f:
-        for raw in f:
-            line = raw.strip()
-            match = local_as_re.match(line)
-            if match:
-                info["local_as"] = int(match.group(1))
-                continue
-
-            match = neighbor_re.match(line)
-            if match:
-                peer_ip = match.group(1)
-                peer = neighbors.setdefault(
-                    peer_ip,
-                    {"peer_ip": peer_ip, "remote_as": None, "route_maps": []},
-                )
-                peer["remote_as"] = int(match.group(2))
-                continue
-
-            match = neighbor_rm_re.match(line)
-            if match:
-                peer_ip, route_map, direction = match.groups()
-                peer = neighbors.setdefault(
-                    peer_ip,
-                    {"peer_ip": peer_ip, "remote_as": None, "route_maps": []},
-                )
-                attachment = {"name": route_map, "direction": direction}
-                if attachment not in peer["route_maps"]:
-                    peer["route_maps"].append(attachment)
-                continue
-
-            match = network_re.match(line)
-            if match:
-                prefix, route_map = match.groups()
-                identity = (prefix, route_map or "")
-                if identity in seen_networks:
-                    continue
-                seen_networks.add(identity)
-                networks.append({"prefix": prefix, "route_map": route_map})
-
-    info["neighbors"] = sorted(neighbors.values(), key=lambda item: item["peer_ip"])
-    info["networks"] = sorted(networks, key=lambda item: item["prefix"])
-    return info
-
-
-def _interface_facts_from_manifest(
-    manifest: TopologyManifest,
-) -> tuple[dict[str, list[str]], dict[str, dict[str, list[str]]], dict[str, list[str]]]:
-    """Derive interface ownership and fabric direction from canonical links."""
-    devices = {device.name: device for device in manifest.devices}
-    switch_interfaces: dict[str, set[str]] = {}
-    client_interfaces: dict[str, set[str]] = {}
-    interface_roles: dict[str, dict[str, set[str]]] = {}
-
-    def add_role(device: str, interface: str, role: str) -> None:
-        normalized = normalize_sonic_interface(interface)
-        if normalized is None:
-            return
-        roles = interface_roles.setdefault(device, {"uplink": set(), "downlink": set(), "any": set()})
-        roles[role].add(normalized)
-        roles["any"].add(normalized)
-
-    uplink_peers = {
-        DeviceRole.LEAF: {DeviceRole.SPINE},
-        DeviceRole.EDGE: {DeviceRole.AGG},
-        DeviceRole.AGG: {DeviceRole.CORE},
-    }
-    downlink_peers = {
-        DeviceRole.LEAF: {DeviceRole.CLIENT},
-        DeviceRole.EDGE: {DeviceRole.CLIENT},
-        DeviceRole.AGG: {DeviceRole.EDGE},
-    }
-    for link in manifest.links:
-        left, right = link.endpoints
-        for endpoint, peer in ((left, right), (right, left)):
-            device = devices[endpoint.device]
-            peer_role = devices[peer.device].role
-            if device.role is DeviceRole.CLIENT:
-                client_interfaces.setdefault(device.name, set()).add(endpoint.interface)
-                continue
-            normalized = normalize_sonic_interface(endpoint.interface)
-            if normalized is not None:
-                switch_interfaces.setdefault(device.name, set()).add(normalized)
-            if peer_role in uplink_peers.get(device.role, set()):
-                add_role(device.name, endpoint.interface, "uplink")
-            elif peer_role in downlink_peers.get(device.role, set()):
-                add_role(device.name, endpoint.interface, "downlink")
-
-    return (
-        {name: sorted(interfaces) for name, interfaces in switch_interfaces.items()},
-        {
-            name: {role: sorted(interfaces) for role, interfaces in roles.items()}
-            for name, roles in interface_roles.items()
-        },
-        {name: sorted(interfaces) for name, interfaces in client_interfaces.items()},
-    )
-
-
-def normalize_sonic_interface(name: str | None) -> str | None:
-    """Normalize interface names to SONiC EthernetX when possible."""
-    if not name:
-        return name
-    raw = name.strip()
-    lower = raw.lower()
-    if lower.startswith("ethernet") and raw[8:].isdigit():
-        return f"Ethernet{int(raw[8:])}"
-    if lower.startswith("eth") and raw[3:].isdigit():
-        idx = int(raw[3:])
-        if idx >= 1:
-            return f"Ethernet{(idx - 1) * 4}"
-    if lower.startswith("e1-") and raw[3:].isdigit():
-        idx = int(raw[3:])
-        if idx >= 1:
-            return f"Ethernet{(idx - 1) * 4}"
-    if "ethernet-1/" in lower:
-        try:
-            idx = int(raw.split("/")[-1])
-            if idx >= 1:
-                return f"Ethernet{(idx - 1) * 4}"
-        except ValueError:
-            return raw
-    return raw
+    return TopologyContext(manifest=manifest, bgp_neighbors=bgp_neighbors)
 
 
 @dataclass
@@ -483,10 +284,6 @@ class _CandidateIndex(CandidatePaths):
         if not match:
             raise ValueError(f"No configured neighbor for {root}->{peer}")
         return match["peer_ip"]
-
-
-def diagnostic_observation_duration(base_duration: int, manifest: TopologyManifest) -> int:
-    return max(base_duration, manifest.require_pingmesh_plan().settings.complete_window_seconds)
 
 
 def _stable_template_seed(seed: int, scale: str, template_name: str) -> int:
