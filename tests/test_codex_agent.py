@@ -102,6 +102,7 @@ def test_private_credential_values_are_redacted_including_account_identity(tmp_p
 async def test_episode_mcp_requires_token_uses_gateway_and_enforces_budget():
     import signal
 
+    import httpx
     from fastmcp import Client
 
     original_handler = signal.getsignal(signal.SIGTERM)
@@ -119,10 +120,13 @@ async def test_episode_mcp_requires_token_uses_gateway_and_enforces_budget():
             assert result.data["data"] == {"window": "episode"}
             with pytest.raises(Exception, match="budget"):
                 await client.call_tool("get_topology", {})
+        # Verify the HTTP boundary directly: MCP clients can wrap an HTTP 401
+        # in a generic transport error whose wording varies by dependency version.
+        async with httpx.AsyncClient(trust_env=False) as client:
+            for headers in ({}, {"Authorization": "Bearer incorrect-token"}):
+                response = await client.post(endpoint["url"], headers=headers, json={})
+                assert response.status_code == 401
         assert calls == [{}]
-        with pytest.raises(Exception, match="401|Unauthorized"):
-            async with Client(endpoint["url"]) as client:
-                await client.list_tools()
     assert signal.getsignal(signal.SIGTERM) == original_handler
 
 

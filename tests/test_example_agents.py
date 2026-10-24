@@ -786,7 +786,7 @@ class MinimalDeepAgent:
 fake_sdk = types.ModuleType('netopsbench.sdk')
 fake_sdk.NetOpsBench = NetOpsBench
 fake_sdk.RunFailedError = RuntimeError
-fake_sdk.supported_scales = lambda: ('xs', 'medium', 'medium', 'large', 'xlarge', 'fat-tree-k8', 'fat-tree-k12')
+fake_sdk.supported_scales = lambda: ('xs', 'medium', 'large', 'xlarge', 'fat-tree-k8', 'fat-tree-k12', 'fat-tree-k18')
 sys.modules['netopsbench.sdk'] = fake_sdk
 
 fake_examples_agents = types.ModuleType('examples.agents')
