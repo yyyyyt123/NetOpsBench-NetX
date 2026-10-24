@@ -102,7 +102,7 @@ class RoutingMetadata(_PersistedModel):
     edge_asn_range: str | None = None
     ecmp_hash_policy_by_role: dict[DeviceRole, Literal[0, 1]]
     ecmp: bool = True
-    bfd: bool = True
+    bfd: bool = False
 
 
 class TopologyManifest(_PersistedModel):

@@ -12,11 +12,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from netopsbench.models.profiles import get_scale_profile
+from netopsbench.platform.runtime.toolchain import runtime_backend_identity
 from netopsbench.platform.topology.topology_utils import load_topology_manifest
 from netopsbench.platform.utils.control import OperationControl
 from netopsbench.platform.utils.proc import safe_run
 
 GIB = 1024**3
+EMERGENCY_MEMORY_BYTES = 12 * GIB
 
 
 def available_memory_bytes() -> int:
@@ -58,7 +60,7 @@ class ResourceMonitor:
                     "available_bytes": available,
                 }
             )
-            if available < 12 * GIB:
+            if available < EMERGENCY_MEMORY_BYTES:
                 self.result["resource_emergency"] = "MemAvailable below 12 GiB"
                 self.emergency.set()
                 self.cancel.set()
@@ -146,6 +148,7 @@ def resource_snapshot(lab_name: str, manifest, *, control: OperationControl | No
     )
     writable_bytes = {name.lstrip("/"): int(size) for name, size in map(str.split, sizes.splitlines())}
     return {
+        "runtime_backend": runtime_backend_identity(),
         "time": datetime.now(UTC).isoformat(),
         "nodes": [
             dict(
@@ -156,7 +159,9 @@ def resource_snapshot(lab_name: str, manifest, *, control: OperationControl | No
                     else (
                         "observability"
                         if row["Name"] in services
-                        else "client" if "-client" in row["Name"] else "switch"
+                        else "client"
+                        if "-client" in row["Name"]
+                        else "switch"
                     )
                 ),
                 data_ports=ports.get(row["Name"].removeprefix(f"clab-{lab_name}-"), 0),
@@ -186,16 +191,23 @@ def storage_snapshot() -> dict:
 
 
 def peak_sample(samples: list[dict]) -> dict:
+    identities = [sample.get("runtime_backend") for sample in samples]
+    if not identities or identities[0] is None or any(identity != identities[0] for identity in identities):
+        raise ValueError("Capacity samples must belong to the same recorded runtime backend")
     nodes: dict[str, dict] = {}
     for sample in samples:
         for row in sample["nodes"]:
             peak = nodes.setdefault(row["name"], dict(row))
             for key in ("memory_bytes", "writable_bytes"):
                 peak[key] = max(peak[key], row[key])
-    return {"nodes": list(nodes.values())}
+    return {"nodes": list(nodes.values()), "runtime_backend": identities[0]}
 
 
-def capacity_check(sample: dict, scale: str, docker_root: Path, existing_runtime: bool = False) -> dict:
+def capacity_check(
+    sample: dict, scale: str, docker_root: Path, existing_runtime: bool = False, diagnostics: bool = True
+) -> dict:
+    if sample.get("runtime_backend") != runtime_backend_identity():
+        raise ValueError("Capacity sample uses a different or unrecorded backend; measure the current runtime first")
     profile = get_scale_profile(scale)
     switches = [
         row for row in sample["nodes"] if row.get("role", "switch") == "switch" and "-client" not in row["name"]
@@ -235,6 +247,7 @@ def capacity_check(sample: dict, scale: str, docker_root: Path, existing_runtime
                 "extrapolated": representative < ports,
             }
         )
+    diagnostic_reserve = int(2.25 * GIB) if diagnostics else 0
     # Match port capacity before applying the maximum measured node cost and margin.
     estimated = int(
         1.2
@@ -242,7 +255,7 @@ def capacity_check(sample: dict, scale: str, docker_root: Path, existing_runtime
             sum(row["sample_memory_bytes"] * row["switches"] for row in costs)
             + max(clients) * profile.total_clients
             + 8 * GIB
-            + int(2.25 * GIB)
+            + diagnostic_reserve
         )
     )
     disk_free = shutil.disk_usage(docker_root).free
@@ -259,7 +272,7 @@ def capacity_check(sample: dict, scale: str, docker_root: Path, existing_runtime
     if existing_runtime:
         # MemAvailable already excludes the retained lab's allocation. Resume
         # needs headroom for diagnosis/services, not a second copy of the lab.
-        estimated = int(1.2 * 10.25 * GIB)
+        estimated = int(1.2 * (8 * GIB + diagnostic_reserve))
         estimated_disk = 20 * GIB
     result = {
         "available_memory_bytes": available,
@@ -267,7 +280,7 @@ def capacity_check(sample: dict, scale: str, docker_root: Path, existing_runtime
         "docker_disk_free_bytes": disk_free,
         "estimated_disk_bytes": estimated_disk,
         "memory_margin": 1.2,
-        "diagnostic_memory_reserve_bytes": int(2.25 * GIB),
+        "diagnostic_memory_reserve_bytes": diagnostic_reserve,
         "mode": "retained_runtime" if existing_runtime else "new_deployment",
         "full_runtime_estimated_memory_bytes": full_memory,
         "full_runtime_estimated_disk_bytes": full_disk,
@@ -287,7 +300,7 @@ def require_capacity(capacity, allow):
     if capacity["status"] == "passed":
         return
     if not allow or (
-        capacity["available_memory_bytes"] < capacity["estimated_memory_bytes"] / 1.2 + 8 * GIB
+        capacity["available_memory_bytes"] < capacity["estimated_memory_bytes"] / 1.2 + EMERGENCY_MEMORY_BYTES
         or capacity["docker_disk_free_bytes"] < capacity["estimated_disk_bytes"]
         or any(cost["extrapolated"] for cost in capacity["switch_costs"])
     ):

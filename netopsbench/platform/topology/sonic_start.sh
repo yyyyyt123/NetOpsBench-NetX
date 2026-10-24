@@ -204,7 +204,26 @@ supervisorctl start portsyncd
 
 supervisorctl start orchagent
 
-python3 /opt/nb-start-group.py
+supervisorctl start coppmgrd
+supervisorctl start neighsyncd
+supervisorctl start fdbsyncd
+supervisorctl start teamsyncd
+supervisorctl start fpmsyncd
+supervisorctl start teammgrd
+supervisorctl start vrfmgrd
+supervisorctl start portmgrd
+supervisorctl start intfmgrd
+supervisorctl start vlanmgrd
+supervisorctl start zebra
+supervisorctl start mgmtd
+supervisorctl start staticd
+supervisorctl start buffermgrd
+supervisorctl start nbrmgrd
+supervisorctl start vxlanmgrd
+supervisorctl start natmgrd
+supervisorctl start natsyncd
+supervisorctl start tunnelmgrd
+supervisorctl start fabricmgrd
 
 # This pinned VS image omits rebootbackend. Skip only an absent service;
 # all existing service start failures still propagate under bash -e.

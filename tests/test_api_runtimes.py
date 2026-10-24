@@ -8,6 +8,15 @@ from pathlib import Path
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def mock_runtime_backend(monkeypatch):
+    monkeypatch.setattr("netopsbench.platform.runtime.deployment.containerlab_command", lambda: ["containerlab"])
+    monkeypatch.setattr(
+        "netopsbench.platform.runtime.manager.runtime_backend_identity",
+        lambda: {"provider": "upstream", "containerlab_version": "test"},
+    )
+
+
 def _record_lifecycle_operations(monkeypatch, calls, *, fail_stage=None):
     import netopsbench.platform.runtime.lifecycle as lifecycle
 
@@ -54,11 +63,11 @@ def test_runtime_manager_create_workers_1_returns_runtime_pool(tmp_path):
     from netopsbench.sdk.runtimes import RuntimeManager, RuntimePool
 
     manager = RuntimeManager(workspace=tmp_path)
-    runtime = manager.create(scale="small", workers=1)
+    runtime = manager.create(scale="medium", workers=1)
 
     assert isinstance(runtime, RuntimePool)
     assert runtime.id == runtime.name
-    assert runtime.scale == "small"
+    assert runtime.scale == "medium"
     assert len(runtime.workers) == 1
     assert runtime.workers[0].worker_id == "worker-1"
     assert runtime.workers[0].worker_index == 1
@@ -66,7 +75,7 @@ def test_runtime_manager_create_workers_1_returns_runtime_pool(tmp_path):
     assert runtime.workers[0].topology_dir == runtime.root_dir / "worker-1"
     assert runtime.root_dir.exists()
     assert runtime.root_dir == tmp_path / ".netopsbench" / "runtimes" / runtime.name
-    assert runtime.status() == {"id": runtime.id, "name": runtime.name, "scale": "small", "state": "created"}
+    assert runtime.status() == {"id": runtime.id, "name": runtime.name, "scale": "medium", "state": "created"}
 
 
 def test_xlarge_runtime_workers_use_non_overlapping_23_subnets(tmp_path):
@@ -121,7 +130,7 @@ def test_runtime_manager_rejects_reusing_an_existing_runtime_name(tmp_path):
     original_metadata = (original.root_dir / "runtime.json").read_text(encoding="utf-8")
 
     with pytest.raises(RuntimeProvisionError, match="already exists"):
-        manager.create(scale="small", workers=1, name="runtime-xs")
+        manager.create(scale="medium", workers=1, name="runtime-xs")
 
     assert (original.root_dir / "runtime.json").read_text(encoding="utf-8") == original_metadata
 
@@ -282,14 +291,14 @@ def test_python_worker_deploy_owns_topology_containerlab_and_activation(tmp_path
         lambda deployed_worker: calls.append(("pid1", deployed_worker.worker_id)),
     )
     monkeypatch.setattr(deployment, "apply_configs", lambda *args: SimpleNamespace(failed=[]))
-    monkeypatch.setattr(deployment, "managed_command", lambda: ["netopsbench-managed-test"])
+    monkeypatch.setattr(deployment, "containerlab_command", lambda: ["official-containerlab-test"])
     deployment.deploy_worker_lab(worker, "xs")
 
     generated = next(item for item in calls if item[0] == "generate")[1]
     commands = [item[1] for item in calls if item[0] == "command"]
     assert generated["name"] == "deploy-lab"
     assert generated["mgmt_subnet"] == worker.mgmt_subnet
-    assert any("netopsbench-managed-test" in command and "deploy" in command for command in commands)
+    assert any("official-containerlab-test" in command and "deploy" in command for command in commands)
     assert ("pid1", worker.worker_id) in calls
     assert not any("telegraf" in " ".join(command) or "pingmesh" in " ".join(command) for command in commands)
 
@@ -316,11 +325,11 @@ def test_k12_worker_deploy_uses_profile_containerlab_parallelism(tmp_path, monke
     monkeypatch.setattr(deployment, "safe_run", fake_safe_run)
     monkeypatch.setattr(deployment, "_verify_sonic_pid1_contract", lambda _worker: None)
     monkeypatch.setattr(deployment, "apply_configs", lambda *args: SimpleNamespace(failed=[]))
-    monkeypatch.setattr(deployment, "managed_command", lambda: ["netopsbench-managed-test"])
+    monkeypatch.setattr(deployment, "containerlab_command", lambda: ["official-containerlab-test"])
     deployment.deploy_worker_lab(worker, "fat-tree-k12")
 
     deploy_command = next(
-        command for command in commands if "netopsbench-managed-test" in command and "deploy" in command
+        command for command in commands if "official-containerlab-test" in command and "deploy" in command
     )
     assert deploy_command[-2:] == ["--max-workers", "16"]
 
@@ -349,11 +358,11 @@ def test_removed_containerlab_env_does_not_override_scale_profile(tmp_path, monk
     monkeypatch.setattr(deployment, "apply_configs", lambda *args: SimpleNamespace(failed=[]))
     monkeypatch.setenv("NETOPSBENCH_CONTAINERLAB_MAX_WORKERS", "3")
 
-    monkeypatch.setattr(deployment, "managed_command", lambda: ["netopsbench-managed-test"])
+    monkeypatch.setattr(deployment, "containerlab_command", lambda: ["official-containerlab-test"])
     deployment.deploy_worker_lab(worker, "fat-tree-k12")
 
     deploy_command = next(
-        command for command in commands if "netopsbench-managed-test" in command and "deploy" in command
+        command for command in commands if "official-containerlab-test" in command and "deploy" in command
     )
     assert deploy_command[-2:] == ["--max-workers", "16"]
 
@@ -1040,7 +1049,7 @@ def test_provision_preserves_quarantined_metadata_when_cleanup_fails(tmp_path, m
     assert "cleanup failed" in str(runtime.metadata["cleanup_error"])
 
 
-def test_managed_teardown_finishes_controller_cleanup_after_forced_container_removal(tmp_path, monkeypatch):
+def test_upstream_teardown_retries_namespace_cleanup_after_forced_container_removal(tmp_path, monkeypatch):
     import subprocess
 
     from netopsbench.models.runtime import RuntimeIdentity
@@ -1048,7 +1057,6 @@ def test_managed_teardown_finishes_controller_cleanup_after_forced_container_rem
 
     topology = tmp_path / "worker-1"
     topology.mkdir()
-    (topology / ".netopsbench-managed").touch()
     worker = RuntimeIdentity.create(
         runtime_id="managed-xs",
         worker_id="worker-1",
@@ -1064,12 +1072,12 @@ def test_managed_teardown_finishes_controller_cleanup_after_forced_container_rem
     def run(command, **kwargs):
         nonlocal destroyed
         calls.append(command)
-        if command[0] == "managed":
+        if command[0] == "official":
             destroyed += 1
             return subprocess.CompletedProcess(command, 1 if destroyed == 1 else 0, "", "")
         return subprocess.CompletedProcess(command, 0, "", "")
 
-    monkeypatch.setattr(deployment, "managed_command", lambda: ["managed"])
+    monkeypatch.setattr(deployment, "containerlab_command", lambda: ["official"])
     monkeypatch.setattr(deployment, "sudo_prefix", lambda: [])
     monkeypatch.setattr(deployment, "docker_prefix", lambda: [])
     monkeypatch.setattr(deployment, "safe_run", run)
@@ -1079,6 +1087,6 @@ def test_managed_teardown_finishes_controller_cleanup_after_forced_container_rem
     monkeypatch.setattr(deployment, "_container_exists", lambda *a: False)
     monkeypatch.setattr(deployment, "_network_exists", lambda *a: False)
     deployment.teardown_worker_lab(worker)
-    first, second = [i for i, c in enumerate(calls) if c[0] == "managed"]
+    first, second = [i for i, c in enumerate(calls) if c[0] == "official"]
     removal = calls.index(["docker", "rm", "-f", "clab-managed-xs-client1"])
     assert first < removal < second

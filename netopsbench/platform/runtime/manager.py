@@ -25,6 +25,7 @@ from netopsbench.platform.runtime.lifecycle import (
     RuntimeLifecycleError,
     teardown_workers,
 )
+from netopsbench.platform.runtime.toolchain import runtime_backend_identity
 from netopsbench.platform.utils.control import OperationControl
 from netopsbench.platform.utils.files import atomic_write_json
 from netopsbench.platform.utils.proc import safe_run
@@ -80,6 +81,19 @@ class RuntimePool:
     def _run_stage(self, stage: str, next_state: str) -> RuntimePool:
         if stage != "teardown" and self.operation_control is not None:
             self.operation_control.remaining()
+        if stage != "teardown":
+            identity = runtime_backend_identity()
+            previous_backend = self.metadata.get("runtime_backend")
+            if (
+                previous_backend is None
+                and self.state == "created"
+                and not self.stage_results
+                and not self.metadata.get("deployment_started")
+            ):
+                self.metadata["runtime_backend"] = identity
+                self._write_metadata()  # Durable even if deployment is interrupted.
+            elif previous_backend != identity:
+                raise ValueError("Runtime backend changed or is unrecorded; archive it and create a new runtime")
         previous = self.stage_results.get(stage)
         if previous is not None and previous.status == "completed":
             return self
